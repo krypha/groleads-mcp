@@ -35,11 +35,25 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-/** Constant-time bearer-token check. */
-function authorized(req: http.IncomingMessage): boolean {
-  const got = Buffer.from(req.headers["authorization"] || "");
-  const want = Buffer.from(`Bearer ${TOKEN}`);
+/** Constant-time compare of a candidate secret against MCP_AUTH_TOKEN. */
+function tokenMatches(candidate: string): boolean {
+  const got = Buffer.from(candidate);
+  const want = Buffer.from(TOKEN);
   return got.length === want.length && timingSafeEqual(got, want);
+}
+
+/**
+ * A request is authorized if it carries the token either as:
+ *   - `Authorization: Bearer <token>` header  (preferred — used by config.yaml `headers`), or
+ *   - a `?token=<token>` URL query parameter   (lets a dashboard that only exposes a
+ *     URL field authenticate; note the token may appear in proxy access logs).
+ */
+function authorized(req: http.IncomingMessage): boolean {
+  const header = req.headers["authorization"] || "";
+  if (header.startsWith("Bearer ") && tokenMatches(header.slice(7))) return true;
+  const q = new URL(req.url || "/", "http://localhost").searchParams.get("token");
+  if (q && tokenMatches(q)) return true;
+  return false;
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
