@@ -1,0 +1,22 @@
+# Standalone deployment of the Groleads Google Maps MCP server (HTTP transport).
+# Runs on its own — the AI agent (e.g. Hermes) connects to it by URL.
+#
+# Set the required variables in a .env file next to this compose (see .env.example):
+#   MCP_AUTH_TOKEN      (required)  — the bearer token agents must send
+#   MAGILEADS_API_KEY   or  MAGILEADS_EMAIL + MAGILEADS_PASSWORD
+services:
+  groleads-mcp:
+    build: .
+    image: groleads-mcp-google-maps:latest
+    container_name: groleads-mcp
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - MCP_HTTP_PORT=8080
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
+      # --- Magileads auth: keep ONE of the following ---
+      - MAGILEADS_API_KEY=${MAGILEADS_API_KEY:-}
+      # - MAGILEADS_EMAIL=${MAGILEADS_EMAIL:-}
+      # - MAGILEADS_PASSWORD=${MAGILEADS_PASSWORD:-}
+      # - MAGILEADS_API_BASE=${MAGILEADS_API_BASE:-}
