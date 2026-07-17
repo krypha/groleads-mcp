@@ -8,11 +8,17 @@ import {
   listDataFields,
   countContacts,
   deleteContactsSelection,
+  listProgrammations,
+  getProgrammationById,
+  getWorkflow,
+  getProgrammationStatistics,
+  getStepModel,
   EMPTY_FILTER,
   MagileadsError,
   type DataField,
   type FilterNode,
   type FilterValue,
+  type Raw,
 } from "./magileads.js";
 
 const MAX_LINKS = 40;
@@ -240,6 +246,82 @@ function fieldView(f: DataField): {
     type,
     ...(pv.length ? { possible_values: pv } : {}),
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Campaign-audit helpers (shared by the campaign/scenario/stats tools)        */
+/* -------------------------------------------------------------------------- */
+
+/** A finite number, or null. Keeps "not applicable" (null) distinct from 0. */
+const num = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) ? v : null;
+
+/** A percentage (one decimal) of part/whole, or null when it can't be computed. */
+function rate(part: number | null, whole: number | null): number | null {
+  if (part == null || whole == null || whole <= 0) return null;
+  return Math.round((part / whole) * 1000) / 10;
+}
+
+/** Derive a campaign status from the raw stopped/archived flags. */
+function deriveStatus(item: Raw): string {
+  if (item.archived === true) return "archived";
+  if (item.stopped === true) return "stopped";
+  return "running";
+}
+
+/** has_*_step flags on a programmation → the channels/actions it uses. */
+const STEP_FLAGS: [string, string][] = [
+  ["has_email_step", "email"],
+  ["has_linkedin_invitation_step", "linkedin_invitation"],
+  ["has_linkedin_message_step", "linkedin_message"],
+  ["has_linkedin_visit_step", "linkedin_visit"],
+  ["has_sms_step", "sms"],
+  ["has_smv_step", "smv"],
+  ["has_call_step", "call"],
+];
+function channelsFromFlags(item: Raw): string[] {
+  return STEP_FLAGS.filter(([k]) => item[k] === true).map(([, v]) => v);
+}
+
+/** Coarse channel bucket for an action_type (email vs linkedin vs …). */
+function channelOfAction(actionType: string | null): string {
+  if (!actionType) return "other";
+  if (actionType.startsWith("linkedin")) return "linkedin";
+  if (["email", "sms", "smv", "call"].includes(actionType)) return actionType;
+  return "other";
+}
+
+/** The numeric step id, whether nested ({type,id}) or flat. */
+function stepIdOf(step: Raw): number | null {
+  const sid = step.step_id;
+  if (sid && typeof sid === "object") {
+    const inner = (sid as Raw).id;
+    if (typeof inner === "number") return inner;
+  }
+  return num(step.id);
+}
+
+/** Best-effort friendly step type; raw step_type/action_type/event_type stay authoritative. */
+function normalizedStepType(step: Raw): string {
+  const st = typeof step.step_type === "string" ? step.step_type : null;
+  const at = typeof step.action_type === "string" ? step.action_type : null;
+  const et = typeof step.event_type === "string" ? step.event_type : null;
+  if (st === "event") {
+    if (et === "not_active" || et === "all_contacts" || !et) return "delay";
+    return "condition";
+  }
+  if (at === "linkedin_invitation") return "linkedin_invite";
+  return at ?? st ?? "unknown";
+}
+
+/** Pull normalized subject/body out of a message model (full content, no truncation). */
+function normalizeMessage(model: Raw | null): { subject: string | null; body: string | null } {
+  if (!model) return { subject: null, body: null };
+  const pick = (k: string): string | null =>
+    typeof model[k] === "string" && (model[k] as string).length > 0 ? (model[k] as string) : null;
+  const subject = pick("subject");
+  const body = pick("html") ?? pick("text") ?? pick("content") ?? pick("message") ?? null;
+  return { subject, body };
 }
 
 /** Register the Google Maps targeting tools onto an McpServer instance. */
@@ -676,6 +758,331 @@ export function registerTools(server: McpServer): void {
           list_name: sel.list_name,
           target: tgt,
           remaining: sel.to_keep,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  /* ------------------------------------------------------------------------ */
+  /* Campaign audit (READ-ONLY): campaigns · scenarios · statistics            */
+  /* All four operate on the MCP server's own Magileads account. The campaign  */
+  /* / scenario must belong to that account (else the API returns unauthorized).*/
+  /* ------------------------------------------------------------------------ */
+
+  server.registerTool(
+    "list_campaigns",
+    {
+      title: "List prospecting campaigns",
+      description:
+        "List the account's prospecting campaigns (Magileads 'programmations'). Each entry: " +
+        "`id`, `name` (the scenario/workflow name), `status` (running/stopped/archived, derived " +
+        "from the raw stopped/archived flags), `start_date`, and `scenario_id` (the workflow to " +
+        "pass to get_scenario). Use `name` to filter (case-insensitive substring on the campaign " +
+        "name — done client-side, since the API can't filter campaigns by name).",
+      inputSchema: {
+        name: z.string().optional().describe("Optional case-insensitive substring filter on the campaign name."),
+        limit: z.number().int().optional().describe("Max campaigns to scan/return (1–100, default 50)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ name, limit }): Promise<TextResult> => {
+      try {
+        const perPage = clamp(Math.trunc(limit ?? 50), 1, 100);
+        const { total, results } = await listProgrammations(perPage);
+        const q = name?.trim().toLowerCase();
+        const rows = results
+          .map((p) => ({
+            id: num(p.id),
+            name: (typeof p.workflow_name === "string" && p.workflow_name) || null,
+            status: deriveStatus(p),
+            start_date: p.date_start ?? null,
+            scenario_id: num(p.workflow_id),
+          }))
+          .filter((r) => !q || (r.name ?? "").toLowerCase().includes(q));
+        return ok({
+          total_on_account: total,
+          scanned: results.length,
+          returned: rows.length,
+          ...(q ? { name_filter: name } : {}),
+          campaigns: rows,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_campaign",
+    {
+      title: "Get a campaign's setup",
+      description:
+        "Fetch one campaign's (programmation's) configuration for audit: `id`, `name`, `status`, " +
+        "`start_date`, `channels` (the action types it uses), `scenario_id` (pass to get_scenario), " +
+        "`target_lists` (each with live contact `count`), and `total_contacts` (sum of those " +
+        "counts). Returns raw stopped/archived/date_stop too. Errors clearly if the campaign isn't " +
+        "found or isn't owned by this account.",
+      inputSchema: {
+        campaign_id: z.number().int().positive().describe("The campaign (programmation) id."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ campaign_id }): Promise<TextResult> => {
+      try {
+        const prog = await getProgrammationById(campaign_id);
+        if (!prog) {
+          return fail(
+            new Error(
+              `Campaign ${campaign_id} was not found on this Magileads account ` +
+                `(it may belong to a different account, or not exist).`,
+            ),
+          );
+        }
+        const lists = Array.isArray(prog.contact_lists) ? (prog.contact_lists as Raw[]) : [];
+        const target_lists = await Promise.all(
+          lists.map(async (l) => {
+            const id = num(l.id);
+            let count: number | null = null;
+            if (id != null) {
+              try {
+                const cl = await getContactList(id);
+                count = num(cl.number_of_contacts);
+              } catch {
+                count = null; // list may be inaccessible; don't sink the whole read
+              }
+            }
+            return { id, name: (typeof l.name === "string" && l.name) || null, count };
+          }),
+        );
+        const total_contacts = target_lists.reduce((a, l) => a + (l.count ?? 0), 0);
+        return ok({
+          id: num(prog.id),
+          name: (typeof prog.workflow_name === "string" && prog.workflow_name) || null,
+          status: deriveStatus(prog),
+          start_date: prog.date_start ?? null,
+          date_stop: prog.date_stop ?? null,
+          stopped: prog.stopped ?? null,
+          archived: prog.archived ?? null,
+          channels: channelsFromFlags(prog),
+          scenario_id: num(prog.workflow_id),
+          target_lists,
+          total_contacts,
+          daily_send_limit: num(prog.daily_send_limit),
+          tags: prog.tags ?? [],
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_scenario",
+    {
+      title: "Get a scenario's full steps and message content",
+      description:
+        "Fetch a scenario (workflow) and its ordered steps for audit. For EACH step returns: " +
+        "`order`, `step_id`, `step_type` (action/event), `action_type` (email, linkedin_visit, " +
+        "linkedin_invitation, linkedin_message, sms, …), a normalized `type`, `channel`, " +
+        "`delay_minutes`, `parent_ids`, and — for message steps — the COMPLETE `subject` and " +
+        "`body` (fetched from the underlying template; never truncated), plus the full raw " +
+        "`message` model and raw `step`. Nothing is summarized or truncated. The `step_id` matches " +
+        "the per-step `step_id` in get_campaign_statistics, so messages can be correlated to stats.",
+      inputSchema: {
+        scenario_id: z.number().int().positive().describe("The scenario (workflow) id — from a campaign's scenario_id."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ scenario_id }): Promise<TextResult> => {
+      try {
+        const wf = await getWorkflow(scenario_id);
+        const steps = Array.isArray(wf.steps) ? (wf.steps as Raw[]) : [];
+        const mapped = await Promise.all(
+          steps.map(async (s, i) => {
+            const actionType = typeof s.action_type === "string" ? s.action_type : null;
+            const modelId = num(s.model_id);
+            const model = actionType && modelId != null ? await getStepModel(actionType, modelId) : null;
+            const { subject, body } = normalizeMessage(model);
+            return {
+              order: i + 1,
+              step_id: stepIdOf(s),
+              step_type: s.step_type ?? null,
+              action_type: actionType,
+              event_type: s.event_type ?? null,
+              type: normalizedStepType(s),
+              channel: channelOfAction(actionType),
+              delay_minutes: num(s.when_minutes),
+              name: (typeof s.model_name === "string" && s.model_name) || (typeof s.name === "string" && s.name) || null,
+              model_id: modelId,
+              parent_ids: s.parent_ids ?? [],
+              is_initial: s.is_initial ?? null,
+              subject,
+              body,
+              message: model, // full raw template (complete, untruncated)
+              step: s, // full raw step (complete, untruncated)
+            };
+          }),
+        );
+        return ok({
+          id: num(wf.id),
+          name: (typeof wf.name === "string" && wf.name) || null,
+          archived: wf.archived ?? null,
+          programmed: wf.programmed ?? null,
+          step_count: mapped.length,
+          steps: mapped,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_campaign_statistics",
+    {
+      title: "Get a campaign's statistics (aggregate + per-step)",
+      description:
+        "Fetch a campaign's (programmation's) statistics for audit — RAW and COMPLETE, no " +
+        "summarizing. Returns `aggregate` (whole-campaign counts) and `per_step` (the crucial " +
+        "detail: one entry per scenario step, with sent/opens/clicks/replies/bounces, computed " +
+        "open_rate/click_rate/reply_rate, timing, links, and the full raw step). `per_step[].step_id` " +
+        "matches get_scenario's `step_id`, so each message can be correlated to its stats. Also " +
+        "returns derived `by_action_type` sums and convenience `email`/`linkedin` blocks. " +
+        "IMPORTANT — metric semantics: the API exposes UNIQUE-contact counts (contacts who opened/" +
+        "clicked/replied), `contacted` = sent; it does NOT expose 'delivered', total (non-unique) " +
+        "opens, or LinkedIn invite-accepted counts, so those fields are null (facts vs. gaps). " +
+        "LinkedIn acceptance, if tracked, appears as a following step's event in per_step timing.",
+      inputSchema: {
+        campaign_id: z.number().int().positive().describe("The campaign (programmation) id."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ campaign_id }): Promise<TextResult> => {
+      try {
+        const p = await getProgrammationStatistics(campaign_id);
+        const steps = Array.isArray(p.steps) ? (p.steps as Raw[]) : [];
+
+        const per_step = steps.map((s) => {
+          const sent = num(s.contacted);
+          const opens = num(s.contacts_opened);
+          const clicks = num(s.contacts_clicked);
+          const replies = num(s.contacts_answered);
+          const bounces = num(s.bounced);
+          const at = typeof s.action_type === "string" ? s.action_type : null;
+          return {
+            step_id: num(s.id),
+            action_type: at,
+            channel: channelOfAction(at),
+            is_initial: s.is_initial ?? null,
+            is_stopped: s.is_stopped ?? null,
+            sent,
+            to_contact: num(s.to_contact),
+            in_queue: num(s.in_queue),
+            opens,
+            clicks,
+            replies,
+            bounces,
+            unsubscribers: num(s.unsubscribers),
+            blacklisted: num(s.blacklisted),
+            open_rate: rate(opens, sent),
+            click_rate: rate(clicks, sent),
+            reply_rate: rate(replies, sent),
+            timing: Array.isArray(s.parent_steps) ? s.parent_steps : [],
+            links: Array.isArray(s.links) ? s.links : [],
+            last_contacted: s.last_contacted ?? null,
+            sent_today: num(s.sent_today),
+            limit_send_per_day: num(s.limit_send_per_day),
+            waiting: num(s.waiting),
+            step: s, // full raw step — nothing dropped
+          };
+        });
+
+        // Derived sums grouped by action_type (faithful channel/subtype breakdown).
+        const by_action_type: Record<
+          string,
+          { steps: number; sent: number; opens: number; clicks: number; replies: number; bounces: number; unsubscribers: number }
+        > = {};
+        for (const s of per_step) {
+          const key = s.action_type ?? "unknown";
+          const b = (by_action_type[key] ??= {
+            steps: 0,
+            sent: 0,
+            opens: 0,
+            clicks: 0,
+            replies: 0,
+            bounces: 0,
+            unsubscribers: 0,
+          });
+          b.steps += 1;
+          b.sent += s.sent ?? 0;
+          b.opens += s.opens ?? 0;
+          b.clicks += s.clicks ?? 0;
+          b.replies += s.replies ?? 0;
+          b.bounces += s.bounces ?? 0;
+          b.unsubscribers += s.unsubscribers ?? 0;
+        }
+        const at = (k: string) => by_action_type[k];
+
+        // Convenience channel blocks (derived). Fields the API doesn't provide are null.
+        const email = {
+          sent: at("email")?.sent ?? 0,
+          delivered: null as number | null, // not exposed by the API
+          opens: null as number | null, // total (non-unique) opens not exposed
+          unique_opens: at("email")?.opens ?? 0,
+          clicks: at("email")?.clicks ?? 0,
+          replies: at("email")?.replies ?? 0,
+          bounces: at("email")?.bounces ?? 0,
+          unsubscribes: at("email")?.unsubscribers ?? 0,
+        };
+        const linkedin = {
+          profile_visits: at("linkedin_visit")?.sent ?? 0,
+          invites_sent: at("linkedin_invitation")?.sent ?? 0,
+          invites_accepted: null as number | null, // not exposed as a count — see per_step timing
+          messages_sent: at("linkedin_message")?.sent ?? 0,
+          replies: at("linkedin_message")?.replies ?? 0,
+        };
+
+        const aggregate = {
+          contacted: num(p.contacted),
+          to_contact: num(p.to_contact),
+          contacts_opened: num(p.contacts_opened),
+          contacts_clicked: num(p.contacts_clicked),
+          contacts_answered: num(p.contacts_answered),
+          bounced: num(p.bounced),
+          unsubscribers: num(p.unsubscribers),
+          blacklisted: num(p.blacklisted),
+          excluded_previous_programmation: num(p.excluded_previous_programmation),
+          excluded_workflow: num(p.excluded_workflow),
+          excluded_programmation: num(p.excluded_programmation),
+        };
+
+        // Everything else from the raw campaign stats (minus the steps we mapped above).
+        const { steps: _omit, ...raw_campaign } = p;
+
+        return ok({
+          campaign_id,
+          workflow_id: num(p.workflow_id),
+          workflow_name: p.workflow_name ?? null,
+          status: deriveStatus(p),
+          stopped: p.stopped ?? null,
+          archived: p.archived ?? null,
+          date_start: p.date_start ?? null,
+          contact_lists: p.contact_lists ?? [],
+          aggregate,
+          email,
+          linkedin,
+          by_action_type,
+          per_step,
+          ab_tests: p.ab_tests ?? [],
+          blacklists_stats: p.blacklists_stats ?? [],
+          tags: p.tags ?? [],
+          raw_campaign, // complete passthrough of all non-step campaign fields
+          _notes:
+            "sent=contacted; opens/clicks/replies are UNIQUE-contact counts; rates are percentages. " +
+            "email.delivered, email.opens (total), and linkedin.invites_accepted are null (not exposed by the API). " +
+            "Correlate per_step.step_id with get_scenario steps to tie each message to its stats.",
         });
       } catch (err) {
         return fail(err);

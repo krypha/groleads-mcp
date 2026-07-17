@@ -355,4 +355,97 @@ export async function deleteContactsSelection(
   });
 }
 
+/* -------------------------------------------------------------------------- */
+/* Campaigns / scenarios / statistics (READ-ONLY — campaign audit)             */
+/*                                                                             */
+/* Magileads vocabulary: a "campaign" is a workflow *programmation* (a         */
+/* scheduled run of a scenario against contact lists); a "scenario" is a       */
+/* *workflow* (the step template). Statistics hang off the programmation.      */
+/* -------------------------------------------------------------------------- */
+
+/** A record with arbitrary keys — these API objects are large and untyped in swagger. */
+export type Raw = Record<string, unknown>;
+
+type ProgrammationList = {
+  number_of_results?: number;
+  results?: Raw[];
+};
+
+/**
+ * List workflow programmations (campaigns). The endpoint filters/sorts only on
+ * id/created_on/workflow_id/date_start (NOT name), so name search is done by the
+ * caller against `workflow_name`. `per_page` is capped at 100 by the API.
+ */
+export async function listProgrammations(perPage: number): Promise<{ total: number; results: Raw[] }> {
+  const options = { per_page: Math.min(Math.max(perPage, 1), 100) };
+  const q = `?options=${encodeURIComponent(JSON.stringify(options))}`;
+  const data = await api<ProgrammationList>(`/workflows/programmations${q}`, { method: "GET" });
+  return { total: data.number_of_results ?? 0, results: data.results ?? [] };
+}
+
+/**
+ * Fetch a single programmation (campaign) by its id, using the list endpoint's
+ * server-side `id equals` filter (the by-id GET needs the workflow_id in the path,
+ * which we don't have from a campaign id alone). Returns null if not found/owned.
+ */
+export async function getProgrammationById(id: number): Promise<Raw | null> {
+  const options = {
+    per_page: 1,
+    filter: { mode: "and", values: [{ field_name: "id", type: "equals", value: String(id) }] },
+  };
+  const q = `?options=${encodeURIComponent(JSON.stringify(options))}`;
+  const data = await api<ProgrammationList>(`/workflows/programmations${q}`, { method: "GET" });
+  return (data.results ?? [])[0] ?? null;
+}
+
+/** Fetch a workflow (scenario) profile, including its `steps` array. */
+export async function getWorkflow(id: number): Promise<Raw> {
+  const data = await api<{ workflow_profile: Raw }>(`/workflows/${id}`, { method: "GET" });
+  return data.workflow_profile;
+}
+
+/** Fetch a programmation's (campaign's) statistics — aggregate + per-step. */
+export async function getProgrammationStatistics(id: number): Promise<Raw> {
+  const data = await api<{ programmation: Raw }>(`/statistics/programmations/${id}`, {
+    method: "GET",
+  });
+  return data.programmation;
+}
+
+/** Map a step `action_type` to its message-model endpoint (null if it has no model). */
+function modelPath(actionType: string, modelId: number): string | null {
+  switch (actionType) {
+    case "email":
+      return `/models/email/${modelId}`;
+    case "linkedin_message":
+      return `/models/linkedin/message/${modelId}`;
+    case "linkedin_invitation":
+      return `/models/linkedin/invitation/${modelId}`;
+    case "sms":
+      return `/models/sms/${modelId}`;
+    case "smv":
+      return `/models/smv/${modelId}`;
+    default:
+      return null; // linkedin_visit, call, dummy, split_contacts, remove_prospect
+  }
+}
+
+/**
+ * Fetch the full message model (template) behind a scenario step, so the scenario
+ * tool can return complete subject/body content. Returns null for step types that
+ * carry no model. Never throws — a fetch failure yields `{ _model_error }` so one
+ * bad template can't sink the whole scenario read.
+ */
+export async function getStepModel(actionType: string, modelId: number): Promise<Raw | null> {
+  const path = modelPath(actionType, modelId);
+  if (!path) return null;
+  try {
+    const data = await api<{ model_profile?: Raw }>(path, { method: "GET" });
+    return data.model_profile ?? (data as Raw);
+  } catch (err) {
+    const message = err instanceof MagileadsError ? err.message : String(err);
+    return { _model_error: message, model_id: modelId, action_type: actionType };
+  }
+}
+
 export { API_BASE };

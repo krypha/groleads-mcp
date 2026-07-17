@@ -38,6 +38,10 @@ OpenRouter, …).
 | `list_contact_fields` | `contact_list_id` | `{ fields[] }` — each `{ data_field_id, identifier, label, type }` |
 | `preview_contact_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?` | `{ list_name, matched_count, total_count, to_delete, to_keep }` — **read-only** |
 | `delete_contacts_by_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?`, `confirm_count`, `delete_entire_list?` | `{ deleted, list_name, remaining }` — **destructive, guarded** |
+| `list_campaigns` | `name?` (filter), `limit?` (1–100, default 50) | `{ campaigns[] }` — each `{ id, name, status, start_date, scenario_id }` |
+| `get_campaign` | `campaign_id` | `{ id, name, status, channels[], scenario_id, target_lists:[{id,name,count}], total_contacts }` |
+| `get_scenario` | `scenario_id` | `{ steps[] }` — each step with full `subject`/`body` (not truncated) |
+| `get_campaign_statistics` | `campaign_id` | `{ aggregate, email, linkedin, by_action_type, per_step[] }` |
 
 ## How targeting works
 
@@ -88,6 +92,40 @@ an agent can't wipe a list by accident.
 
 ```
 list_contact_fields → preview_contact_selection → (read to_delete) → delete_contacts_by_selection(confirm_count = to_delete)
+```
+
+## Auditing a prospecting campaign
+
+Four **read-only** tools expose everything an agent needs to audit a campaign. They return
+**raw, complete** data — the analysis is the agent's job, not the server's; nothing is
+summarized or truncated.
+
+In Magileads terms: a **campaign** is a *programmation*, and a **scenario** is the
+*workflow* (step template) it runs.
+
+1. `list_campaigns` — find campaigns (by `name` substring). Each has a `scenario_id`.
+2. `get_campaign` — a campaign's setup: channels, `target_lists` (with live counts), and
+   `total_contacts`.
+3. `get_scenario` — the ordered steps with the **complete message content** (`subject` +
+   `body`) for every email / LinkedIn / SMS step, fetched from the underlying templates.
+4. `get_campaign_statistics` — `aggregate` (whole-campaign) **and** `per_step` (the crucial
+   detail), plus convenience `email` / `linkedin` / `by_action_type` blocks and computed
+   `open_rate` / `click_rate` / `reply_rate`.
+
+`get_scenario` and `get_campaign_statistics` share the same `step_id`, so each message
+can be correlated to its own stats.
+
+> **Metric honesty.** The API reports **unique-contact** counts (contacts who opened /
+> clicked / replied) and `contacted` = sent. It does **not** provide `delivered`, total
+> (non-unique) opens, or a LinkedIn *invites-accepted* count — those fields are returned as
+> `null` so the agent can tell facts from gaps. The `email` / `linkedin` / `by_action_type`
+> blocks and the rates are **derived** (summed / computed), never returned by the API.
+
+The campaign / scenario must belong to the account configured on the server; otherwise the
+API returns `unauthorized_workflow` / `unauthorized_workflow_programmation`.
+
+```
+list_campaigns → get_campaign → get_scenario (messages) + get_campaign_statistics (per-step) → agent correlates by step_id
 ```
 
 ## Transports
@@ -201,7 +239,7 @@ discovered.
 ```
 src/
 ├── magileads.ts   Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts       The 8 MCP tool definitions + handlers (input validation, error wrapping)
+├── tools.ts       The 12 MCP tool definitions + handlers (input validation, error wrapping)
 ├── server.ts      buildServer() — creates an McpServer with all tools registered
 ├── index.ts       stdio entry point
 └── http.ts        HTTP entry point (Streamable HTTP + bearer/query auth + /health)

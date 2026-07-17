@@ -22,7 +22,7 @@ src/magileads.ts   Self-contained Magileads API client. Dual auth from env:
                    (JWT via POST /users/authentication, auto-refreshed via
                    /users/authentication/refresh, 30s-early renewal, retry-once on 401).
                    Base URL MAGILEADS_API_BASE (default https://app.api-magileads.net).
-src/tools.ts       The 8 tools + handlers. Every handler is wrapped so it NEVER throws
+src/tools.ts       The 12 tools + handlers. Every handler is wrapped so it NEVER throws
                    (returns {content:[...], isError:true} on failure via fail()). Inputs
                    are clamped (max_links 1–40, max_results 1–200, urls sliced to 10,
                    criteria capped at 30 — never silently dropped on a delete).
@@ -34,7 +34,7 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
                    server+transport per request, GET /health, and auth (see below).
 ```
 
-**The 8 tools:**
+**The 12 tools:**
 
 *Google Maps targeting* — `generate_maps_search_urls`, `extract_maps_search`,
 `run_google_maps_targeting` (one-shot generate+extract).
@@ -45,6 +45,9 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
 list), `preview_contact_selection` (read-only; counts a criteria selection, deletes
 nothing), `delete_contacts_by_selection` (DESTRUCTIVE; deletes contacts by criteria
 behind two guardrails — see below).
+
+*Campaign audit (all read-only)* — `list_campaigns`, `get_campaign`, `get_scenario`
+(full step content), `get_campaign_statistics` (aggregate + per-step). See below.
 
 ## Key behavioral facts (don't relearn these the hard way)
 
@@ -78,6 +81,34 @@ Filters go to Magileads as `ContactLists.ContactsSelection` on
   unless `delete_entire_list:true`; (2) `confirm_count` must equal the live `to_delete`
   or the delete is refused. Preview → pass its `to_delete` as `confirm_count`.
 - Magileads login body is `{ email, password }` → `{ access_token, refresh_token }`.
+
+## Campaign audit (the read-only path)
+
+Magileads vocabulary: a **campaign** = a workflow *programmation*; a **scenario** = a
+*workflow* (its step template); **statistics** hang off the programmation.
+
+- `list_campaigns` / `get_campaign` → `GET /workflows/programmations` (the list item, not
+  the by-id GET, is richer: `workflow_name`, `contact_lists:[{id,name}]`, `has_*_step`
+  flags, `stopped`/`archived`). The list only filters server-side on `id`/`created_on`/
+  `workflow_id`/`date_start` — **not name**, so `get_campaign` fetches by an `id equals`
+  filter, and `list_campaigns` does the name substring match client-side. `status` is
+  derived (archived→stopped→running). Per-list `count` comes from `getContactList`.
+- `get_scenario` → `GET /workflows/{id}`. `steps` is untyped (`[any]`) in swagger; each step
+  carries `action_type`, `step_type` (action/event), `model_id`/`model_name`, `parent_ids`,
+  `is_initial`. **The message content is NOT inline** — it lives in a separate model, fetched
+  per `action_type`: `/models/email/{id}` (subject+text+html), `/models/linkedin/message/{id}`,
+  `/models/linkedin/invitation/{id}` (text), `/models/sms|smv/{id}`. `get_scenario` fetches it
+  and returns full `subject`/`body` + the raw model + raw step — never truncated.
+- `get_campaign_statistics` → `GET /statistics/programmations/{id}`: channel-agnostic
+  `aggregate` + `steps:[Statistics.Step]` (per-step `contacted`=sent, `contacts_opened/
+  clicked/answered` = UNIQUE-contact counts, `bounced`, `parent_steps[{event_type,
+  when_minutes}]`, `links`). The stats step `id` == the scenario `step_id.id` → correlate
+  messages to stats. The API has **no** `delivered`, total (non-unique) opens, or LinkedIn
+  invite-accepted count → those are exposed as `null` (facts vs. gaps), per the tool desc.
+  `by_action_type`/`email`/`linkedin`/rates are DERIVED (summed/computed), never from the API.
+- These tools return RAW + COMPLETE data; the audit/analysis is the agent's job, not the MCP's.
+- Auth: the campaign/scenario must belong to the server's own account, else the API returns
+  `unauthorized_workflow` / `unauthorized_workflow_programmation` (surfaced via `fail()`).
 
 ## Auth (HTTP mode)
 
