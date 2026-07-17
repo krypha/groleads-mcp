@@ -22,9 +22,10 @@ src/magileads.ts   Self-contained Magileads API client. Dual auth from env:
                    (JWT via POST /users/authentication, auto-refreshed via
                    /users/authentication/refresh, 30s-early renewal, retry-once on 401).
                    Base URL MAGILEADS_API_BASE (default https://app.api-magileads.net).
-src/tools.ts       The 5 tools + handlers. Every handler is wrapped so it NEVER throws
+src/tools.ts       The 8 tools + handlers. Every handler is wrapped so it NEVER throws
                    (returns {content:[...], isError:true} on failure via fail()). Inputs
-                   are clamped (max_links 1–40, max_results 1–200, urls sliced to 10).
+                   are clamped (max_links 1–40, max_results 1–200, urls sliced to 10,
+                   criteria capped at 30 — never silently dropped on a delete).
 src/server.ts      buildServer() → McpServer with all tools registered. Shared by both
                    entry points.
 src/index.ts       stdio transport (StdioServerTransport).
@@ -33,9 +34,17 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
                    server+transport per request, GET /health, and auth (see below).
 ```
 
-**The 5 tools:** `generate_maps_search_urls`, `extract_maps_search`,
-`run_google_maps_targeting` (one-shot generate+extract), `list_contact_lists`,
-`get_contact_list_status`.
+**The 8 tools:**
+
+*Google Maps targeting* — `generate_maps_search_urls`, `extract_maps_search`,
+`run_google_maps_targeting` (one-shot generate+extract).
+
+*Contact lists* — `list_contact_lists`, `get_contact_list_status`.
+
+*Contact manipulation* — `list_contact_fields` (read-only; the filterable fields of a
+list), `preview_contact_selection` (read-only; counts a criteria selection, deletes
+nothing), `delete_contacts_by_selection` (DESTRUCTIVE; deletes contacts by criteria
+behind two guardrails — see below).
 
 ## Key behavioral facts (don't relearn these the hard way)
 
@@ -45,6 +54,29 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
   return a `contact_list_id` immediately; the extraction job finishes later. Poll
   `get_contact_list_status` until the job state is `completed`.
 - **stdio: stdout is sacred** — JSON-RPC only. All logs go to `console.error` (stderr).
+- **Data fields are account-global** — `list_contact_fields` returns them from
+  `GET /data-fields` (not per-list); they apply to every contact list. `identifier`
+  (e.g. "email", "company") is what agents name; `data_field_id` is what the API filters on.
+
+## Contact selection & deletion (the destructive path)
+
+Filters go to Magileads as `ContactLists.ContactsSelection` on
+`DELETE /contact-lists/{id}/contacts`:
+`{ filter, contact_ids:[], excluded_contact_ids:[], reverse_selection }`.
+
+- **filter** = `{ mode:'and'|'or', values:[{ field_name:<data_field_id as STRING>, type, value }] }`.
+  An empty `{mode:'and',values:[]}` matches EVERY contact.
+- **op → type** (verified against the swagger `Type` enum, note `start_with`/`end_with`,
+  not `starts_*`): contains, not_contains, equals, not_equals, start_with, end_with,
+  more_than, more_or_equal_than, less_than, less_or_equal_than, does_exist, does_not_exist.
+  `tools.ts` accepts friendly aliases (`starts_with`, `gt`, `has_value`, `is_empty`, …).
+- **target** `matching` → `reverse_selection:false` (delete the matches);
+  `all_except_matching` → `reverse_selection:true` (keep only the matches, delete the rest).
+- **Count / guardrail source**: `GET /contact-lists/{id}/contacts?options={per_page:1,filter}`
+  → read `number_of_results`. `preview_*` returns this; `delete_*` RE-COUNTS it live.
+- **Two guardrails in `delete_contacts_by_selection`**: (1) empty criteria are refused
+  unless `delete_entire_list:true`; (2) `confirm_count` must equal the live `to_delete`
+  or the delete is refused. Preview → pass its `to_delete` as `confirm_count`.
 - Magileads login body is `{ email, password }` → `{ access_token, refresh_token }`.
 
 ## Auth (HTTP mode)

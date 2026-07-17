@@ -274,4 +274,85 @@ export async function getContactList(id: number): Promise<ContactListSummary> {
   return data.contact_list_profile;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Contact fields & selection (filter / count / delete)                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A Groleads/Magileads data field. Data fields are account-global (shared across
+ * every contact list), so `listDataFields()` is what backs `list_contact_fields`.
+ * `id` is the numeric field id used as `field_name` (as a STRING) inside filters;
+ * `identifier` is the stable slug an agent names ("email", "company", ...).
+ */
+export type DataField = {
+  id: number;
+  name: string;
+  identifier: string;
+  possible_values?: string[] | null;
+  [key: string]: unknown;
+};
+
+/** One leaf filter condition. `field_name` is a data_field_id serialized as a string. */
+export type FilterValue = {
+  field_name: string;
+  type: string;
+  value?: string | string[];
+};
+
+/** A filter node: `and`/`or` over leaf conditions (and, recursively, nested nodes). */
+export type FilterNode = {
+  mode: "and" | "or";
+  values: (FilterValue | FilterNode)[];
+};
+
+/**
+ * The DELETE body shape (Groleads `ContactLists.ContactsSelection`). An empty
+ * `filter` ({mode:'and',values:[]}) matches EVERY contact. `reverse_selection`
+ * flips "these" ↔ "all except these": with a filter F, false deletes the F-matches,
+ * true keeps only the F-matches (i.e. deletes everything else).
+ */
+export type ContactsSelection = {
+  filter: FilterNode;
+  contact_ids: number[];
+  excluded_contact_ids: number[];
+  reverse_selection: boolean;
+};
+
+/** An all-matching (empty) filter — matches every contact in the list. */
+export const EMPTY_FILTER: FilterNode = { mode: "and", values: [] };
+
+/** List the account's data fields (the filterable contact fields). */
+export async function listDataFields(): Promise<DataField[]> {
+  const data = await api<{ data_fields_list?: DataField[] }>("/data-fields", {
+    method: "GET",
+  });
+  return data.data_fields_list ?? [];
+}
+
+/**
+ * Count the contacts of a list that match `filter`, via the paginated contacts
+ * endpoint. `per_page:1` keeps the payload tiny; `number_of_results` is the FULL
+ * match count (not the page size). This is the source of truth for the guardrail.
+ */
+export async function countContacts(listId: number, filter: FilterNode): Promise<number> {
+  const options = { per_page: 1, filter };
+  const q = `?options=${encodeURIComponent(JSON.stringify(options))}`;
+  const data = await api<{ number_of_results?: number }>(
+    `/contact-lists/${listId}/contacts${q}`,
+    { method: "GET" },
+  );
+  return data.number_of_results ?? 0;
+}
+
+/** Delete contacts from a list by selection (DESTRUCTIVE). Returns the raw payload. */
+export async function deleteContactsSelection(
+  listId: number,
+  selection: ContactsSelection,
+): Promise<unknown> {
+  return api<unknown>(`/contact-lists/${listId}/contacts`, {
+    method: "DELETE",
+    body: JSON.stringify(selection),
+  });
+}
+
 export { API_BASE };

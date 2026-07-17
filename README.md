@@ -35,6 +35,9 @@ OpenRouter, …).
 | `run_google_maps_targeting` | `search`, `locations?`, `contact_list_name`, `max_links?`, `max_results?` | `{ contact_list_id, urls[], … }` — generate **+** extract in one call |
 | `list_contact_lists` | `name?` (filter), `limit?` (1–200, default 25) | `{ total, lists[] }` |
 | `get_contact_list_status` | `contact_list_id` | `{ id, name, contacts, emails, companies, jobs[] }` |
+| `list_contact_fields` | `contact_list_id` | `{ fields[] }` — each `{ data_field_id, identifier, label, type }` |
+| `preview_contact_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?` | `{ list_name, matched_count, total_count, to_delete, to_keep }` — **read-only** |
+| `delete_contacts_by_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?`, `confirm_count`, `delete_entire_list?` | `{ deleted, list_name, remaining }` — **destructive, guarded** |
 
 ## How targeting works
 
@@ -47,6 +50,45 @@ OpenRouter, …).
    Only then are the counts final. Never assume "done" from the extract call alone.
 
 `run_google_maps_targeting` combines steps 1 + 2 for convenience.
+
+## Manipulating contacts in a list
+
+Beyond building lists, the server can **prune** them by criteria — with a safety net so
+an agent can't wipe a list by accident.
+
+1. **Discover fields** — `list_contact_fields` returns the filterable fields
+   (`identifier` like `email` / `company` / `first_name`, plus `data_field_id`, `label`,
+   `type`). Name fields by their `identifier` in criteria.
+2. **Preview** — `preview_contact_selection` counts what a selection would affect and
+   **deletes nothing**. It returns `matched_count`, `total_count`, and — for the chosen
+   `target` — `to_delete` / `to_keep`.
+3. **Delete** — `delete_contacts_by_selection` removes contacts, behind two guardrails.
+
+**Criteria** are `{ field, op, value? }` objects:
+
+| `op` (aliases) | Meaning |
+| --- | --- |
+| `contains` / `not_contains` | substring match |
+| `equals` / `not_equals` | exact match |
+| `starts_with` / `ends_with` | prefix / suffix |
+| `greater_than` (`gt`) / `greater_or_equal` / `less_than` (`lt`) / `less_or_equal` | numeric compare |
+| `has_value` (`does_exist`) / `is_empty` (`does_not_exist`) | existence — **no `value` needed** |
+
+- **`match`**: `all` (AND, default) or `any` (OR) across the criteria.
+- **`target`**: `matching` (default — select the contacts that match) or
+  `all_except_matching` (select everyone who does **not** match, i.e. keep only the matches).
+
+**Guardrails on `delete_contacts_by_selection`:**
+
+- **`confirm_count` is required** and must equal the **live** `to_delete` (re-counted at
+  delete time). Pass the `to_delete` you got from `preview_contact_selection`. If the list
+  changed in between (count differs), the delete is refused — preview again.
+- **Empty criteria are refused** (they would match the whole list) unless you explicitly
+  set `delete_entire_list: true`.
+
+```
+list_contact_fields → preview_contact_selection → (read to_delete) → delete_contacts_by_selection(confirm_count = to_delete)
+```
 
 ## Transports
 
@@ -159,7 +201,7 @@ discovered.
 ```
 src/
 ├── magileads.ts   Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts       The 5 MCP tool definitions + handlers (input validation, error wrapping)
+├── tools.ts       The 8 MCP tool definitions + handlers (input validation, error wrapping)
 ├── server.ts      buildServer() — creates an McpServer with all tools registered
 ├── index.ts       stdio entry point
 └── http.ts        HTTP entry point (Streamable HTTP + bearer/query auth + /health)
