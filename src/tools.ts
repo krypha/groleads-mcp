@@ -13,12 +13,18 @@ import {
   getWorkflow,
   getProgrammationStatistics,
   getStepModel,
+  getMe,
+  listLinkedinAccounts,
+  searchContactListsPaginated,
+  queryContacts,
+  searchContacts,
   EMPTY_FILTER,
   MagileadsError,
   type DataField,
   type FilterNode,
   type FilterValue,
   type Raw,
+  type ContactsPage,
 } from "./magileads.js";
 
 const MAX_LINKS = 40;
@@ -322,6 +328,100 @@ function normalizeMessage(model: Raw | null): { subject: string | null; body: st
   const subject = pick("subject");
   const body = pick("html") ?? pick("text") ?? pick("content") ?? pick("message") ?? null;
   return { subject, body };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Data-query helpers (account / lists / contacts)                             */
+/* -------------------------------------------------------------------------- */
+
+/** Thousands-separated integer (12345 → "12,345"); passes non-numbers through. */
+const fmt = (n: unknown): string =>
+  typeof n === "number" && Number.isFinite(n) ? n.toLocaleString("en-US") : String(n ?? "");
+
+/** Build id↔identifier maps from the account's (global) data fields. */
+async function dataFieldMaps(): Promise<{
+  idToIdentifier: Map<number, string>;
+  identifierToId: Map<string, number>;
+}> {
+  const fields = await listDataFields();
+  const idToIdentifier = new Map<number, string>();
+  const identifierToId = new Map<string, number>();
+  for (const f of fields) {
+    if (typeof f.id === "number" && typeof f.identifier === "string") {
+      idToIdentifier.set(f.id, f.identifier);
+      identifierToId.set(f.identifier.trim().toLowerCase(), f.id);
+    }
+  }
+  return { idToIdentifier, identifierToId };
+}
+
+/** Resolve a human field name (or numeric id / special token) to the API field_name string. */
+function resolveFieldName(name: string, identifierToId: Map<string, number>): string {
+  const raw = String(name).trim();
+  const lc = raw.toLowerCase();
+  if (identifierToId.has(lc)) return String(identifierToId.get(lc));
+  if (SPECIAL_FIELDS.has(lc)) return lc;
+  if (/^\d+$/.test(raw)) return raw; // already a data_field_id
+  throw new Error(
+    `Unknown field "${name}". Call list_contact_fields for valid identifiers, or pass a numeric data_field_id.`,
+  );
+}
+
+/** Recursively resolve field names inside a Magileads Filter object to id strings. */
+function resolveFilter(filter: Raw, identifierToId: Map<string, number>): FilterNode {
+  const mode = filter.mode === "or" ? "or" : "and";
+  const rawValues = Array.isArray(filter.values) ? (filter.values as Raw[]) : [];
+  const values = rawValues.map((v) => {
+    if (v && typeof v === "object" && Array.isArray((v as Raw).values)) {
+      return resolveFilter(v as Raw, identifierToId); // nested filter node
+    }
+    const o = v as Raw;
+    const fieldRaw = (o.field_name ?? o.field) as string | undefined;
+    if (fieldRaw == null) throw new Error("Each filter value needs a `field_name` (or `field`).");
+    const leaf: FilterValue = {
+      field_name: resolveFieldName(String(fieldRaw), identifierToId),
+      type: String(o.type ?? "contains"),
+    };
+    if (o.value !== undefined) leaf.value = o.value as string | string[];
+    return leaf;
+  });
+  return { mode, values };
+}
+
+/** Resolve a contact's `[{data_field_id,value}]` properties to a `{ identifier: value }` object. */
+function resolveContact(contact: Raw, idToIdentifier: Map<number, string>): Raw {
+  const props = Array.isArray(contact.properties) ? (contact.properties as Raw[]) : [];
+  const out: Raw = { id: contact.id };
+  for (const p of props) {
+    const fid = typeof p.data_field_id === "number" ? p.data_field_id : null;
+    if (fid == null) continue;
+    out[idToIdentifier.get(fid) ?? `field_${fid}`] = p.value;
+  }
+  return out;
+}
+
+/** Compact per-page view of a contacts result (max 50 rows), shared by query/search. */
+function contactsView(
+  res: ContactsPage,
+  page: number,
+  perPage: number,
+  idToIdentifier: Map<number, string>,
+): Raw {
+  const contacts = (res.results ?? []).slice(0, 50).map((c) => resolveContact(c, idToIdentifier));
+  return {
+    total: num(res.number_of_results),
+    total_formatted: fmt(res.number_of_results),
+    pages: num(res.number_of_pages),
+    page,
+    per_page: perPage,
+    counts: {
+      contacts: num(res.number_of_contacts),
+      emails: num(res.number_of_emails),
+      linkedin_url: num(res.number_of_linkedin_url),
+    },
+    returned: contacts.length,
+    contacts,
+  };
 }
 
 /** Register the Google Maps targeting tools onto an McpServer instance. */
@@ -1083,6 +1183,307 @@ export function registerTools(server: McpServer): void {
             "sent=contacted; opens/clicks/replies are UNIQUE-contact counts; rates are percentages. " +
             "email.delivered, email.opens (total), and linkedin.invites_accepted are null (not exposed by the API). " +
             "Correlate per_step.step_id with get_scenario steps to tie each message to its stats.",
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  /* ------------------------------------------------------------------------ */
+  /* Read-only data browsing: account · linkedin · lists · contacts            */
+  /* Compact, capped responses (agents have limited context). No writes.       */
+  /* ------------------------------------------------------------------------ */
+
+  server.registerTool(
+    "get_account_overview",
+    {
+      title: "Get the Magileads account overview",
+      description:
+        "Summarize the connected Magileads/Groleads account: identity (name, email, id), company/" +
+        "role, and plan/subscription status (active, trial, end_date, billing). Note: the API " +
+        "exposes subscription STATUS but no numeric credit balance, so credit counts are not " +
+        "reported. Takes no parameters.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (): Promise<TextResult> => {
+      try {
+        const me = await getMe();
+        const subs = (me.subscriptions ?? {}) as Raw;
+        const teams = Array.isArray(me.teams) ? (me.teams as Raw[]) : [];
+        const orgs = Array.isArray(me.organizations) ? (me.organizations as Raw[]) : [];
+        const name = [me.first_name, me.last_name].filter(Boolean).join(" ").trim() || null;
+        return ok({
+          id: num(me.id),
+          first_name: me.first_name ?? null,
+          last_name: me.last_name ?? null,
+          email: me.email ?? null,
+          company: me.company ?? null,
+          job_title: me.job_title ?? null,
+          phone: me.phone ?? me.mobile_phone ?? null,
+          country: me.country ?? null,
+          language: me.language ?? null,
+          timezone: me.timezone ?? null,
+          level: me.level ?? null,
+          activated: me.activated ?? null,
+          created_on: me.created_on ?? null,
+          last_activity: me.last_activity ?? null,
+          subscription: {
+            active: subs.active ?? null,
+            trial: subs.trial ?? null,
+            end_date: subs.end_date ?? null,
+            recurring_interval: subs.recurring_interval ?? null,
+            monthly_amount: subs.monthly_amount ?? null,
+            is_canceled: subs.is_canceled ?? null,
+            payment_method_valid: subs.payment_method_valid ?? null,
+          },
+          teams: { count: teams.length, names: teams.map((t) => t.name).filter(Boolean) },
+          organizations: { count: orgs.length, names: orgs.map((o) => o.name).filter(Boolean) },
+          permissions_count: Array.isArray(me.permissions) ? me.permissions.length : null,
+          summary:
+            `${name ?? me.email ?? "account"} — plan ${subs.active ? "active" : "inactive"}` +
+            `${subs.end_date ? ` until ${String(subs.end_date).slice(0, 10)}` : ""}, ` +
+            `${teams.length} team(s), ${orgs.length} org(s)`,
+          _note: "No numeric credit balance is exposed by the API; subscription status is what's available.",
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_linkedin_accounts",
+    {
+      title: "List connected LinkedIn accounts",
+      description:
+        "List the account's connected LinkedIn integration accounts and their health, so an agent " +
+        "can tell whether LinkedIn steps will run. Per account: id, name, username, is_valid, " +
+        "validity_tested, checkpoint_required, is_sales_navigator_account, last_use. Takes no " +
+        "parameters.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (): Promise<TextResult> => {
+      try {
+        const accounts = await listLinkedinAccounts();
+        const view = accounts.map((a) => ({
+          id: num(a.id),
+          name: a.name ?? null,
+          username: a.username ?? null,
+          is_valid: a.is_valid ?? null,
+          validity_tested: a.validity_tested ?? null,
+          checkpoint_required: a.checkpoint_required ?? null,
+          is_sales_navigator_account: a.is_sales_navigator_account ?? null,
+          last_use: a.last_use ?? null,
+        }));
+        const valid = view.filter((a) => a.is_valid === true).length;
+        const checkpoint = view.filter((a) => a.checkpoint_required === true).length;
+        return ok({
+          count: view.length,
+          valid,
+          checkpoint,
+          accounts: view,
+          summary: `${view.length} LinkedIn account(s): ${valid} valid, ${checkpoint} in checkpoint`,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_contact_lists",
+    {
+      title: "Search / browse contact lists (paged)",
+      description:
+        "Browse the account's contact lists with paging and sorting. Filter by `name` (substring); " +
+        "sort by `name` or `id` (default `id`, newest first). Returns each list's id, name, and " +
+        "counters (contacts/emails/linkedin/companies), plus list_type/created_on, and the total " +
+        "count and number of pages. The API only supports name/id for sort & filter.",
+      inputSchema: {
+        name: z.string().optional().describe("Optional case-insensitive substring filter on the list name."),
+        sort: z.enum(["name", "id"]).optional().describe("Sort field: 'id' (default, newest first) or 'name' (A→Z)."),
+        per_page: z.number().int().optional().describe("Results per page (1–100, default 25)."),
+        page: z.number().int().optional().describe("1-based page number (default 1)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ name, sort, per_page, page }): Promise<TextResult> => {
+      try {
+        const perPage = clamp(Math.trunc(per_page ?? 25), 1, 100);
+        const pg = Math.max(Math.trunc(page ?? 1), 1);
+        const sortField = sort === "name" ? "name" : "id";
+        const sortDirection: "asc" | "desc" = sortField === "name" ? "asc" : "desc";
+        const res = await searchContactListsPaginated({ name, sortField, sortDirection, perPage, page: pg });
+        const lists = (res.results ?? []).map((l) => ({
+          id: num(l.id),
+          name: l.name ?? null,
+          number_of_contacts: num(l.number_of_contacts),
+          number_of_emails: num(l.number_of_emails),
+          number_of_linkedin_url: num(l.number_of_linkedin_url),
+          number_of_companies: num(l.number_of_companies),
+          list_type: l.list_type ?? null,
+          created_on: l.created_on ?? null,
+        }));
+        return ok({
+          total: num(res.number_of_results),
+          total_formatted: fmt(res.number_of_results),
+          pages: num(res.number_of_pages),
+          page: pg,
+          per_page: perPage,
+          ...(name?.trim() ? { name_filter: name.trim() } : {}),
+          returned: lists.length,
+          lists,
+          summary: `${fmt(res.number_of_results)} list(s) — page ${pg}/${res.number_of_pages ?? 1}`,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_contact_list",
+    {
+      title: "Get a contact list's profile",
+      description:
+        "Fetch one contact list's profile: counts (contacts/emails/linkedin/companies), list_type, " +
+        "language, country, created_on, pin, and the state of any running jobs (`jobs` + " +
+        "`in_progress`) so an agent can tell whether an import/extraction is still underway.",
+      inputSchema: {
+        contact_list_id: z.number().int().positive().describe("The contact list id."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ contact_list_id }): Promise<TextResult> => {
+      try {
+        const p = await getContactList(contact_list_id);
+        const details = Array.isArray(p.state_details) ? p.state_details : [];
+        const jobs = details.map((j) => ({ type: j.type, state: j.state, percent: j.percent }));
+        // A job is "running" unless its state is terminal. States are Capitalized
+        // (e.g. "Completed", "Error") so compare case-insensitively.
+        const TERMINAL = new Set(["completed", "error", "failed", "canceled", "cancelled", "done"]);
+        const in_progress = details.some((j) => {
+          const s = String(j.state ?? "").toLowerCase();
+          return s !== "" && !TERMINAL.has(s);
+        });
+        return ok({
+          id: num(p.id),
+          name: p.name ?? null,
+          list_type: p.list_type ?? null,
+          language: p.language ?? null,
+          country: p.country ?? null,
+          created_on: p.created_on ?? null,
+          pin: p.pin ?? null,
+          counts: {
+            contacts: num(p.number_of_contacts),
+            emails: num(p.number_of_emails),
+            linkedin_url: num(p.number_of_linkedin_url),
+            companies: num(p.number_of_companies),
+          },
+          jobs,
+          in_progress,
+          summary:
+            `${p.name ?? contact_list_id} — ${fmt(p.number_of_contacts ?? 0)} contacts ` +
+            `(${fmt(p.number_of_emails ?? 0)} emails)${in_progress ? ", job in progress" : ""}`,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "query_contacts",
+    {
+      title: "Query contacts in a list (filter + sort, paged)",
+      description:
+        "List a contact list's contacts with an optional Magileads `filter` and `sort`. Field names " +
+        "may be human identifiers (email, company, first_name, …) — they're resolved to data-field " +
+        "ids automatically. Contacts are returned with RESOLVED, readable property names, capped at " +
+        "50 rows per call. `filter` = { mode:'and'|'or', values:[{ field/field_name, type, value }] } " +
+        "(type: contains, equals, start_with, does_exist, …). Also returns the total match count and " +
+        "page count. Never returns more than 50 contacts — page through for more.",
+      inputSchema: {
+        contact_list_id: z.number().int().positive().describe("The contact list id."),
+        filter: z
+          .object({
+            mode: z.enum(["and", "or"]).optional(),
+            values: z.array(z.any()),
+          })
+          .optional()
+          .describe("Magileads Filter object. Leaf: { field (identifier or id), type, value }; nesting allowed."),
+        sort: z
+          .object({
+            field: z.string().describe("Field identifier or data_field_id to sort on."),
+            direction: z.enum(["asc", "desc"]).optional(),
+          })
+          .optional()
+          .describe("Sort by a field, asc/desc (default desc)."),
+        per_page: z.number().int().optional().describe("Rows per page (1–50, default 50)."),
+        page: z.number().int().optional().describe("1-based page number (default 1)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ contact_list_id, filter, sort, per_page, page }): Promise<TextResult> => {
+      try {
+        const perPage = clamp(Math.trunc(per_page ?? 50), 1, 50);
+        const pg = Math.max(Math.trunc(page ?? 1), 1);
+        const { idToIdentifier, identifierToId } = await dataFieldMaps();
+        const options: Record<string, unknown> = { per_page: perPage };
+        if (filter) options.filter = resolveFilter(filter as Raw, identifierToId);
+        if (sort?.field) {
+          options.sort = {
+            field_name: resolveFieldName(sort.field, identifierToId),
+            sort_direction: sort.direction === "asc" ? "asc" : "desc",
+          };
+        }
+        const res = await queryContacts(contact_list_id, JSON.stringify(options), pg);
+        const view = contactsView(res, pg, perPage, idToIdentifier);
+        return ok({
+          list_id: contact_list_id,
+          ...view,
+          summary: `${fmt(res.number_of_results)} contact(s) match — page ${pg}/${res.number_of_pages ?? 1}, showing ${view.returned}`,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_contacts",
+    {
+      title: "Free-text search contacts in a list (paged)",
+      description:
+        "Search a contact list's contacts by a free-text `query` (matched across fields by the API). " +
+        "Returns contacts with RESOLVED, readable property names, capped at 50 rows per call, plus " +
+        "the total match count and page count. The query must be at least a couple of characters " +
+        "(the API rejects very short queries).",
+      inputSchema: {
+        contact_list_id: z.number().int().positive().describe("The contact list id."),
+        query: z.string().min(1).describe("Free-text search string (a few characters minimum)."),
+        per_page: z.number().int().optional().describe("Rows per page (1–50, default 50)."),
+        page: z.number().int().optional().describe("1-based page number (default 1)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ contact_list_id, query, per_page, page }): Promise<TextResult> => {
+      try {
+        const q = query.trim();
+        if (!q) return fail(new Error("query must not be blank."));
+        const perPage = clamp(Math.trunc(per_page ?? 50), 1, 50);
+        const pg = Math.max(Math.trunc(page ?? 1), 1);
+        const { idToIdentifier } = await dataFieldMaps();
+        const res = await searchContacts(contact_list_id, q, JSON.stringify({ per_page: perPage }), pg);
+        const view = contactsView(res, pg, perPage, idToIdentifier);
+        return ok({
+          list_id: contact_list_id,
+          query: q,
+          ...view,
+          summary: `"${q}": ${fmt(res.number_of_results)} match(es) — page ${pg}/${res.number_of_pages ?? 1}, showing ${view.returned}`,
         });
       } catch (err) {
         return fail(err);

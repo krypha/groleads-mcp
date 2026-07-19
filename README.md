@@ -42,6 +42,12 @@ OpenRouter, …).
 | `get_campaign` | `campaign_id` | `{ id, name, status, channels[], scenario_id, target_lists:[{id,name,count}], total_contacts }` |
 | `get_scenario` | `scenario_id` | `{ steps[] }` — each step with full `subject`/`body` (not truncated) |
 | `get_campaign_statistics` | `campaign_id` | `{ aggregate, email, linkedin, by_action_type, per_step[] }` |
+| `get_account_overview` | *(none)* | `{ id, name, email, level, subscription{…}, teams, organizations }` |
+| `list_linkedin_accounts` | *(none)* | `{ count, valid, checkpoint, accounts[] }` |
+| `search_contact_lists` | `name?`, `sort?` (name\|id), `per_page?` (1–100, default 25), `page?` | `{ total, pages, lists[] }` |
+| `get_contact_list` | `contact_list_id` | `{ counts{…}, list_type, jobs[], in_progress }` |
+| `query_contacts` | `contact_list_id`, `filter?`, `sort?`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — resolved field names, capped at 50 |
+| `search_contacts` | `contact_list_id`, `query`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — resolved field names, capped at 50 |
 
 ## How targeting works
 
@@ -127,6 +133,28 @@ API returns `unauthorized_workflow` / `unauthorized_workflow_programmation`.
 ```
 list_campaigns → get_campaign → get_scenario (messages) + get_campaign_statistics (per-step) → agent correlates by step_id
 ```
+
+## Querying the account's data (read-only)
+
+Six **read-only** tools let an agent explore everything in the account without changing a
+thing. Responses are **compact and capped** (agents have limited context): they summarize,
+paginate, and never dump giant raw payloads.
+
+- `get_account_overview` — who's connected: identity + plan/subscription status. *(The API
+  exposes subscription status but **no numeric credit balance**, so credits aren't reported.)*
+- `list_linkedin_accounts` — connected LinkedIn accounts and their health (`is_valid`,
+  `checkpoint_required`, …), so you can tell whether LinkedIn steps will run.
+- `search_contact_lists` — browse lists with paging + `name` filter, sorted by `name` or `id`.
+- `get_contact_list` — one list's counters, type, and job state (`in_progress` tells you if
+  an import/extraction is still running).
+- `query_contacts` — a list's contacts with a Magileads `filter` + `sort`. Field names may be
+  **human identifiers** (`email`, `company`, `first_name`, …) — resolved to field ids for you —
+  and each contact is returned with **resolved, readable** property names. **Capped at 50 rows**
+  per call; page through for more.
+- `search_contacts` — the same, but by a free-text `query` across fields.
+
+> **Pagination.** Contacts use cursor pagination: the first call creates a cursor and the
+> tool follows it for `page` > 1 automatically — just pass `page`.
 
 ## Transports
 
@@ -239,7 +267,7 @@ discovered.
 ```
 src/
 ├── magileads.ts   Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts       The 12 MCP tool definitions + handlers (input validation, error wrapping)
+├── tools.ts       The 18 MCP tool definitions + handlers (input validation, error wrapping)
 ├── server.ts      buildServer() — creates an McpServer with all tools registered
 ├── index.ts       stdio entry point
 └── http.ts        HTTP entry point (Streamable HTTP + bearer/query auth + /health)

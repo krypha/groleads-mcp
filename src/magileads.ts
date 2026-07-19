@@ -448,4 +448,125 @@ export async function getStepModel(actionType: string, modelId: number): Promise
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Account / integrations / data browsing (READ-ONLY)                          */
+/* -------------------------------------------------------------------------- */
+
+/** Fetch the authenticated account's profile (`GET /users/me` -> user_profile). */
+export async function getMe(): Promise<Raw> {
+  const data = await api<{ user_profile: Raw }>("/users/me", { method: "GET" });
+  return data.user_profile;
+}
+
+/** List the account's connected LinkedIn integration accounts. */
+export async function listLinkedinAccounts(): Promise<Raw[]> {
+  const data = await api<{ linkedin_accounts_list?: Raw[] }>("/integrations/linkedin", {
+    method: "GET",
+  });
+  return data.linkedin_accounts_list ?? [];
+}
+
+/** A page of contact lists (root envelope of the paginated list endpoint). */
+export type ContactListPage = {
+  number_of_results?: number;
+  number_of_pages?: number;
+  results?: ContactListSummary[];
+};
+
+/**
+ * Search/browse contact lists with paging + sorting. The endpoint only sorts/
+ * filters on `name` or `id`; `options` is a URL-encoded JSON blob and the page
+ * number is a path segment (`/contact-lists-paginated/page/{n}`).
+ */
+export async function searchContactListsPaginated(opts: {
+  name?: string;
+  sortField: "name" | "id";
+  sortDirection: "asc" | "desc";
+  perPage: number;
+  page: number;
+}): Promise<ContactListPage> {
+  const options: Record<string, unknown> = {
+    per_page: opts.perPage,
+    sort: { field_name: opts.sortField, sort_direction: opts.sortDirection },
+  };
+  if (opts.name && opts.name.trim()) {
+    options.filter = {
+      mode: "and",
+      values: [{ field_name: "name", type: "contains", value: opts.name.trim() }],
+    };
+  }
+  const q = `?options=${encodeURIComponent(JSON.stringify(options))}`;
+  return api<ContactListPage>(`/contact-lists-paginated/page/${opts.page}${q}`, { method: "GET" });
+}
+
+/**
+ * A page of contacts. NOTE (verified live, differs from some docs): `results` is a
+ * FLAT array of Contact objects and the per-list counters sit at the ROOT — there
+ * is no `results[0].results` nesting. Pagination is cursor-based: `current_page` /
+ * `next_page` are URLs of the form
+ * `/contact-lists/{id}/contacts[/search]/{cursor}/page/{n}`, and a `page` field
+ * inside `options` is ignored.
+ */
+export type ContactsPage = {
+  number_of_results?: number;
+  number_of_pages?: number;
+  current_page?: string | null;
+  next_page?: string | null;
+  previous_page?: string | null;
+  number_of_contacts?: number;
+  number_of_emails?: number;
+  number_of_linkedin_url?: number;
+  results?: Raw[];
+};
+
+/** Derive the path for page N from a cursor URL, keeping only the pathname. */
+function cursorPagePath(currentPage: string | null | undefined, page: number): string | null {
+  if (!currentPage) return null;
+  try {
+    const { pathname } = new URL(currentPage);
+    return /\/page\/\d+$/.test(pathname) ? pathname.replace(/\/page\/\d+$/, `/page/${page}`) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Query a list's contacts with a pre-built `options` JSON (PaginationOptions). The
+ * first call creates the cursor; for page>1 we replay the requested page against the
+ * cursor URL the first call returned. `optionsJson` is passed through verbatim.
+ */
+export async function queryContacts(
+  listId: number,
+  optionsJson: string,
+  page: number,
+): Promise<ContactsPage> {
+  const q = `?options=${encodeURIComponent(optionsJson)}`;
+  const first = await api<ContactsPage>(`/contact-lists/${listId}/contacts${q}`, { method: "GET" });
+  if (page <= 1) return first;
+  const path = cursorPagePath(first.current_page, page);
+  if (!path) return first;
+  return api<ContactsPage>(`${path}${q}`, { method: "GET" });
+}
+
+/**
+ * Free-text search within a list's contacts. POST creates the cursor; deeper pages
+ * are GET on the returned cursor URL (per the API). Same flat envelope as queryContacts.
+ */
+export async function searchContacts(
+  listId: number,
+  query: string,
+  optionsJson: string,
+  page: number,
+): Promise<ContactsPage> {
+  const q = `?options=${encodeURIComponent(optionsJson)}`;
+  const first = await api<ContactsPage>(`/contact-lists/${listId}/contacts/search${q}`, {
+    method: "POST",
+    body: JSON.stringify({ query }),
+  });
+  if (page <= 1) return first;
+  const path = cursorPagePath(first.current_page, page);
+  if (!path) return first;
+  return api<ContactsPage>(`${path}${q}`, { method: "GET" });
+}
+
 export { API_BASE };

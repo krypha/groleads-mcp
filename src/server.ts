@@ -5,7 +5,7 @@ import { registerTools } from "./tools.js";
 export function buildServer(): McpServer {
   const server = new McpServer({
     name: "groleads-google-maps",
-    version: "0.4.0",
+    version: "0.5.0",
   });
   registerTools(server);
   return server;

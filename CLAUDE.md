@@ -22,7 +22,7 @@ src/magileads.ts   Self-contained Magileads API client. Dual auth from env:
                    (JWT via POST /users/authentication, auto-refreshed via
                    /users/authentication/refresh, 30s-early renewal, retry-once on 401).
                    Base URL MAGILEADS_API_BASE (default https://app.api-magileads.net).
-src/tools.ts       The 12 tools + handlers. Every handler is wrapped so it NEVER throws
+src/tools.ts       The 18 tools + handlers. Every handler is wrapped so it NEVER throws
                    (returns {content:[...], isError:true} on failure via fail()). Inputs
                    are clamped (max_links 1–40, max_results 1–200, urls sliced to 10,
                    criteria capped at 30 — never silently dropped on a delete).
@@ -34,7 +34,7 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
                    server+transport per request, GET /health, and auth (see below).
 ```
 
-**The 12 tools:**
+**The 18 tools:**
 
 *Google Maps targeting* — `generate_maps_search_urls`, `extract_maps_search`,
 `run_google_maps_targeting` (one-shot generate+extract).
@@ -48,6 +48,9 @@ behind two guardrails — see below).
 
 *Campaign audit (all read-only)* — `list_campaigns`, `get_campaign`, `get_scenario`
 (full step content), `get_campaign_statistics` (aggregate + per-step). See below.
+
+*Data browsing (all read-only)* — `get_account_overview`, `list_linkedin_accounts`,
+`search_contact_lists`, `get_contact_list`, `query_contacts`, `search_contacts`. See below.
 
 ## Key behavioral facts (don't relearn these the hard way)
 
@@ -109,6 +112,37 @@ Magileads vocabulary: a **campaign** = a workflow *programmation*; a **scenario*
 - These tools return RAW + COMPLETE data; the audit/analysis is the agent's job, not the MCP's.
 - Auth: the campaign/scenario must belong to the server's own account, else the API returns
   `unauthorized_workflow` / `unauthorized_workflow_programmation` (surfaced via `fail()`).
+
+## Data browsing (the read-only query path)
+
+Six tools let an agent read the whole account. Responses are COMPACT + CAPPED (summaries,
+paging; never dump giant payloads).
+
+- `get_account_overview` → `GET /users/me` → `user_profile`. Identity + `subscriptions`
+  (plan STATUS: active/trial/end_date/…). **No numeric credit balance exists** in the API —
+  don't invent one; the tool says so.
+- `list_linkedin_accounts` → `GET /integrations/linkedin` → `linkedin_accounts_list`
+  (id/name/username/is_valid/validity_tested/checkpoint_required/is_sales_navigator_account/last_use).
+- `search_contact_lists` → `GET /contact-lists-paginated/page/{n}?options=` (path templated
+  as `/page/{n}` even though swagger only lists `/contact-lists-paginated`). `options` sorts/
+  filters ONLY on `name`/`id`. Root envelope: `number_of_results`/`number_of_pages`/`results[]`.
+- `get_contact_list` → reuses `getContactList` (`GET /contact-lists/{id}` → `contact_list_profile`).
+  Job states are Capitalized (`"Completed"`, `"Error"`) → compare case-insensitively; `in_progress`
+  is true only for non-terminal states.
+- `query_contacts` → `GET /contact-lists/{id}/contacts?options=` and `search_contacts` →
+  `POST /contact-lists/{id}/contacts/search {query}` (+ `?options=`). Key facts (verified live,
+  differ from swagger prose):
+  - **Flat envelope**: contacts are `results[]` directly (each a `Contact` with
+    `properties:[{data_field_id,value}]`); per-list counters (`number_of_contacts/emails/
+    linkedin_url`) sit at the ROOT — there is NO `results[0].results` nesting.
+  - **Cursor pagination**: the first call mints a cursor; `current_page`/`next_page` are URLs
+    `/contact-lists/{id}/contacts[/search]/{cursor}/page/{n}`. A `page` field inside `options`
+    is IGNORED. `magileads.ts` derives page-N by rewriting the cursor URL's pathname
+    (`cursorPagePath`), so the server's base URL — not the API's echoed host — is used.
+  - **Field resolution**: `field_name` in filters/sort is a `data_field_id` as a STRING;
+    `tools.ts` resolves human identifiers → id via `/data-fields`, and resolves each contact's
+    `properties` back to `{ identifier: value }`. Output is CAPPED at 50 contacts per call.
+  - Search rejects very short queries (`query_too_short`) — surfaced via `fail()`.
 
 ## Auth (HTTP mode)
 
