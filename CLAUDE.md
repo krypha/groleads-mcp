@@ -22,7 +22,7 @@ src/magileads.ts   Self-contained Magileads API client. Dual auth from env:
                    (JWT via POST /users/authentication, auto-refreshed via
                    /users/authentication/refresh, 30s-early renewal, retry-once on 401).
                    Base URL MAGILEADS_API_BASE (default https://app.api-magileads.net).
-src/tools.ts       The 18 tools + handlers. Every handler is wrapped so it NEVER throws
+src/tools.ts       The 22 tools + handlers. Every handler is wrapped so it NEVER throws
                    (returns {content:[...], isError:true} on failure via fail()). Inputs
                    are clamped (max_links 1–40, max_results 1–200, urls sliced to 10,
                    criteria capped at 30 — never silently dropped on a delete).
@@ -34,7 +34,7 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
                    server+transport per request, GET /health, and auth (see below).
 ```
 
-**The 18 tools:**
+**The 22 tools:**
 
 *Google Maps targeting* — `generate_maps_search_urls`, `extract_maps_search`,
 `run_google_maps_targeting` (one-shot generate+extract).
@@ -51,6 +51,9 @@ behind two guardrails — see below).
 
 *Data browsing (all read-only)* — `get_account_overview`, `list_linkedin_accounts`,
 `search_contact_lists`, `get_contact_list`, `query_contacts`, `search_contacts`. See below.
+
+*PRM / pipeline (all read-only)* — `list_prm_statuses`, `query_prm_contacts`,
+`get_prm_contact`, `list_prm_nurturings`. See below.
 
 ## Key behavioral facts (don't relearn these the hard way)
 
@@ -143,6 +146,32 @@ paging; never dump giant payloads).
     `tools.ts` resolves human identifiers → id via `/data-fields`, and resolves each contact's
     `properties` back to `{ identifier: value }`. Output is CAPPED at 50 contacts per call.
   - Search rejects very short queries (`query_too_short`) — surfaced via `fail()`.
+
+## PRM / pipeline (the read-only CRM path)
+
+The PRM is Magileads' CRM / prospection pipeline. Four read-only tools; NO writes (no status
+change, note, call, exclusion, LinkedIn send, import, delete).
+
+- `list_prm_statuses` → `GET /prm/status` + `GET /prm/status/custom` (merged). **Two different
+  shapes** (verified live): default statuses are `{status:<key string>, visible, color, sorting}`
+  (NO id/name — the key IS the name, e.g. "opener"); custom statuses are `{id, name, visible,
+  color, sorting, type_default_status}`. A contact's `custom_status` (int) resolves via the
+  custom list; its `status` is a default key.
+- `query_prm_contacts` → `GET /prm/contacts?options=` — same flat envelope + cursor pagination
+  as the contacts endpoint (`/prm/contacts/{cursor}/page/{n}`; `page` in options ignored).
+  Convenience params build a Filter: `status` → `status`/`custom_status equals` (name→id via the
+  custom list), `only_positive` → `is_positive equals true`, `search` → `any_datafield contains`.
+  `resolvePrmFieldName` passes PRM special fields through (status/custom_status/is_positive/score/
+  created_on/any_datafield/…, `PRM_FIELDS`) and resolves data-field identifiers → id. Capped at 50.
+- `get_prm_contact` → `GET /prm/contact/{id}` → `contact_profile`. **Do NOT pass
+  `set_new_reply_read`** (it marks replies read = a write). Engagement `scoring` is DERIVED:
+  summed from each `programmations[].score_{open,link_click,answer,positive_answer,
+  negative_answer,invitation_accepted}_count` — there is no top-level scoring object. **Notes are
+  NOT in the profile** (dedicated `/prm/contact/{id}/note*` endpoints, not exposed); they may
+  appear as items inside `history` (a heterogeneous, swagger-undocumented oneOf → passed raw,
+  capped at 30).
+- `list_prm_nurturings` → `GET /prm/nurturings` → `{id, name, filter, contact_list_ids, created_on}`.
+- Auth errors (`prm_contact_does_not_exist`, unauthorized) surface via `fail()`.
 
 ## Auth (HTTP mode)
 

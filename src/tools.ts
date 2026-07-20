@@ -18,6 +18,10 @@ import {
   searchContactListsPaginated,
   queryContacts,
   searchContacts,
+  listPrmStatuses,
+  queryPrmContacts,
+  getPrmContact,
+  listPrmNurturings,
   EMPTY_FILTER,
   MagileadsError,
   type DataField,
@@ -367,21 +371,18 @@ function resolveFieldName(name: string, identifierToId: Map<string, number>): st
   );
 }
 
-/** Recursively resolve field names inside a Magileads Filter object to id strings. */
-function resolveFilter(filter: Raw, identifierToId: Map<string, number>): FilterNode {
+/** Recursively resolve field names inside a Magileads Filter object, via `resolve`. */
+function resolveFilter(filter: Raw, resolve: (name: string) => string): FilterNode {
   const mode = filter.mode === "or" ? "or" : "and";
   const rawValues = Array.isArray(filter.values) ? (filter.values as Raw[]) : [];
   const values = rawValues.map((v) => {
     if (v && typeof v === "object" && Array.isArray((v as Raw).values)) {
-      return resolveFilter(v as Raw, identifierToId); // nested filter node
+      return resolveFilter(v as Raw, resolve); // nested filter node
     }
     const o = v as Raw;
     const fieldRaw = (o.field_name ?? o.field) as string | undefined;
     if (fieldRaw == null) throw new Error("Each filter value needs a `field_name` (or `field`).");
-    const leaf: FilterValue = {
-      field_name: resolveFieldName(String(fieldRaw), identifierToId),
-      type: String(o.type ?? "contains"),
-    };
+    const leaf: FilterValue = { field_name: resolve(String(fieldRaw)), type: String(o.type ?? "contains") };
     if (o.value !== undefined) leaf.value = o.value as string | string[];
     return leaf;
   });
@@ -389,15 +390,78 @@ function resolveFilter(filter: Raw, identifierToId: Map<string, number>): Filter
 }
 
 /** Resolve a contact's `[{data_field_id,value}]` properties to a `{ identifier: value }` object. */
-function resolveContact(contact: Raw, idToIdentifier: Map<number, string>): Raw {
+function resolveProps(contact: Raw, idToIdentifier: Map<number, string>): Raw {
   const props = Array.isArray(contact.properties) ? (contact.properties as Raw[]) : [];
-  const out: Raw = { id: contact.id };
+  const out: Raw = {};
   for (const p of props) {
     const fid = typeof p.data_field_id === "number" ? p.data_field_id : null;
     if (fid == null) continue;
     out[idToIdentifier.get(fid) ?? `field_${fid}`] = p.value;
   }
   return out;
+}
+
+/** Like resolveProps but with the contact `id` folded in (flat row shape). */
+function resolveContact(contact: Raw, idToIdentifier: Map<number, string>): Raw {
+  return { id: contact.id, ...resolveProps(contact, idToIdentifier) };
+}
+
+/**
+ * PRM filter/sort fields the API allows beyond data-field identifiers (verified live).
+ * These take priority over data-field identifiers so e.g. `status`/`score` aren't
+ * mistaken for a similarly-named data field.
+ */
+const PRM_FIELDS = new Set([
+  "id", "status", "custom_status", "is_positive", "created_on", "score", "status_changed_date",
+  "any_datafield", "last_link_click", "last_email_open", "last_email_answered",
+  "last_linkedin_invitation_accepted", "last_linkedin_message_answered", "last_call",
+  "last_sms_got", "last_sms_not_got", "last_reply", "last_reply_or_status_changed_date",
+  "programmation_id", "workflow_id", "contact_list_id", "status_from_programmation",
+  "integration_id", "call_created_by", "person_in_charge", "company_has_person_in_charge",
+  "phone_has_person_in_charge", "in_active_programmation", "contacted_linkedin", "contacted_email",
+  "link_click", "tag_id", "last_note_date", "notes", "status_change_count", "new_reply",
+  "new_first_reply", "opener_step", "clicker_step", "answerer_step", "email_open_count", "click_count",
+]);
+
+/** Resolve a PRM field name: PRM special field → as-is; else data-field identifier → id;
+ *  else numeric id → as-is; else pass through (the API validates unknown fields). */
+function resolvePrmFieldName(name: string, identifierToId: Map<string, number>): string {
+  const raw = String(name).trim();
+  const lc = raw.toLowerCase();
+  if (PRM_FIELDS.has(lc)) return lc;
+  if (identifierToId.has(lc)) return String(identifierToId.get(lc));
+  if (/^\d+$/.test(raw)) return raw;
+  return lc; // permissive: many PRM fields exist; let the API reject truly invalid ones
+}
+
+/** Build lookup maps from the PRM status referential (custom id↔name, default keys). */
+async function prmStatusMaps(): Promise<{
+  customById: Map<number, { name: string | null; color: unknown }>;
+  customByName: Map<string, number>;
+  defaultKeys: Set<string>;
+}> {
+  const { default: defs, custom } = await listPrmStatuses();
+  const customById = new Map<number, { name: string | null; color: unknown }>();
+  const customByName = new Map<string, number>();
+  for (const c of custom) {
+    const id = typeof c.id === "number" ? c.id : null;
+    if (id == null) continue;
+    customById.set(id, { name: (typeof c.name === "string" && c.name) || null, color: c.color ?? null });
+    if (typeof c.name === "string") customByName.set(c.name.trim().toLowerCase(), id);
+  }
+  const defaultKeys = new Set(defs.map((s) => String(s.status ?? "").toLowerCase()).filter(Boolean));
+  return { customById, customByName, defaultKeys };
+}
+
+/** Resolve a contact's custom_status id to `{id,name,color}` (or null). */
+function customStatusView(
+  customStatus: unknown,
+  customById: Map<number, { name: string | null; color: unknown }>,
+): Raw | null {
+  const id = num(customStatus);
+  if (id == null) return null;
+  const found = customById.get(id);
+  return { id, name: found?.name ?? null, color: found?.color ?? null };
 }
 
 /** Compact per-page view of a contacts result (max 50 rows), shared by query/search. */
@@ -1433,7 +1497,7 @@ export function registerTools(server: McpServer): void {
         const pg = Math.max(Math.trunc(page ?? 1), 1);
         const { idToIdentifier, identifierToId } = await dataFieldMaps();
         const options: Record<string, unknown> = { per_page: perPage };
-        if (filter) options.filter = resolveFilter(filter as Raw, identifierToId);
+        if (filter) options.filter = resolveFilter(filter as Raw, (n) => resolveFieldName(n, identifierToId));
         if (sort?.field) {
           options.sort = {
             field_name: resolveFieldName(sort.field, identifierToId),
@@ -1484,6 +1548,285 @@ export function registerTools(server: McpServer): void {
           query: q,
           ...view,
           summary: `"${q}": ${fmt(res.number_of_results)} match(es) — page ${pg}/${res.number_of_pages ?? 1}, showing ${view.returned}`,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  /* ------------------------------------------------------------------------ */
+  /* PRM (CRM / prospection pipeline) — READ-ONLY                              */
+  /* No status changes, notes, calls, exclusions, sends, imports or deletes.   */
+  /* ------------------------------------------------------------------------ */
+
+  server.registerTool(
+    "list_prm_statuses",
+    {
+      title: "List PRM pipeline statuses",
+      description:
+        "List the PRM (CRM) pipeline statuses — the referential that maps a contact's " +
+        "`custom_status` id to a name. Merges the built-in statuses (kind:'default', keyed by a " +
+        "string like 'opener'/'answerer') and the account's custom statuses (kind:'custom', with a " +
+        "numeric id + name). Each: id (null for default), key, name, color, visible, sorting, kind. " +
+        "Takes no parameters.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (): Promise<TextResult> => {
+      try {
+        const { default: defs, custom } = await listPrmStatuses();
+        const statuses = [
+          ...defs.map((s) => ({
+            kind: "default" as const,
+            id: null,
+            key: s.status ?? null,
+            name: s.status ?? null,
+            color: s.color ?? null,
+            visible: s.visible ?? null,
+            sorting: num(s.sorting),
+          })),
+          ...custom.map((s) => ({
+            kind: "custom" as const,
+            id: num(s.id),
+            key: num(s.id),
+            name: s.name ?? null,
+            color: s.color ?? null,
+            visible: s.visible ?? null,
+            sorting: num(s.sorting),
+          })),
+        ];
+        return ok({
+          count: statuses.length,
+          default_count: defs.length,
+          custom_count: custom.length,
+          statuses,
+          summary: `${statuses.length} status(es): ${defs.length} default, ${custom.length} custom`,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "query_prm_contacts",
+    {
+      title: "Query PRM (pipeline) contacts",
+      description:
+        "List the account's PRM (CRM) contacts with convenience filters or a raw Magileads " +
+        "`options` object. `status` accepts a default-status key (opener/answerer/…), a custom-" +
+        "status name, or a custom-status id. `only_positive:true` keeps contacts marked positive. " +
+        "`search` matches across all data fields. Contacts are returned with RESOLVED, readable " +
+        "property names plus status/custom_status (name+color), is_positive, score and new_reply — " +
+        "capped at 50 rows per call, with the total match count and page count. Never returns >50.",
+      inputSchema: {
+        options: z
+          .object({ filter: z.any().optional(), sort: z.any().optional() })
+          .optional()
+          .describe("Advanced: a raw Magileads PaginationOptions ({filter, sort}); AND-combined with the convenience filters."),
+        status: z.string().optional().describe("Filter by status: default key, custom-status name, or custom-status id."),
+        only_positive: z.boolean().optional().describe("Keep only contacts marked positive (is_positive=true)."),
+        search: z.string().optional().describe("Free-text match across all data fields (any_datafield contains)."),
+        per_page: z.number().int().optional().describe("Rows per page (1–50, default 50)."),
+        page: z.number().int().optional().describe("1-based page number (default 1)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ options, status, only_positive, search, per_page, page }): Promise<TextResult> => {
+      try {
+        const perPage = clamp(Math.trunc(per_page ?? 50), 1, 50);
+        const pg = Math.max(Math.trunc(page ?? 1), 1);
+        const { idToIdentifier, identifierToId } = await dataFieldMaps();
+        const { customById, customByName, defaultKeys } = await prmStatusMaps();
+
+        // Convenience conditions.
+        const conds: FilterValue[] = [];
+        if (status != null && String(status).trim()) {
+          const s = String(status).trim();
+          const lc = s.toLowerCase();
+          if (/^\d+$/.test(s)) conds.push({ field_name: "custom_status", type: "equals", value: s });
+          else if (customByName.has(lc))
+            conds.push({ field_name: "custom_status", type: "equals", value: String(customByName.get(lc)) });
+          else if (defaultKeys.has(lc)) conds.push({ field_name: "status", type: "equals", value: lc });
+          else conds.push({ field_name: "status", type: "equals", value: s });
+        }
+        if (only_positive === true) conds.push({ field_name: "is_positive", type: "equals", value: "true" });
+        if (search != null && String(search).trim())
+          conds.push({ field_name: "any_datafield", type: "contains", value: String(search).trim() });
+
+        // Merge with a caller-supplied raw filter.
+        const provided =
+          options && (options as Raw).filter
+            ? resolveFilter((options as Raw).filter as Raw, (n) => resolvePrmFieldName(n, identifierToId))
+            : null;
+        let filter: FilterNode | undefined;
+        if (provided && conds.length) filter = { mode: "and", values: [provided, ...conds] };
+        else if (provided) filter = provided;
+        else if (conds.length) filter = { mode: "and", values: conds };
+
+        const opt: Record<string, unknown> = { per_page: perPage };
+        if (filter) opt.filter = filter;
+        const rawSort = options && (options as Raw).sort ? ((options as Raw).sort as Raw) : null;
+        if (rawSort && (rawSort.field_name ?? rawSort.field)) {
+          opt.sort = {
+            field_name: resolvePrmFieldName(String(rawSort.field_name ?? rawSort.field), identifierToId),
+            sort_direction: rawSort.sort_direction === "asc" ? "asc" : "desc",
+          };
+        }
+
+        const res = await queryPrmContacts(JSON.stringify(opt), pg);
+        const contacts = (res.results ?? []).slice(0, 50).map((c) => ({
+          ...resolveContact(c, idToIdentifier),
+          status: c.status ?? null,
+          custom_status: customStatusView(c.custom_status, customById),
+          is_positive: c.is_positive ?? null,
+          score: num(c.score),
+          new_reply: c.new_reply ?? null,
+          number_of_replies: num(c.number_of_replies),
+        }));
+        return ok({
+          total: num(res.number_of_results),
+          total_formatted: fmt(res.number_of_results),
+          pages: num(res.number_of_pages),
+          page: pg,
+          per_page: perPage,
+          returned: contacts.length,
+          contacts,
+          summary: `${fmt(res.number_of_results)} PRM contact(s) — page ${pg}/${res.number_of_pages ?? 1}, showing ${contacts.length}`,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_prm_contact",
+    {
+      title: "Get a PRM (pipeline) contact's full profile",
+      description:
+        "Fetch one PRM contact's complete pipeline record: resolved properties, current status + " +
+        "custom_status (name+color), is_positive, score/amount/probability, an aggregated engagement " +
+        "`scoring` (opens/link_clicks/answers/positive/negative/invitations_accepted, summed across " +
+        "campaigns), `calls`, `programmations` (per-campaign flags unsubscribed/blacklisted/excluded " +
+        "+ per-campaign scoring), and the reply/interaction `history` (raw, capped). This is READ-" +
+        "ONLY: it does NOT mark replies as read. NOTE: notes are not part of the profile response " +
+        "(they live behind dedicated note endpoints not exposed here); notes may still appear as " +
+        "items inside `history`.",
+      inputSchema: {
+        contact_id: z.number().int().positive().describe("The PRM contact id."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ contact_id }): Promise<TextResult> => {
+      try {
+        const [p, { idToIdentifier }, { customById }] = await Promise.all([
+          getPrmContact(contact_id),
+          dataFieldMaps(),
+          prmStatusMaps(),
+        ]);
+        const progsRaw = Array.isArray(p.programmations) ? (p.programmations as Raw[]) : [];
+        const sum = (k: string) => progsRaw.reduce((a, pr) => a + (num(pr[k]) ?? 0), 0);
+        const scoring = {
+          open: sum("score_open_count"),
+          link_click: sum("score_link_click_count"),
+          answer: sum("score_answer_count"),
+          positive_answer: sum("score_positive_answer_count"),
+          negative_answer: sum("score_negative_answer_count"),
+          invitation_accepted: sum("score_invitation_accepted_count"),
+        };
+        const programmations = progsRaw.map((pr) => ({
+          programmation_id: num(pr.programmation_id),
+          workflow_id: num(pr.workflow_id),
+          workflow_name: pr.workflow_name ?? null,
+          contact_list_id: num(pr.contact_list_id),
+          contact_lists: pr.contact_lists ?? [],
+          status: pr.status ?? null,
+          date_start: pr.date_start ?? null,
+          unsubscribed: pr.unsubscribed ?? null,
+          blacklisted: pr.blacklisted ?? null,
+          excluded_workflow: pr.excluded_workflow ?? null,
+          excluded_programmation: pr.excluded_programmation ?? null,
+          excluded_previous_programmation: pr.excluded_previous_programmation ?? null,
+          score: num(pr.score),
+          scoring: {
+            open: num(pr.score_open_count),
+            link_click: num(pr.score_link_click_count),
+            answer: num(pr.score_answer_count),
+            positive_answer: num(pr.score_positive_answer_count),
+            negative_answer: num(pr.score_negative_answer_count),
+            invitation_accepted: num(pr.score_invitation_accepted_count),
+          },
+        }));
+        const calls = (Array.isArray(p.calls) ? (p.calls as Raw[]) : []).map((c) => ({
+          id: num(c.id),
+          name: c.name ?? null,
+          call_date: c.call_date ?? null,
+          type: c.type ?? null,
+          created_on: c.created_on ?? null,
+          created_by: c.created_by ?? null,
+        }));
+        const historyRaw = Array.isArray(p.history) ? (p.history as Raw[]) : [];
+        return ok({
+          id: num(p.id),
+          created_on: p.created_on ?? null,
+          status: p.status ?? null,
+          custom_status: customStatusView(p.custom_status, customById),
+          is_positive: p.is_positive ?? null,
+          score: num(p.score),
+          amount: num(p.amount),
+          probability: num(p.probability),
+          closing_date: p.closing_date ?? null,
+          status_changed_date: p.status_changed_date ?? null,
+          in_active_programmation: p.in_active_programmation ?? null,
+          new_reply: p.new_reply ?? null,
+          new_first_reply: p.new_first_reply ?? null,
+          last_reply_date: p.last_reply_date ?? null,
+          tags: p.tags ?? [],
+          properties: resolveProps(p, idToIdentifier),
+          scoring,
+          programmations,
+          calls,
+          excluded_programmations: p.excluded_programmations ?? [],
+          excluded_workflows: p.excluded_workflows ?? [],
+          history_count: historyRaw.length,
+          history: historyRaw.slice(0, 30),
+          _notes:
+            "Engagement `scoring` is aggregated from per-campaign counters (see programmations[].scoring). " +
+            "Notes are NOT in this profile (dedicated note endpoints are not exposed); they may appear inside history. " +
+            "Replies are NOT marked read by this tool. history is capped at 30 items.",
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_prm_nurturings",
+    {
+      title: "List PRM nurturing sequences",
+      description:
+        "List the account's PRM nurturing sequences: id, name, contact_list_ids, created_on, and the " +
+        "`filter` that selects contacts into the sequence. Takes no parameters.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (): Promise<TextResult> => {
+      try {
+        const nurt = await listPrmNurturings();
+        const nurturings = nurt.map((n) => ({
+          id: num(n.id),
+          name: n.name ?? null,
+          contact_list_ids: n.contact_list_ids ?? [],
+          created_on: n.created_on ?? null,
+          filter: n.filter ?? null,
+        }));
+        return ok({
+          count: nurturings.length,
+          nurturings,
+          summary: `${nurturings.length} nurturing sequence(s)`,
         });
       } catch (err) {
         return fail(err);

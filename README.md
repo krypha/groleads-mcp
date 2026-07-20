@@ -48,6 +48,10 @@ OpenRouter, …).
 | `get_contact_list` | `contact_list_id` | `{ counts{…}, list_type, jobs[], in_progress }` |
 | `query_contacts` | `contact_list_id`, `filter?`, `sort?`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — resolved field names, capped at 50 |
 | `search_contacts` | `contact_list_id`, `query`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — resolved field names, capped at 50 |
+| `list_prm_statuses` | *(none)* | `{ statuses[] }` — default + custom pipeline statuses |
+| `query_prm_contacts` | `status?`, `only_positive?`, `search?`, `options?`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — capped at 50 |
+| `get_prm_contact` | `contact_id` | `{ status, scoring, programmations[], calls[], history[] }` |
+| `list_prm_nurturings` | *(none)* | `{ nurturings[] }` |
 
 ## How targeting works
 
@@ -155,6 +159,30 @@ paginate, and never dump giant raw payloads.
 
 > **Pagination.** Contacts use cursor pagination: the first call creates a cursor and the
 > tool follows it for `page` > 1 automatically — just pass `page`.
+
+## Querying the PRM / pipeline (read-only)
+
+Four **read-only** tools expose the **PRM** (Magileads' CRM / prospection pipeline) so an
+agent can see where each prospect stands. No writes — no status changes, notes, calls,
+exclusions, LinkedIn sends, imports, or deletes.
+
+- `list_prm_statuses` — the pipeline's statuses (built-in ones like `opener`/`answerer`, plus
+  the account's custom statuses with their ids/names/colors). This is the referential that
+  maps a contact's `custom_status` id to a name.
+- `query_prm_contacts` — browse PRM contacts. Convenience filters: `status` (a default key, a
+  custom-status name, or its id), `only_positive`, and `search` (across all fields); or pass a
+  raw Magileads `options` object. Contacts come back with resolved names, status/custom_status
+  (name + color), `is_positive`, `score`, and `new_reply`. **Capped at 50 rows.**
+- `get_prm_contact` — one prospect's full record: resolved properties, status, `is_positive`,
+  `score`/`amount`/`probability`, an aggregated engagement `scoring`
+  (opens/clicks/answers/±/invites), `calls`, `programmations` (per-campaign
+  unsubscribed/blacklisted/excluded flags + scoring), and the reply/interaction `history`.
+- `list_prm_nurturings` — the account's nurturing sequences.
+
+> **Read-only, deliberately.** `get_prm_contact` does **not** pass the API's
+> `set_new_reply_read` flag, so viewing a prospect never marks their replies as read.
+> **Notes** are not part of the profile response (they live behind dedicated note endpoints
+> this server doesn't expose); they may still appear as items inside `history`.
 
 ## Transports
 
@@ -267,7 +295,7 @@ discovered.
 ```
 src/
 ├── magileads.ts   Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts       The 18 MCP tool definitions + handlers (input validation, error wrapping)
+├── tools.ts       The 22 MCP tool definitions + handlers (input validation, error wrapping)
 ├── server.ts      buildServer() — creates an McpServer with all tools registered
 ├── index.ts       stdio entry point
 └── http.ts        HTTP entry point (Streamable HTTP + bearer/query auth + /health)

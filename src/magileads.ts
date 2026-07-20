@@ -569,4 +569,47 @@ export async function searchContacts(
   return api<ContactsPage>(`${path}${q}`, { method: "GET" });
 }
 
+/* -------------------------------------------------------------------------- */
+/* PRM — the CRM / prospection pipeline (READ-ONLY)                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Fetch the PRM status referential. Two shapes (verified live):
+ *   default statuses  → { status:<key string>, visible, color, sorting }  (no id/name)
+ *   custom statuses   → { id, name, visible, color, sorting, type_default_status }
+ * A PRM contact's `custom_status` is a custom-status id; its `status` is a default key.
+ */
+export async function listPrmStatuses(): Promise<{ default: Raw[]; custom: Raw[] }> {
+  const [def, cust] = await Promise.all([
+    api<{ status?: Raw[] }>("/prm/status", { method: "GET" }),
+    api<{ status?: Raw[] }>("/prm/status/custom", { method: "GET" }),
+  ]);
+  return { default: def.status ?? [], custom: cust.status ?? [] };
+}
+
+/**
+ * Query PRM contacts with a pre-built `options` JSON. Same flat envelope + cursor
+ * pagination as the contact-list contacts (`/prm/contacts/{cursor}/page/{n}`).
+ */
+export async function queryPrmContacts(optionsJson: string, page: number): Promise<ContactsPage> {
+  const q = `?options=${encodeURIComponent(optionsJson)}`;
+  const first = await api<ContactsPage>(`/prm/contacts${q}`, { method: "GET" });
+  if (page <= 1) return first;
+  const path = cursorPagePath(first.current_page, page);
+  if (!path) return first;
+  return api<ContactsPage>(`${path}${q}`, { method: "GET" });
+}
+
+/** Fetch one PRM contact's full profile (`GET /prm/contact/{id}` → contact_profile). */
+export async function getPrmContact(contactId: number): Promise<Raw> {
+  const data = await api<{ contact_profile: Raw }>(`/prm/contact/${contactId}`, { method: "GET" });
+  return data.contact_profile;
+}
+
+/** List the account's PRM nurturing sequences. */
+export async function listPrmNurturings(): Promise<Raw[]> {
+  const data = await api<{ nurturings?: Raw[] }>("/prm/nurturings", { method: "GET" });
+  return data.nurturings ?? [];
+}
+
 export { API_BASE };
