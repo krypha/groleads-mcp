@@ -52,6 +52,9 @@ OpenRouter, …).
 | `query_prm_contacts` | `status?`, `only_positive?`, `search?`, `options?`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — capped at 50 |
 | `get_prm_contact` | `contact_id` | `{ status, scoring, programmations[], calls[], history[] }` |
 | `list_prm_nurturings` | *(none)* | `{ nurturings[] }` |
+| `list_api_endpoints` | `search?`, `method?`, `reads_only?`, `writes_only?`, `limit?` | `{ endpoints[] }` — discover the callable non-admin API surface |
+| `magileads_get` | `path`, `query?` | raw JSON — GET any non-admin endpoint (read-only) |
+| `magileads_request` | `method`, `path`, `query?`, `body?`, `confirm?` | write any non-admin endpoint — **dry-run until `confirm:true`** |
 
 ## How targeting works
 
@@ -184,12 +187,32 @@ exclusions, LinkedIn sends, imports, or deletes.
 > **Notes** are not part of the profile response (they live behind dedicated note endpoints
 > this server doesn't expose); they may still appear as items inside `history`.
 
+## Generic API access (everything else)
+
+The dedicated tools above cover the common workflows. For anything else, three **generic
+passthrough** tools reach the account's **entire non-admin API surface** (admin, billing,
+reseller, team, and account-settings endpoints are excluded by an allowlist generated from
+the API's OpenAPI spec — see [`src/endpoints.generated.ts`](src/endpoints.generated.ts)):
+
+- `list_api_endpoints` — discover the callable endpoints (filter by `search`, `method`,
+  reads/writes). Use it to find the exact `path` + `method`.
+- `magileads_get` — **read-only**: GET any allow-listed endpoint. Pass `path` (with `{params}`
+  filled in) and an optional `query` object (object values are JSON-encoded, e.g.
+  `{ options: { per_page: 10 } }`). It even follows the API's own `next_page` / cursor URLs.
+- `magileads_request` — **writes** (POST/PUT/DELETE/PATCH): create lists/models, send LinkedIn
+  messages, imports, PRM exclusions, status changes, and so on.
+
+> **Write guardrail.** `magileads_request` performs a **dry run by default** — it returns
+> exactly what *would* be sent and changes nothing. Set `confirm: true` to actually execute.
+> Admin/billing endpoints are refused outright. Regenerate the allowlist with
+> `bun run gen:endpoints` if the API adds endpoints.
+
 ## Transports
 
 | Transport | Entry point | Use when |
 | --- | --- | --- |
-| **stdio** | `node dist/index.js` | The agent runs the server as a local subprocess (Claude Desktop/Code, Cursor, a local script). |
-| **HTTP** | `node dist/http.js` | The agent connects over the network — a remote / containerized agent (e.g. Hermes in Docker). This is the deployed mode. |
+| **stdio** | `bun run src/index.ts` | The agent runs the server as a local subprocess (Claude Desktop/Code, Cursor, a local script). |
+| **HTTP** | `bun run src/http.ts` | The agent connects over the network — a remote / containerized agent (e.g. Hermes in Docker). This is the deployed mode. |
 
 The HTTP transport is a stateless MCP **Streamable HTTP** endpoint at `POST /mcp`
 (returns JSON), plus an unauthenticated `GET /health` liveness probe.
@@ -222,15 +245,16 @@ A client proves the token **either** way:
 
 ## Run locally
 
+The server runs on [Bun](https://bun.sh) (it executes the TypeScript directly — no build step).
+
 ```bash
-npm install
-npm run build
+bun install
 
 # stdio (local agent)
-MAGILEADS_API_KEY=... npm start
+MAGILEADS_API_KEY=... bun run start
 
 # HTTP (remote agent) — listens on :8080/mcp
-MAGILEADS_API_KEY=... MCP_AUTH_TOKEN=$(openssl rand -hex 32) npm run start:http
+MAGILEADS_API_KEY=... MCP_AUTH_TOKEN=$(openssl rand -hex 32) bun run start:http
 ```
 
 Smoke-test the HTTP endpoint:
@@ -255,8 +279,8 @@ env vars (`MCP_AUTH_TOKEN`, `MAGILEADS_API_KEY`), and give it a domain. Dokploy'
 reverse proxy terminates TLS, so the agent reaches the server at
 `https://<your-domain>/mcp`.
 
-The image runs `node dist/http.js`, listens on `8080`, runs as a non-root user, and
-declares a `HEALTHCHECK` against `/health`.
+The image is Bun-based (`oven/bun`), runs `bun run src/http.ts`, listens on `8080`, runs as a
+non-root user, and declares a `HEALTHCHECK` against `/health`.
 
 ## Connect to a Hermes Agent
 
@@ -294,13 +318,15 @@ discovered.
 
 ```
 src/
-├── magileads.ts   Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts       The 22 MCP tool definitions + handlers (input validation, error wrapping)
-├── server.ts      buildServer() — creates an McpServer with all tools registered
-├── index.ts       stdio entry point
-└── http.ts        HTTP entry point (Streamable HTTP + bearer/query auth + /health)
-Dockerfile         Multi-stage build; runs dist/http.js
-docker-compose.yml Standalone deployment
+├── magileads.ts             Self-contained Magileads client (dual auth + JWT refresh + API calls)
+├── tools.ts                 The 25 MCP tool definitions + handlers (input validation, error wrapping)
+├── endpoints.generated.ts   Non-admin API allowlist for the generic passthrough tools (generated)
+├── server.ts                buildServer() — creates an McpServer with all tools registered
+├── index.ts                 stdio entry point
+└── http.ts                  HTTP entry point (Streamable HTTP + bearer/query auth + /health)
+scripts/generate-endpoints.mjs  Regenerates endpoints.generated.ts from the OpenAPI spec
+Dockerfile                   Bun image (oven/bun); runs `bun run src/http.ts`
+docker-compose.yml           Standalone deployment
 ```
 
 `magileads.ts` is deliberately standalone — it does **not** import anything from the
@@ -308,11 +334,16 @@ Groleads app.
 
 ## Development
 
+Runs on [Bun](https://bun.sh) — Bun executes the TypeScript directly, so there's no build
+step for running; TypeScript is used only for type-checking.
+
 ```bash
-npm run build       # tsc → dist/
-npm run typecheck   # tsc --noEmit
-npm run dev         # build + run stdio
-npm run dev:http    # build + run HTTP
+bun install
+bun run typecheck      # tsc --noEmit (type safety)
+bun run dev            # run stdio
+bun run dev:http       # run HTTP
+bun run gen:endpoints  # refresh the non-admin API allowlist from the OpenAPI spec
+bun run build          # optional: bundle to dist/ with `bun build`
 ```
 
 The server logs to **stderr**. In stdio mode, **stdout is reserved** for the JSON-RPC

@@ -6,10 +6,12 @@ Instructions for Claude Code working in **this** repository. (User-facing docs l
 ## What this is
 
 A standalone **MCP server** (`@modelcontextprotocol/sdk` v1.x, TypeScript, ESM/NodeNext)
-that exposes **Groleads / Magileads Google Maps targeting** as tools for AI agents.
-It runs in production, deployed via Docker on Dokploy at **`mcp.groleads.com`**, and is
-consumed by a **Nous Research Hermes Agent** over HTTP. No LinkedIn account is involved —
-Google Maps targeting only needs Magileads credentials. The server is model-agnostic.
+that exposes **Groleads / Magileads** as tools for AI agents (Google Maps targeting, contact
+lists, campaign audit, PRM, plus a generic non-admin API passthrough).
+**Runs on Bun** — Bun executes the TypeScript entry points directly, so there is **no build
+step to run** (`tsc` is used only for type-checking). It runs in production, deployed via
+Docker on Dokploy at **`mcp.groleads.com`**, and is consumed by a **Nous Research Hermes
+Agent** over HTTP. No LinkedIn account is required. The server is model-agnostic.
 
 This repo was split out of the main Groleads Next.js app; it has **no dependency on that
 app** and must stay that way.
@@ -22,10 +24,13 @@ src/magileads.ts   Self-contained Magileads API client. Dual auth from env:
                    (JWT via POST /users/authentication, auto-refreshed via
                    /users/authentication/refresh, 30s-early renewal, retry-once on 401).
                    Base URL MAGILEADS_API_BASE (default https://app.api-magileads.net).
-src/tools.ts       The 22 tools + handlers. Every handler is wrapped so it NEVER throws
+src/tools.ts       The 25 tools + handlers. Every handler is wrapped so it NEVER throws
                    (returns {content:[...], isError:true} on failure via fail()). Inputs
                    are clamped (max_links 1–40, max_results 1–200, urls sliced to 10,
                    criteria capped at 30 — never silently dropped on a delete).
+src/endpoints.generated.ts  GENERATED non-admin API allowlist (method/path/tag/summary) that
+                   the generic passthrough tools may call. Regenerate with
+                   `bun run gen:endpoints` (scripts/generate-endpoints.mjs, from the OpenAPI spec).
 src/server.ts      buildServer() → McpServer with all tools registered. Shared by both
                    entry points.
 src/index.ts       stdio transport (StdioServerTransport).
@@ -34,7 +39,7 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
                    server+transport per request, GET /health, and auth (see below).
 ```
 
-**The 22 tools:**
+**The 25 tools:**
 
 *Google Maps targeting* — `generate_maps_search_urls`, `extract_maps_search`,
 `run_google_maps_targeting` (one-shot generate+extract).
@@ -54,6 +59,10 @@ behind two guardrails — see below).
 
 *PRM / pipeline (all read-only)* — `list_prm_statuses`, `query_prm_contacts`,
 `get_prm_contact`, `list_prm_nurturings`. See below.
+
+*Generic passthrough* — `list_api_endpoints` (read-only; discover the callable surface),
+`magileads_get` (read-only; GET any non-admin endpoint), `magileads_request` (writes any
+non-admin endpoint; dry-run until `confirm:true`). See below.
 
 ## Key behavioral facts (don't relearn these the hard way)
 
@@ -173,6 +182,25 @@ change, note, call, exclusion, LinkedIn send, import, delete).
 - `list_prm_nurturings` → `GET /prm/nurturings` → `{id, name, filter, contact_list_ids, created_on}`.
 - Auth errors (`prm_contact_does_not_exist`, unauthorized) surface via `fail()`.
 
+## Generic passthrough (the "everything else" path)
+
+Three tools reach the account's whole **non-admin** API surface for endpoints without a
+dedicated tool. Backed by `src/endpoints.generated.ts` (the allowlist).
+
+- **Admin is excluded at generation time** — `ADMIN_TAGS` in `scripts/generate-endpoints.mjs`
+  (Resellers/Organizations/Teams/Roles/Permissions/API Keys/External API keys/Subscriptions/
+  Crons/Webhooks/OVH/Zapier/Affiliation/Pools, and all of Users except `GET /users/me*`).
+  Regenerate with `bun run gen:endpoints`.
+- `magileads_get` allows only GET matches; `magileads_request` only POST/PUT/DELETE/PATCH.
+  `matchEndpoint` turns each template into a regex and ALSO strips a trailing `/page/{n}` or
+  `/{cursor}/page/{n}` so agents can follow the API's own `next_page`/cursor URLs. `buildPath`
+  accepts either a plain path or a full echoed URL (it keeps only pathname+query).
+- **Write guardrail**: `magileads_request` is a DRY RUN unless `confirm:true` — it returns
+  `{dry_run:true, would_call}` and sends nothing. `destructiveHint:true`, `readOnlyHint:false`.
+- Responses are capped at ~60 KB (`capResult`) to protect agent context.
+- Prefer the dedicated tools; the passthrough is the escape hatch. It CAN write, so it is the
+  one place (besides `delete_contacts_by_selection`) that mutates data.
+
 ## Auth (HTTP mode)
 
 - `MCP_AUTH_TOKEN` is **required** in HTTP mode (network-reachable endpoint).
@@ -184,11 +212,12 @@ change, note, call, exclusion, LinkedIn send, import, delete).
 ## Commands
 
 ```bash
-npm install
-npm run build        # tsc → dist/
-npm run typecheck    # tsc --noEmit
-npm run start:http   # run HTTP locally (needs MCP_AUTH_TOKEN + Magileads creds)
-npm run start        # run stdio locally
+bun install
+bun run typecheck      # tsc --noEmit (Bun runs TS directly; no emit needed to run)
+bun run start:http     # run HTTP locally (needs MCP_AUTH_TOKEN + Magileads creds)
+bun run start          # run stdio locally
+bun run gen:endpoints  # regenerate the non-admin passthrough allowlist from the OpenAPI spec
+bun run build          # optional: bundle to dist/ via `bun build`
 ```
 
 **Verify a change without an MCP client** — drive JSON-RPC over the transport directly:
@@ -201,7 +230,7 @@ curl -s -X POST 'localhost:8080/mcp?token=T' \
 ```
 
 For stdio, pipe newline-delimited JSON-RPC (`initialize` → `notifications/initialized`
-→ `tools/list` → `tools/call`) into `node dist/index.js`.
+→ `tools/list` → `tools/call`) into `bun run src/index.ts`.
 
 `tools/list` needs no Magileads call, so a dummy `MAGILEADS_API_KEY=dummy` is enough to
 smoke-test plumbing. A real `generate_maps_search_urls` call takes ~30–60 s and hits the
@@ -209,8 +238,9 @@ live API.
 
 ## Deployment
 
-- `Dockerfile` (multi-stage, non-root, `CMD node dist/http.js`, HEALTHCHECK on /health)
-  + `docker-compose.yml`. Dokploy builds the Dockerfile and terminates TLS at its proxy.
+- `Dockerfile` (Bun image `oven/bun:1-alpine`, non-root `bun` user, `bun install --production`
+  against `bun.lock`, `CMD bun run src/http.ts`, HEALTHCHECK on /health) + `docker-compose.yml`.
+  Bun runs the TS directly — no build/dist stage. Dokploy builds the Dockerfile and terminates TLS.
 - Env in prod: `MCP_AUTH_TOKEN`, `MAGILEADS_API_KEY` (or email/password).
 
 ## Hermes integration
@@ -223,6 +253,9 @@ Register as a remote HTTP MCP server in Hermes (dashboard or `~/.hermes/config.y
 
 - Keep `magileads.ts` free of any Groleads-app imports (standalone).
 - New tools: register in `tools.ts`, validate + clamp inputs, wrap the body so it can't
-  throw, return text content (JSON string) — mirror the existing 5.
+  throw, return text content (JSON string) — mirror the existing ones. Read-only tools set
+  `readOnlyHint:true`; anything that mutates sets `destructiveHint:true` + a confirm guard.
+- The server runs under **Bun** (no build step to run). Keep code Bun+Node-compatible
+  (`node:*` built-ins are fine). Don't reintroduce a `tsc`-emit runtime dependency.
 - Never log secrets. Never write to stdout in stdio mode.
 - Credentials come from env only — never hardcode them (not even test creds) in the repo.

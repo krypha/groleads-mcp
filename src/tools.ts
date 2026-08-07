@@ -22,6 +22,7 @@ import {
   queryPrmContacts,
   getPrmContact,
   listPrmNurturings,
+  rawRequest,
   EMPTY_FILTER,
   MagileadsError,
   type DataField,
@@ -30,6 +31,7 @@ import {
   type Raw,
   type ContactsPage,
 } from "./magileads.js";
+import { NON_ADMIN_ENDPOINTS, type EndpointDef } from "./endpoints.generated.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -462,6 +464,87 @@ function customStatusView(
   if (id == null) return null;
   const found = customById.get(id);
   return { id, name: found?.name ?? null, color: found?.color ?? null };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Generic passthrough helpers (non-admin allowlist from the generated index)  */
+/* -------------------------------------------------------------------------- */
+
+const MAX_PASSTHROUGH_BYTES = 60_000; // cap giant payloads to protect agent context
+
+/** Turn a path template (`/contact-lists/{id}/contacts`) into an anchored regex. */
+function templateToRegex(tpl: string): RegExp {
+  const literals = tpl.split(/\{[^}]+\}/g).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(`^${literals.join("[^/]+")}$`);
+}
+
+const ENDPOINT_MATCHERS: (EndpointDef & { re: RegExp })[] = NON_ADMIN_ENDPOINTS.map((e) => ({
+  ...e,
+  re: templateToRegex(e.path),
+}));
+
+/**
+ * Find the non-admin endpoint matching a concrete (method, path); null if none.
+ * Also matches the API's own cursor-pagination URL forms — `.../page/{n}` and
+ * `.../{cursor}/page/{n}` — by falling back to the base template, so an agent can
+ * follow `next_page`/`current_page` URLs through the passthrough.
+ */
+function matchEndpoint(method: string, path: string): EndpointDef | null {
+  const m = method.toUpperCase();
+  const clean = (path.split("?")[0] || "/").replace(/\/+$/, "") || "/";
+  const candidates = [clean];
+  const stripPage = clean.replace(/\/page\/\d+$/, ""); // .../page/{n}
+  if (stripPage !== clean) candidates.push(stripPage);
+  const stripCursor = clean.replace(/\/[^/]+\/page\/\d+$/, ""); // .../{cursor}/page/{n}
+  if (stripCursor !== clean && stripCursor !== stripPage) candidates.push(stripCursor);
+  for (const c of candidates) {
+    const hit = ENDPOINT_MATCHERS.find((e) => e.method === m && e.re.test(c));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** Split a raw path (or full URL), merge an optional query object; returns {base (for matching), full (for the call)}. */
+function buildPath(rawPath: string, query?: Raw): { base: string; full: string } {
+  let raw = String(rawPath).trim();
+  let existing = "";
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      const u = new URL(raw); // accept the API's echoed next_page/current_page URLs
+      raw = u.pathname;
+      existing = u.search.replace(/^\?/, "");
+    } catch {
+      /* fall through */
+    }
+  } else {
+    const parts = raw.split("?");
+    raw = parts[0];
+    existing = parts[1] || "";
+  }
+  const base = ("/" + raw.replace(/^\/+/, "")).replace(/\/+$/, "") || "/";
+  const params = new URLSearchParams(existing);
+  if (query && typeof query === "object") {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null) continue;
+      params.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+    }
+  }
+  const qs = params.toString();
+  return { base, full: qs ? `${base}?${qs}` : base };
+}
+
+/** Serialize a passthrough result, capping oversized payloads (invalid-JSON-safe). */
+function capResult(data: unknown): Raw {
+  const json = JSON.stringify(data ?? null);
+  if (json.length <= MAX_PASSTHROUGH_BYTES) return { result: data ?? null };
+  return {
+    _truncated: true,
+    _bytes: json.length,
+    note:
+      `Response too large (${fmt(json.length)} bytes). Narrow it with query params ` +
+      `(e.g. per_page, or an options filter), or use a dedicated tool.`,
+    preview: json.slice(0, 4000),
+  };
 }
 
 /** Compact per-page view of a contacts result (max 50 rows), shared by query/search. */
@@ -1828,6 +1911,142 @@ export function registerTools(server: McpServer): void {
           nurturings,
           summary: `${nurturings.length} nurturing sequence(s)`,
         });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  /* ------------------------------------------------------------------------ */
+  /* Generic API passthrough — reach any NON-ADMIN Magileads endpoint          */
+  /* Admin/billing/reseller/team endpoints are excluded by the generated       */
+  /* allowlist (src/endpoints.generated.ts). Writes are dry-run until          */
+  /* confirm:true. Prefer the dedicated tools above; use these for the rest.   */
+  /* ------------------------------------------------------------------------ */
+
+  server.registerTool(
+    "list_api_endpoints",
+    {
+      title: "Discover callable (non-admin) API endpoints",
+      description:
+        "List the Magileads API endpoints the generic tools (magileads_get / magileads_request) " +
+        "can call — the account's whole non-admin surface (admin/billing/reseller/team endpoints are " +
+        "excluded). Filter by `search` (substring on path/summary/tag), `method`, or `writes_only`/" +
+        "`reads_only`. Use this to find the exact `path` + `method` to pass to magileads_get / " +
+        "magileads_request.",
+      inputSchema: {
+        search: z.string().optional().describe("Substring filter on path, summary, or tag (case-insensitive)."),
+        method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).optional().describe("Filter by HTTP method."),
+        reads_only: z.boolean().optional().describe("Only GET (read) endpoints."),
+        writes_only: z.boolean().optional().describe("Only write (POST/PUT/DELETE/PATCH) endpoints."),
+        limit: z.number().int().optional().describe("Max endpoints to return (1–200, default 60)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ search, method, reads_only, writes_only, limit }): Promise<TextResult> => {
+      try {
+        const q = search?.trim().toLowerCase();
+        const cap = clamp(Math.trunc(limit ?? 60), 1, 200);
+        let rows = NON_ADMIN_ENDPOINTS.filter((e) => {
+          if (method && e.method !== method) return false;
+          if (reads_only && e.write) return false;
+          if (writes_only && !e.write) return false;
+          if (q && !(`${e.method} ${e.path} ${e.tag} ${e.summary}`.toLowerCase().includes(q))) return false;
+          return true;
+        });
+        const total = rows.length;
+        rows = rows.slice(0, cap);
+        return ok({
+          total_available: NON_ADMIN_ENDPOINTS.length,
+          matched: total,
+          returned: rows.length,
+          endpoints: rows.map((e) => ({ method: e.method, path: e.path, tag: e.tag, summary: e.summary, write: e.write })),
+          note: "Pass a concrete path (fill {params}) to magileads_get (GET) or magileads_request (writes).",
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "magileads_get",
+    {
+      title: "Call any non-admin API GET endpoint",
+      description:
+        "Read-only escape hatch: GET any allow-listed non-admin Magileads endpoint that no dedicated " +
+        "tool covers. Provide `path` (e.g. '/blacklists' or '/contact-lists/123') with {params} filled " +
+        "in, and optional `query` params (object; object values are JSON-encoded, e.g. " +
+        "{ options: { per_page: 10 } }). Discover paths with list_api_endpoints. Only GET is allowed " +
+        "here (use magileads_request for writes). Large responses are truncated with a note.",
+      inputSchema: {
+        path: z.string().min(1).describe("API path with a leading slash, {params} filled in, e.g. '/blacklists'."),
+        query: z.record(z.any()).optional().describe("Optional query params. Object/array values are JSON-encoded (e.g. options/filter)."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ path, query }): Promise<TextResult> => {
+      try {
+        const { base, full } = buildPath(path, query as Raw | undefined);
+        const ep = matchEndpoint("GET", base);
+        if (!ep) {
+          return fail(
+            new Error(
+              `GET ${base} is not an allow-listed non-admin read endpoint ` +
+                `(it may be admin-only, a write, or not exist). Use list_api_endpoints to find valid paths.`,
+            ),
+          );
+        }
+        const data = await rawRequest("GET", full);
+        return ok({ method: "GET", path: full, tag: ep.tag, ...capResult(data) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "magileads_request",
+    {
+      title: "Call any non-admin API write endpoint (guarded)",
+      description:
+        "Escape hatch for WRITES (POST/PUT/DELETE/PATCH) on any allow-listed non-admin Magileads " +
+        "endpoint not covered by a dedicated tool — creating lists/models, sending LinkedIn " +
+        "messages, imports, PRM exclusions, status changes, etc. GUARDED: it does a DRY RUN by " +
+        "default (shows exactly what would be sent and changes nothing); set `confirm:true` to " +
+        "actually execute. Admin/billing/reseller endpoints are blocked. Discover paths with " +
+        "list_api_endpoints. This tool can modify or delete data — review the dry run first.",
+      inputSchema: {
+        method: z.enum(["POST", "PUT", "DELETE", "PATCH"]).describe("HTTP method for the write."),
+        path: z.string().min(1).describe("API path with a leading slash, {params} filled in."),
+        query: z.record(z.any()).optional().describe("Optional query params (object/array values are JSON-encoded)."),
+        body: z.any().optional().describe("Optional JSON request body."),
+        confirm: z.boolean().optional().describe("Must be true to actually send the request; otherwise a dry run is returned."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async ({ method, path, query, body, confirm }): Promise<TextResult> => {
+      try {
+        const { base, full } = buildPath(path, query as Raw | undefined);
+        const ep = matchEndpoint(method, base);
+        if (!ep) {
+          return fail(
+            new Error(
+              `${method} ${base} is not an allow-listed non-admin endpoint ` +
+                `(it may be admin-only or not exist). Use list_api_endpoints to find valid write paths.`,
+            ),
+          );
+        }
+        if (confirm !== true) {
+          return ok({
+            dry_run: true,
+            would_call: { method, path: full, body: body ?? null },
+            endpoint: { tag: ep.tag, summary: ep.summary },
+            note: "Nothing was sent. Re-call with confirm:true to execute this write.",
+          });
+        }
+        const data = await rawRequest(method, full, body);
+        return ok({ executed: true, method, path: full, tag: ep.tag, ...capResult(data) });
       } catch (err) {
         return fail(err);
       }

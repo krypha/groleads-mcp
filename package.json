@@ -1,26 +1,28 @@
 {
   "name": "@groleads/mcp-google-maps",
-  "version": "0.6.0",
-  "description": "MCP server exposing Groleads (Magileads) Google Maps targeting as tools for AI agents. Stdio + HTTP transports. No LinkedIn account required.",
+  "version": "0.7.0",
+  "description": "MCP server exposing Groleads (Magileads) targeting, contact, campaign-audit, PRM and generic API tools for AI agents. Runs on Bun. Stdio + HTTP transports.",
   "type": "module",
   "bin": {
     "groleads-mcp-google-maps": "dist/index.js"
   },
   "files": [
     "dist",
+    "src",
     "README.md",
     ".env.example"
   ],
   "engines": {
-    "node": ">=18"
+    "bun": ">=1.1"
   },
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "start:http": "node dist/http.js",
-    "dev": "tsc && node dist/index.js",
-    "dev:http": "tsc && node dist/http.js",
-    "typecheck": "tsc --noEmit"
+    "build": "bun build ./src/index.ts ./src/http.ts --target bun --outdir dist",
+    "start": "bun run src/index.ts",
+    "start:http": "bun run src/http.ts",
+    "dev": "bun run src/index.ts",
+    "dev:http": "bun run src/http.ts",
+    "typecheck": "tsc --noEmit",
+    "gen:endpoints": "bun run scripts/generate-endpoints.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

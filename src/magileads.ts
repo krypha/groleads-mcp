@@ -612,4 +612,26 @@ export async function listPrmNurturings(): Promise<Raw[]> {
   return data.nurturings ?? [];
 }
 
+/* -------------------------------------------------------------------------- */
+/* Generic passthrough (used by the allow-listed magileads_get/_request tools) */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Make an arbitrary authenticated request to the Magileads API. `pathWithQuery`
+ * must already include the leading slash and any (encoded) `?query`. Returns the
+ * parsed JSON body; throws MagileadsError on a non-2xx (surfaced via fail()).
+ * The caller is responsible for restricting which paths/methods are allowed.
+ */
+export async function rawRequest(
+  method: string,
+  pathWithQuery: string,
+  body?: unknown,
+): Promise<unknown> {
+  const init: RequestInit = { method: method.toUpperCase() };
+  if (body !== undefined && body !== null) {
+    init.body = typeof body === "string" ? body : JSON.stringify(body);
+  }
+  return api<unknown>(pathWithQuery, init);
+}
+
 export { API_BASE };
