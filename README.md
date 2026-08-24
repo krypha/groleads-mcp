@@ -1,13 +1,14 @@
-# @groleads/mcp-google-maps
+# Magileads MCP
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that exposes
-**Groleads / Magileads Google Maps targeting** as tools for AI agents.
+**Magileads** as tools for AI agents — Google Maps targeting, contact lists, campaign
+audit, PRM (pipeline), data queries, and a generic non-admin API passthrough.
 
-Turn a plain query — *"dentists in Lyon"* — into a filled Groleads contact list.
-**No LinkedIn account** is needed, only Magileads credentials. The server is
-**model-agnostic**: it works with any MCP-capable agent (Nous Research **Hermes**,
-Claude Desktop/Code, Cursor, …), whatever LLM powers it (Claude, GPT, Ollama,
-OpenRouter, …).
+Turn a plain query — *"dentists in Lyon"* — into a filled Magileads contact list, audit a
+prospecting campaign, or read the whole account. **No LinkedIn account** is needed, only
+Magileads credentials. It **runs on [Bun](https://bun.sh)** and is **model-agnostic**: it
+works with any MCP-capable agent (Nous Research **Hermes**, Claude Desktop/Code, Cursor, …),
+whatever LLM powers it (Claude, GPT, Ollama, OpenRouter, …).
 
 ---
 
@@ -44,7 +45,7 @@ OpenRouter, …).
 | `get_campaign_statistics` | `campaign_id` | `{ aggregate, email, linkedin, by_action_type, per_step[] }` |
 | `get_account_overview` | *(none)* | `{ id, name, email, level, subscription{…}, teams, organizations }` |
 | `list_linkedin_accounts` | *(none)* | `{ count, valid, checkpoint, accounts[] }` |
-| `search_contact_lists` | `name?`, `sort?` (name\|id), `per_page?` (1–100, default 25), `page?` | `{ total, pages, lists[] }` |
+| `search_contact_lists` | `name?`, `sort?` (contacts\|emails\|linkedin\|companies\|recent\|name), `per_page?` (1–200, default 25), `page?` | `{ total_lists, total_contacts, lists[] }` — ranks across ALL lists |
 | `get_contact_list` | `contact_list_id` | `{ counts{…}, list_type, jobs[], in_progress }` |
 | `query_contacts` | `contact_list_id`, `filter?`, `sort?`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — resolved field names, capped at 50 |
 | `search_contacts` | `contact_list_id`, `query`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — resolved field names, capped at 50 |
@@ -151,7 +152,10 @@ paginate, and never dump giant raw payloads.
   exposes subscription status but **no numeric credit balance**, so credits aren't reported.)*
 - `list_linkedin_accounts` — connected LinkedIn accounts and their health (`is_valid`,
   `checkpoint_required`, …), so you can tell whether LinkedIn steps will run.
-- `search_contact_lists` — browse lists with paging + `name` filter, sorted by `name` or `id`.
+- `search_contact_lists` — **rank** lists across the whole account (`sort` by contacts, emails,
+  linkedin, companies, recent, or name) + `name` filter. Returns `total_lists` and
+  `total_contacts`. Fetches all lists in one call, so "biggest lists" is correct even on large
+  accounts (and it's faster).
 - `get_contact_list` — one list's counters, type, and job state (`in_progress` tells you if
   an import/extraction is still running).
 - `query_contacts` — a list's contacts with a Magileads `filter` + `sort`. Field names may be
@@ -293,7 +297,7 @@ In the dashboard's **Add MCP server** form:
 
 | Field | Value |
 | --- | --- |
-| **Name** | `groleads_gmaps` |
+| **Name** | `magileads` |
 | **Transport** | `HTTP/SSE` |
 | **URL** | `https://<your-domain>/mcp?token=<MCP_AUTH_TOKEN>` |
 | **Environment** | *(leave empty — it applies to stdio servers only, not HTTP)* |
@@ -304,14 +308,14 @@ The token goes in the URL because this form has no headers field.
 
 ```yaml
 mcp_servers:
-  groleads_gmaps:
+  magileads:
     url: "https://<your-domain>/mcp"
     headers:
       Authorization: "Bearer <MCP_AUTH_TOKEN>"
 ```
 
 Either way, the Magileads credentials stay in **this** server — Hermes never sees
-them. Hermes namespaces the tools as `groleads_gmaps.<tool>` (or similar) once
+them. Hermes namespaces the tools as `magileads.<tool>` (or similar) once
 discovered.
 
 ## Project structure
@@ -329,8 +333,8 @@ Dockerfile                   Bun image (oven/bun); runs `bun run src/http.ts`
 docker-compose.yml           Standalone deployment
 ```
 
-`magileads.ts` is deliberately standalone — it does **not** import anything from the
-Groleads app.
+`magileads.ts` is deliberately standalone — it does **not** import anything from any
+parent app.
 
 ## Development
 

@@ -15,7 +15,7 @@ import {
   getStepModel,
   getMe,
   listLinkedinAccounts,
-  searchContactListsPaginated,
+  listContactListNames,
   queryContacts,
   searchContacts,
   listPrmStatuses,
@@ -71,7 +71,7 @@ const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), h
 /* -------------------------------------------------------------------------- */
 
 /**
- * Friendly operator → Magileads filter `type` (verified against api.groleads.com
+ * Friendly operator → Magileads filter `type` (verified against api.magileads.net
  * swagger `Type` enum). Aliases are accepted so an agent can say `starts_with`,
  * `gt`, `has_value`, `is_empty`, … and still land on the exact enum value.
  */
@@ -622,7 +622,7 @@ export function registerTools(server: McpServer): void {
       title: "Extract contacts from Google Maps URLs",
       description:
         "Extract businesses (name, address, phone, website, etc.) from Google Maps search URLs into " +
-        "a Groleads contact list. Accepts up to 10 URLs per call. Provide either `contact_list_name` " +
+        "a Magileads contact list. Accepts up to 10 URLs per call. Provide either `contact_list_name` " +
         "(creates a new list) or `contact_list_id` (appends to an existing one). Extraction runs " +
         "asynchronously: this returns the target list id immediately, then poll " +
         "`get_contact_list_status` until its extraction job reaches 'completed'.",
@@ -1347,7 +1347,7 @@ export function registerTools(server: McpServer): void {
     {
       title: "Get the Magileads account overview",
       description:
-        "Summarize the connected Magileads/Groleads account: identity (name, email, id), company/" +
+        "Summarize the connected Magileads account: identity (name, email, id), company/" +
         "role, and plan/subscription status (active, trial, end_date, billing). Note: the API " +
         "exposes subscription STATUS but no numeric credit balance, so credit counts are not " +
         "reported. Takes no parameters.",
@@ -1443,28 +1443,53 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     "search_contact_lists",
     {
-      title: "Search / browse contact lists (paged)",
+      title: "Search / rank contact lists",
       description:
-        "Browse the account's contact lists with paging and sorting. Filter by `name` (substring); " +
-        "sort by `name` or `id` (default `id`, newest first). Returns each list's id, name, and " +
-        "counters (contacts/emails/linkedin/companies), plus list_type/created_on, and the total " +
-        "count and number of pages. The API only supports name/id for sort & filter.",
+        "List and RANK the account's contact lists. Fetches ALL lists in one call (GET " +
+        "/contact-lists/names) then sorts/filters in memory, so 'biggest lists' rankings are " +
+        "correct across the whole account — not just one page. Filter by `name` (substring); " +
+        "`sort` by contacts (default), emails, linkedin, companies, recent (newest first), or name " +
+        "(A→Z). Returns `total_lists` and `total_contacts` (sums over the filtered set) plus each " +
+        "list's counters, list_type and created_on. Capped at `per_page` rows per call.",
       inputSchema: {
         name: z.string().optional().describe("Optional case-insensitive substring filter on the list name."),
-        sort: z.enum(["name", "id"]).optional().describe("Sort field: 'id' (default, newest first) or 'name' (A→Z)."),
-        per_page: z.number().int().optional().describe("Results per page (1–100, default 25)."),
+        sort: z
+          .enum(["contacts", "emails", "linkedin", "companies", "recent", "name"])
+          .optional()
+          .describe("Ranking: contacts (default), emails, linkedin, companies, recent (newest), or name (A→Z)."),
+        per_page: z.number().int().optional().describe("Rows per page (1–200, default 25)."),
         page: z.number().int().optional().describe("1-based page number (default 1)."),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ name, sort, per_page, page }): Promise<TextResult> => {
       try {
-        const perPage = clamp(Math.trunc(per_page ?? 25), 1, 100);
+        const perPage = clamp(Math.trunc(per_page ?? 25), 1, 200);
         const pg = Math.max(Math.trunc(page ?? 1), 1);
-        const sortField = sort === "name" ? "name" : "id";
-        const sortDirection: "asc" | "desc" = sortField === "name" ? "asc" : "desc";
-        const res = await searchContactListsPaginated({ name, sortField, sortDirection, perPage, page: pg });
-        const lists = (res.results ?? []).map((l) => ({
+        const sortKey = sort ?? "contacts";
+        const all = await listContactListNames();
+
+        const q = name?.trim().toLowerCase();
+        const filtered = q ? all.filter((l) => String(l.name ?? "").toLowerCase().includes(q)) : all;
+
+        const n = (l: Raw, k: string) => (typeof l[k] === "number" ? (l[k] as number) : 0);
+        const cmp: Record<string, (a: Raw, b: Raw) => number> = {
+          contacts: (a, b) => n(b, "number_of_contacts") - n(a, "number_of_contacts"),
+          emails: (a, b) => n(b, "number_of_emails") - n(a, "number_of_emails"),
+          linkedin: (a, b) => n(b, "number_of_linkedin_url") - n(a, "number_of_linkedin_url"),
+          companies: (a, b) => n(b, "number_of_companies") - n(a, "number_of_companies"),
+          recent: (a, b) =>
+            String(b.created_on ?? "").localeCompare(String(a.created_on ?? "")) ||
+            (num(b.id) ?? 0) - (num(a.id) ?? 0),
+          name: (a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")),
+        };
+        const sorted = [...filtered].sort(cmp[sortKey]);
+
+        const total_lists = filtered.length;
+        const total_contacts = filtered.reduce((s, l) => s + n(l, "number_of_contacts"), 0);
+        const pages = Math.max(Math.ceil(total_lists / perPage), 1);
+        const start = (pg - 1) * perPage;
+        const lists = sorted.slice(start, start + perPage).map((l) => ({
           id: num(l.id),
           name: l.name ?? null,
           number_of_contacts: num(l.number_of_contacts),
@@ -1474,16 +1499,22 @@ export function registerTools(server: McpServer): void {
           list_type: l.list_type ?? null,
           created_on: l.created_on ?? null,
         }));
+
         return ok({
-          total: num(res.number_of_results),
-          total_formatted: fmt(res.number_of_results),
-          pages: num(res.number_of_pages),
+          total_lists,
+          total_lists_formatted: fmt(total_lists),
+          total_contacts,
+          total_contacts_formatted: fmt(total_contacts),
+          sort: sortKey,
           page: pg,
           per_page: perPage,
-          ...(name?.trim() ? { name_filter: name.trim() } : {}),
+          pages,
+          ...(q ? { name_filter: name!.trim() } : {}),
           returned: lists.length,
           lists,
-          summary: `${fmt(res.number_of_results)} list(s) — page ${pg}/${res.number_of_pages ?? 1}`,
+          summary:
+            `${fmt(total_lists)} list(s), ${fmt(total_contacts)} contacts total — ` +
+            `sorted by ${sortKey}, page ${pg}/${pages}`,
         });
       } catch (err) {
         return fail(err);

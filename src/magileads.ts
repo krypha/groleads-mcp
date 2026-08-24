@@ -279,7 +279,7 @@ export async function getContactList(id: number): Promise<ContactListSummary> {
 /* -------------------------------------------------------------------------- */
 
 /**
- * A Groleads/Magileads data field. Data fields are account-global (shared across
+ * A Magileads data field. Data fields are account-global (shared across
  * every contact list), so `listDataFields()` is what backs `list_contact_fields`.
  * `id` is the numeric field id used as `field_name` (as a STRING) inside filters;
  * `identifier` is the stable slug an agent names ("email", "company", ...).
@@ -306,7 +306,7 @@ export type FilterNode = {
 };
 
 /**
- * The DELETE body shape (Groleads `ContactLists.ContactsSelection`). An empty
+ * The DELETE body shape (Magileads `ContactLists.ContactsSelection`). An empty
  * `filter` ({mode:'and',values:[]}) matches EVERY contact. `reverse_selection`
  * flips "these" ↔ "all except these": with a filter F, false deletes the F-matches,
  * true keeps only the F-matches (i.e. deletes everything else).
@@ -467,36 +467,18 @@ export async function listLinkedinAccounts(): Promise<Raw[]> {
 }
 
 /** A page of contact lists (root envelope of the paginated list endpoint). */
-export type ContactListPage = {
-  number_of_results?: number;
-  number_of_pages?: number;
-  results?: ContactListSummary[];
-};
-
 /**
- * Search/browse contact lists with paging + sorting. The endpoint only sorts/
- * filters on `name` or `id`; `options` is a URL-encoded JSON blob and the page
- * number is a path segment (`/contact-lists-paginated/page/{n}`).
+ * Fetch ALL contact lists in one call — ids, names, and counters
+ * (number_of_contacts/emails/linkedin_url/companies), plus created_on and
+ * list_type. Non-paginated, so sorting/ranking (e.g. "biggest lists") is correct
+ * across the whole account, not just one page. Filtering/sorting is done by the
+ * caller (`search_contact_lists`) in memory.
  */
-export async function searchContactListsPaginated(opts: {
-  name?: string;
-  sortField: "name" | "id";
-  sortDirection: "asc" | "desc";
-  perPage: number;
-  page: number;
-}): Promise<ContactListPage> {
-  const options: Record<string, unknown> = {
-    per_page: opts.perPage,
-    sort: { field_name: opts.sortField, sort_direction: opts.sortDirection },
-  };
-  if (opts.name && opts.name.trim()) {
-    options.filter = {
-      mode: "and",
-      values: [{ field_name: "name", type: "contains", value: opts.name.trim() }],
-    };
-  }
-  const q = `?options=${encodeURIComponent(JSON.stringify(options))}`;
-  return api<ContactListPage>(`/contact-lists-paginated/page/${opts.page}${q}`, { method: "GET" });
+export async function listContactListNames(): Promise<ContactListSummary[]> {
+  const data = await api<{ contact_lists?: ContactListSummary[] }>("/contact-lists/names", {
+    method: "GET",
+  });
+  return data.contact_lists ?? [];
 }
 
 /**

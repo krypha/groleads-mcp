@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Groleads MCP — Google Maps targeting (HTTP transport).
+ * Magileads MCP (HTTP transport).
  *
  * Serves the MCP Streamable HTTP transport so a remote / containerized agent
  * (e.g. a Nous Research Hermes Agent) can connect over the network by URL,
@@ -100,14 +100,14 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse): P
 async function main(): Promise<void> {
   if (authMode() === "none") {
     console.error(
-      "[groleads-mcp] No credentials configured. Set MAGILEADS_API_KEY, or " +
+      "[magileads-mcp] No credentials configured. Set MAGILEADS_API_KEY, or " +
         "MAGILEADS_EMAIL + MAGILEADS_PASSWORD.",
     );
     process.exit(1);
   }
   if (!TOKEN) {
     console.error(
-      "[groleads-mcp] MCP_AUTH_TOKEN is required in HTTP mode (the endpoint is " +
+      "[magileads-mcp] MCP_AUTH_TOKEN is required in HTTP mode (the endpoint is " +
         "network-reachable). Generate one, e.g.: openssl rand -hex 32",
     );
     process.exit(1);
@@ -124,7 +124,7 @@ async function main(): Promise<void> {
       return;
     }
     handleMcp(req, res).catch((err) => {
-      console.error("[groleads-mcp] request error:", err);
+      console.error("[magileads-mcp] request error:", err);
       if (!res.headersSent) {
         json(res, 500, { jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null });
       }
@@ -133,13 +133,13 @@ async function main(): Promise<void> {
 
   server.listen(PORT, () => {
     console.error(
-      `[groleads-mcp] HTTP MCP ready on :${PORT}${MCP_PATH} ` +
+      `[magileads-mcp] HTTP MCP ready on :${PORT}${MCP_PATH} ` +
         `(auth: bearer + ${authMode()}, base: ${API_BASE}).`,
     );
   });
 }
 
 main().catch((err) => {
-  console.error("[groleads-mcp] Fatal error:", err);
+  console.error("[magileads-mcp] Fatal error:", err);
   process.exit(1);
 });

@@ -1,14 +1,17 @@
-# Standalone deployment of the Groleads Google Maps MCP server (HTTP transport).
+# Standalone deployment of the Magileads MCP server (HTTP transport).
 # Runs on its own — the AI agent (e.g. Hermes) connects to it by URL.
+#
+# On Dokploy: point a Compose service at this repo; Dokploy builds the Dockerfile,
+# gives the service a domain, and terminates TLS at its reverse proxy.
 #
 # Set the required variables in a .env file next to this compose (see .env.example):
 #   MCP_AUTH_TOKEN      (required)  — the bearer token agents must send
 #   MAGILEADS_API_KEY   or  MAGILEADS_EMAIL + MAGILEADS_PASSWORD
 services:
-  groleads-mcp:
+  magileads-mcp:
     build: .
-    image: groleads-mcp-google-maps:latest
-    container_name: groleads-mcp
+    image: magileads-mcp:latest
+    container_name: magileads-mcp
     restart: unless-stopped
     ports:
       - "8080:8080"

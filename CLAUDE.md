@@ -1,4 +1,4 @@
-# CLAUDE.md — Groleads Google Maps MCP server
+# CLAUDE.md — Magileads MCP server
 
 Instructions for Claude Code working in **this** repository. (User-facing docs live in
 [README.md](README.md); read it too.)
@@ -6,15 +6,14 @@ Instructions for Claude Code working in **this** repository. (User-facing docs l
 ## What this is
 
 A standalone **MCP server** (`@modelcontextprotocol/sdk` v1.x, TypeScript, ESM/NodeNext)
-that exposes **Groleads / Magileads** as tools for AI agents (Google Maps targeting, contact
+that exposes **Magileads** as tools for AI agents (Google Maps targeting, contact
 lists, campaign audit, PRM, plus a generic non-admin API passthrough).
 **Runs on Bun** — Bun executes the TypeScript entry points directly, so there is **no build
 step to run** (`tsc` is used only for type-checking). It runs in production, deployed via
-Docker on Dokploy at **`mcp.groleads.com`**, and is consumed by a **Nous Research Hermes
-Agent** over HTTP. No LinkedIn account is required. The server is model-agnostic.
+Docker on Dokploy (behind a domain of your choice), and is consumed by a **Nous Research
+Hermes Agent** over HTTP. No LinkedIn account is required. The server is model-agnostic.
 
-This repo was split out of the main Groleads Next.js app; it has **no dependency on that
-app** and must stay that way.
+This repo is standalone; it has **no dependency on any parent app** and must stay that way.
 
 ## Architecture
 
@@ -135,9 +134,11 @@ paging; never dump giant payloads).
   don't invent one; the tool says so.
 - `list_linkedin_accounts` → `GET /integrations/linkedin` → `linkedin_accounts_list`
   (id/name/username/is_valid/validity_tested/checkpoint_required/is_sales_navigator_account/last_use).
-- `search_contact_lists` → `GET /contact-lists-paginated/page/{n}?options=` (path templated
-  as `/page/{n}` even though swagger only lists `/contact-lists-paginated`). `options` sorts/
-  filters ONLY on `name`/`id`. Root envelope: `number_of_results`/`number_of_pages`/`results[]`.
+- `search_contact_lists` → `GET /contact-lists/names` (NON-paginated: returns ALL lists with
+  counters + created_on + list_type). Filtering/sorting/paging is done in memory, so ranking
+  (`sort`: contacts/emails/linkedin/companies/recent/name) is correct across the whole account —
+  not just one page (and it's ~5× faster than the old paginated endpoint). Returns `total_lists`
+  + `total_contacts` (sums over the filtered set). NOT `/contact-lists-paginated` any more.
 - `get_contact_list` → reuses `getContactList` (`GET /contact-lists/{id}` → `contact_list_profile`).
   Job states are Capitalized (`"Completed"`, `"Error"`) → compare case-insensitively; `in_progress`
   is true only for non-terminal states.
@@ -246,12 +247,12 @@ live API.
 ## Hermes integration
 
 Register as a remote HTTP MCP server in Hermes (dashboard or `~/.hermes/config.yaml`):
-`url: https://mcp.groleads.com/mcp` + token (via `?token=` in the URL, or an
+`url: https://<your-domain>/mcp` + token (via `?token=` in the URL, or an
 `Authorization: Bearer` header in config.yaml). Hermes auto-discovers the tools.
 
 ## Conventions
 
-- Keep `magileads.ts` free of any Groleads-app imports (standalone).
+- Keep `magileads.ts` free of any parent-app imports (standalone).
 - New tools: register in `tools.ts`, validate + clamp inputs, wrap the body so it can't
   throw, return text content (JSON string) — mirror the existing ones. Read-only tools set
   `readOnlyHint:true`; anything that mutates sets `destructiveHint:true` + a confirm guard.

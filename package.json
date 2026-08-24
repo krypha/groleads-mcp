@@ -1,10 +1,10 @@
 {
-  "name": "@groleads/mcp-google-maps",
-  "version": "0.7.0",
-  "description": "MCP server exposing Groleads (Magileads) targeting, contact, campaign-audit, PRM and generic API tools for AI agents. Runs on Bun. Stdio + HTTP transports.",
+  "name": "magileads-mcp",
+  "version": "0.8.0",
+  "description": "Magileads MCP — exposes Magileads (targeting, contact lists, campaign audit, PRM, and a generic non-admin API passthrough) as tools for AI agents. Runs on Bun. Stdio + HTTP transports.",
   "type": "module",
   "bin": {
-    "groleads-mcp-google-maps": "dist/index.js"
+    "magileads-mcp": "dist/index.js"
   },
   "files": [
     "dist",

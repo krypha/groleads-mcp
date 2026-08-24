@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * Groleads MCP — Google Maps targeting (stdio transport).
+ * Magileads MCP (stdio transport).
  *
- * A stdio Model Context Protocol server exposing Groleads (Magileads) Google Maps
- * targeting as tools for AI agents. No LinkedIn account needed — only Magileads creds.
+ * A stdio Model Context Protocol server exposing Magileads as tools for AI agents
+ * (targeting, contact lists, campaign audit, PRM, and a generic API passthrough).
+ * Only Magileads credentials are required.
  *
  * For a containerized / remote deployment (e.g. an agent that connects over the
- * network), use the HTTP entrypoint instead: `node dist/http.js` (see http.ts).
+ * network), use the HTTP entrypoint instead: `bun run src/http.ts` (see http.ts).
  *
  * Configure via environment (see .env.example):
  *   MAGILEADS_API_KEY                       (preferred), or
@@ -24,7 +25,7 @@ async function main(): Promise<void> {
   const mode = authMode();
   if (mode === "none") {
     console.error(
-      "[groleads-mcp] No credentials configured. Set MAGILEADS_API_KEY, or " +
+      "[magileads-mcp] No credentials configured. Set MAGILEADS_API_KEY, or " +
         "MAGILEADS_EMAIL + MAGILEADS_PASSWORD, then restart.",
     );
     process.exit(1);
@@ -35,11 +36,11 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   console.error(
-    `[groleads-mcp] Google Maps targeting server ready (stdio, auth: ${mode}, base: ${API_BASE}).`,
+    `[magileads-mcp] server ready (stdio, auth: ${mode}, base: ${API_BASE}).`,
   );
 }
 
 main().catch((err) => {
-  console.error("[groleads-mcp] Fatal error:", err);
+  console.error("[magileads-mcp] Fatal error:", err);
   process.exit(1);
 });
