@@ -5,7 +5,7 @@ import { registerTools } from "./tools.js";
 export function buildServer(): McpServer {
   const server = new McpServer({
     name: "magileads-mcp",
-    version: "0.8.0",
+    version: "0.9.0",
   });
   registerTools(server);
   return server;

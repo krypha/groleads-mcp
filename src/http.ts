@@ -1,30 +1,36 @@
 #!/usr/bin/env node
 /**
- * Magileads MCP (HTTP transport).
+ * Magileads MCP (HTTP transport) — multi-tenant.
  *
  * Serves the MCP Streamable HTTP transport so a remote / containerized agent
- * (e.g. a Nous Research Hermes Agent) can connect over the network by URL,
- * instead of spawning a local stdio subprocess.
+ * (e.g. a Nous Research Hermes Agent) can connect over the network by URL.
+ *
+ * AUTH IS PER CLIENT (bring-your-own-key): each request must carry the calling
+ * client's OWN Magileads API key, which the server uses for that request only —
+ * so different clients hit different Magileads accounts. A client presents its key
+ * as ANY of:
+ *   - `X-Magileads-Api-Key: <key>` header      (preferred)
+ *   - `Authorization: Bearer <key>` header      (config-file friendly)
+ *   - `?api_key=<key>` (or `?token=<key>`) query (URL-only dashboards; may appear in proxy logs)
+ * There is no separate gate token: a request without a usable key is rejected
+ * (unless the server has its own MAGILEADS_* env credentials as a default account).
  *
  * Environment:
- *   MCP_AUTH_TOKEN   REQUIRED — clients must send `Authorization: Bearer <token>`.
  *   MCP_HTTP_PORT    listen port (default 8080)
  *   MCP_HTTP_PATH    MCP endpoint path (default /mcp)
- *   MAGILEADS_API_KEY  or  MAGILEADS_EMAIL + MAGILEADS_PASSWORD   (Magileads auth)
+ *   MAGILEADS_API_KEY  or  MAGILEADS_EMAIL + MAGILEADS_PASSWORD   (OPTIONAL default account)
  *   MAGILEADS_API_BASE (optional)
  *
- * All logging goes to stderr.
+ * All logging goes to stderr. The client's key is never logged.
  */
 
 import http from "node:http";
-import { timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildServer } from "./server.js";
-import { authMode, API_BASE } from "./magileads.js";
+import { authMode, API_BASE, runWithAuth } from "./magileads.js";
 
 const PORT = Number(process.env.MCP_HTTP_PORT) || 8080;
 const MCP_PATH = process.env.MCP_HTTP_PATH || "/mcp";
-const TOKEN = process.env.MCP_AUTH_TOKEN || "";
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -35,25 +41,26 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-/** Constant-time compare of a candidate secret against MCP_AUTH_TOKEN. */
-function tokenMatches(candidate: string): boolean {
-  const got = Buffer.from(candidate);
-  const want = Buffer.from(TOKEN);
-  return got.length === want.length && timingSafeEqual(got, want);
-}
-
 /**
- * A request is authorized if it carries the token either as:
- *   - `Authorization: Bearer <token>` header  (preferred — used by config.yaml `headers`), or
- *   - a `?token=<token>` URL query parameter   (lets a dashboard that only exposes a
- *     URL field authenticate; note the token may appear in proxy access logs).
+ * Extract the calling client's Magileads API key from the request, checking (in
+ * order) the `X-Magileads-Api-Key` header, an `Authorization: Bearer` header, and
+ * an `?api_key=` / `?token=` query parameter. Returns undefined if none is present.
  */
-function authorized(req: http.IncomingMessage): boolean {
-  const header = req.headers["authorization"] || "";
-  if (header.startsWith("Bearer ") && tokenMatches(header.slice(7))) return true;
-  const q = new URL(req.url || "/", "http://localhost").searchParams.get("token");
-  if (q && tokenMatches(q)) return true;
-  return false;
+function extractClientKey(req: http.IncomingMessage): string | undefined {
+  const hdr = req.headers["x-magileads-api-key"];
+  if (typeof hdr === "string" && hdr.trim()) return hdr.trim();
+
+  const auth = req.headers["authorization"];
+  if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+    const t = auth.slice(7).trim();
+    if (t) return t;
+  }
+
+  const sp = new URL(req.url || "/", "http://localhost").searchParams;
+  const q = sp.get("api_key") || sp.get("token");
+  if (q && q.trim()) return q.trim();
+
+  return undefined;
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -70,8 +77,20 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse): P
     json(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
     return;
   }
-  if (!authorized(req)) {
-    json(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+
+  // Per-client key. If none is provided AND the server has no default account, reject.
+  const clientKey = extractClientKey(req);
+  if (!clientKey && authMode() === "none") {
+    json(res, 401, {
+      jsonrpc: "2.0",
+      error: {
+        code: -32001,
+        message:
+          "Unauthorized: provide your Magileads API key via the X-Magileads-Api-Key header, " +
+          "Authorization: Bearer <key>, or ?api_key=<key>.",
+      },
+      id: null,
+    });
     return;
   }
 
@@ -83,7 +102,7 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse): P
     return;
   }
 
-  // Stateless: a fresh server + transport per request.
+  // Stateless: a fresh server + transport per request, run under this client's credential.
   const server = buildServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -93,26 +112,13 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse): P
     transport.close();
     server.close();
   });
-  await server.connect(transport);
-  await transport.handleRequest(req, res, body);
+  await runWithAuth({ apiKey: clientKey }, async () => {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, body);
+  });
 }
 
 async function main(): Promise<void> {
-  if (authMode() === "none") {
-    console.error(
-      "[magileads-mcp] No credentials configured. Set MAGILEADS_API_KEY, or " +
-        "MAGILEADS_EMAIL + MAGILEADS_PASSWORD.",
-    );
-    process.exit(1);
-  }
-  if (!TOKEN) {
-    console.error(
-      "[magileads-mcp] MCP_AUTH_TOKEN is required in HTTP mode (the endpoint is " +
-        "network-reachable). Generate one, e.g.: openssl rand -hex 32",
-    );
-    process.exit(1);
-  }
-
   const server = http.createServer((req, res) => {
     const path = (req.url || "").split("?")[0];
     if (req.method === "GET" && path === "/health") {
@@ -132,9 +138,13 @@ async function main(): Promise<void> {
   });
 
   server.listen(PORT, () => {
+    const mode = authMode();
+    const authDesc =
+      mode === "none"
+        ? "per-request client key required (multi-tenant)"
+        : `per-request client key, else env ${mode} (default account)`;
     console.error(
-      `[magileads-mcp] HTTP MCP ready on :${PORT}${MCP_PATH} ` +
-        `(auth: bearer + ${authMode()}, base: ${API_BASE}).`,
+      `[magileads-mcp] HTTP MCP ready on :${PORT}${MCP_PATH} (auth: ${authDesc}, base: ${API_BASE}).`,
     );
   });
 }

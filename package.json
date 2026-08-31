@@ -1,6 +1,6 @@
 {
   "name": "magileads-mcp",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Magileads MCP — exposes Magileads (targeting, contact lists, campaign audit, PRM, and a generic non-admin API passthrough) as tools for AI agents. Runs on Bun. Stdio + HTTP transports.",
   "type": "module",
   "bin": {

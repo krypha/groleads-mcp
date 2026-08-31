@@ -221,31 +221,38 @@ the API's OpenAPI spec — see [`src/endpoints.generated.ts`](src/endpoints.gene
 The HTTP transport is a stateless MCP **Streamable HTTP** endpoint at `POST /mcp`
 (returns JSON), plus an unauthenticated `GET /health` liveness probe.
 
+## Authentication (multi-tenant)
+
+The HTTP transport is **bring-your-own-key**: every request carries the calling client's
+**own Magileads API key**, and the server uses it for that request only — so different
+clients hit different Magileads accounts. There is **no shared gate token** to manage, and
+the server stores no per-client secrets.
+
+A client presents its Magileads API key as any of:
+
+- `X-Magileads-Api-Key: <key>` header — **preferred**
+- `Authorization: Bearer <key>` header — config-file friendly
+- `?api_key=<key>` (or `?token=<key>`) on the URL — for dashboards with only a URL field
+  (note the key may appear in reverse-proxy access logs)
+
+A request with no usable key gets `401`, **unless** the server is configured with a default
+account (below), in which case keyless requests fall back to that account.
+
 ## Configuration
 
-All configuration is via environment variables (see [`.env.example`](.env.example)).
-
-**Magileads authentication — pick ONE:**
+All via environment variables (see [`.env.example`](.env.example)). For a pure multi-tenant
+deployment you can leave them **all unset**.
 
 | Variable(s) | Meaning |
 | --- | --- |
-| `MAGILEADS_API_KEY` | Sent as `X-API-Key` (preferred). |
-| `MAGILEADS_EMAIL` + `MAGILEADS_PASSWORD` | JWT login, auto-refreshed. |
+| `MAGILEADS_API_KEY` | **Optional** default account (`X-API-Key`), used for keyless requests + stdio. |
+| `MAGILEADS_EMAIL` + `MAGILEADS_PASSWORD` | Optional default account via JWT login (auto-refreshed). |
 | `MAGILEADS_API_BASE` | Optional; defaults to `https://app.api-magileads.net`. |
-
-**HTTP transport:**
-
-| Variable | Meaning |
-| --- | --- |
-| `MCP_AUTH_TOKEN` | **Required in HTTP mode.** Clients must present this token (the endpoint is network-reachable). Generate one with `openssl rand -hex 32`. |
 | `MCP_HTTP_PORT` | Listen port (default `8080`). |
 | `MCP_HTTP_PATH` | MCP endpoint path (default `/mcp`). |
 
-A client proves the token **either** way:
-
-- `Authorization: Bearer <token>` header (preferred — used by config-file clients), **or**
-- a `?token=<token>` query parameter on the URL (handy for dashboards that only
-  expose a URL field — note the token may appear in reverse-proxy access logs).
+> **stdio** is always single-account — it uses the `MAGILEADS_*` env credentials (there is no
+> per-request key over stdio).
 
 ## Run locally
 
@@ -254,34 +261,34 @@ The server runs on [Bun](https://bun.sh) (it executes the TypeScript directly �
 ```bash
 bun install
 
-# stdio (local agent)
+# stdio (local agent) — single account from env
 MAGILEADS_API_KEY=... bun run start
 
-# HTTP (remote agent) — listens on :8080/mcp
-MAGILEADS_API_KEY=... MCP_AUTH_TOKEN=$(openssl rand -hex 32) bun run start:http
+# HTTP (multi-tenant) — clients send their own Magileads key; no server creds needed
+bun run start:http
 ```
 
-Smoke-test the HTTP endpoint:
+Smoke-test the HTTP endpoint (send your Magileads key as the client key):
 
 ```bash
 curl -s localhost:8080/health                       # {"status":"ok"}
-curl -s -X POST 'localhost:8080/mcp?token=YOUR_TOKEN' \
+curl -s -X POST localhost:8080/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
+  -H 'X-Magileads-Api-Key: YOUR_MAGILEADS_KEY' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
 ## Deploy with Docker / Dokploy
 
 ```bash
-cp .env.example .env          # set MCP_AUTH_TOKEN + MAGILEADS_API_KEY
-docker compose up -d --build
+docker compose up -d --build   # no env vars needed for a multi-tenant deployment
 ```
 
-On **Dokploy**: create an app from this repo, let it build the `Dockerfile`, set the
-env vars (`MCP_AUTH_TOKEN`, `MAGILEADS_API_KEY`), and give it a domain. Dokploy's
-reverse proxy terminates TLS, so the agent reaches the server at
-`https://<your-domain>/mcp`.
+On **Dokploy**: create an app from this repo, let it build the `Dockerfile`, and give it a
+domain. **No env vars are required** for multi-tenant (clients bring their own Magileads key);
+optionally set a default `MAGILEADS_API_KEY` for keyless requests. Dokploy's reverse proxy
+terminates TLS, so clients reach the server at `https://<your-domain>/mcp`.
 
 The image is Bun-based (`oven/bun`), runs `bun run src/http.ts`, listens on `8080`, runs as a
 non-root user, and declares a `HEALTHCHECK` against `/health`.
@@ -293,29 +300,31 @@ remote HTTP MCP servers and discovers their tools automatically at startup.
 
 ### Option 1 — dashboard (simplest)
 
-In the dashboard's **Add MCP server** form:
+In the dashboard's **Add MCP server** form — each Hermes agent uses **its own** Magileads
+API key as the client key:
 
 | Field | Value |
 | --- | --- |
 | **Name** | `magileads` |
 | **Transport** | `HTTP/SSE` |
-| **URL** | `https://<your-domain>/mcp?token=<MCP_AUTH_TOKEN>` |
+| **URL** | `https://<your-domain>/mcp?api_key=<THIS_CLIENT_MAGILEADS_KEY>` |
 | **Environment** | *(leave empty — it applies to stdio servers only, not HTTP)* |
 
-The token goes in the URL because this form has no headers field.
+The key goes in the URL because this form has no headers field.
 
-### Option 2 — config.yaml (cleaner, keeps the token out of the URL)
+### Option 2 — config.yaml (cleaner, keeps the key out of the URL)
 
 ```yaml
 mcp_servers:
   magileads:
     url: "https://<your-domain>/mcp"
     headers:
-      Authorization: "Bearer <MCP_AUTH_TOKEN>"
+      X-Magileads-Api-Key: "<THIS_CLIENT_MAGILEADS_KEY>"
 ```
 
-Either way, the Magileads credentials stay in **this** server — Hermes never sees
-them. Hermes namespaces the tools as `magileads.<tool>` (or similar) once
+Each client's Magileads key never leaves that client's config — the server holds no
+per-client secrets, and routes every request to the account behind the key it was given.
+Hermes namespaces the tools as `magileads.<tool>` (or similar) once
 discovered.
 
 ## Project structure
@@ -355,11 +364,11 @@ transport — never `console.log` to stdout there.
 
 ## Troubleshooting
 
-- **Hermes shows the server but tools fail / 401** — the token is wrong or missing.
-  Check the `?token=` in the URL (Option 1) or the `Authorization` header (Option 2)
-  matches `MCP_AUTH_TOKEN` exactly.
-- **Server won't start in HTTP mode** — `MCP_AUTH_TOKEN` is unset (required) or no
-  Magileads credentials are configured.
+- **Tools fail / `401` / `token_not_exist`** — the client's Magileads API key is missing or
+  wrong. Check the `?api_key=` in the URL (Option 1) or the `X-Magileads-Api-Key` header
+  (Option 2). A `401` with no tool error means no key was sent at all.
+- **Every client sees the same account** — they're all sending the same key (or none, falling
+  back to the server's default `MAGILEADS_API_KEY`). Each client must send its own key.
 - **`generate_*` seems to hang** — it's slow (~30–60 s), not stuck. Give clients a
   generous timeout.
 - **Extraction "not finished"** — it's asynchronous. Poll `get_contact_list_status`

@@ -1,15 +1,19 @@
 /**
  * Minimal, self-contained Magileads API client for the MCP server.
  *
- * Unlike the app's `src/lib/magileads.ts` (which is `server-only` and cookie-bound),
- * this client is a standalone Node module. It authenticates in one of two ways,
- * chosen from the environment:
+ * Standalone Node module. Authentication is resolved per request, in this order:
  *
- *   - MAGILEADS_API_KEY               -> sent as `X-API-Key` (machine-to-machine, preferred for agents)
- *   - MAGILEADS_EMAIL + MAGILEADS_PASSWORD -> POST /users/authentication (JWT, auto-refreshed)
+ *   1. A PER-REQUEST client API key (multi-tenant) — the HTTP transport puts each
+ *      calling client's own Magileads key into an AsyncLocalStorage store, so every
+ *      tool call runs against THAT client's account. Sent as `X-API-Key`, stateless.
+ *   2. Otherwise the server's own ENV credentials (single-account fallback / stdio):
+ *      - MAGILEADS_API_KEY               -> `X-API-Key`
+ *      - MAGILEADS_EMAIL + MAGILEADS_PASSWORD -> POST /users/authentication (JWT, auto-refreshed)
  *
  * Base URL defaults to https://app.api-magileads.net (override with MAGILEADS_API_BASE).
  */
+
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const API_BASE = (process.env.MAGILEADS_API_BASE || "https://app.api-magileads.net").replace(
   /\/+$/,
@@ -21,10 +25,31 @@ const PASSWORD = process.env.MAGILEADS_PASSWORD || "";
 
 export type AuthMode = "apiKey" | "password" | "none";
 
+/** The ENV auth mode — the fallback used when no per-request client key is present. */
 export function authMode(): AuthMode {
   if (API_KEY) return "apiKey";
   if (EMAIL && PASSWORD) return "password";
   return "none";
+}
+
+/**
+ * Per-request Magileads credential (multi-tenant). The HTTP transport puts the
+ * calling client's own API key here for the duration of a request, so every tool
+ * runs against THAT client's Magileads account — no shared/global credential.
+ * When absent (stdio, or a request with no key), auth falls back to the env vars.
+ */
+export type RequestAuth = { apiKey?: string };
+const authStore = new AsyncLocalStorage<RequestAuth>();
+
+/** Run `fn` with `auth` as the active per-request credential. */
+export function runWithAuth<T>(auth: RequestAuth, fn: () => T): T {
+  return authStore.run(auth, fn);
+}
+
+/** The per-request client API key for the current async context, if any. */
+function currentApiKey(): string | undefined {
+  const k = authStore.getStore()?.apiKey;
+  return k && k.trim() ? k.trim() : undefined;
 }
 
 /** An error carrying the HTTP status and Magileads' machine-readable key (`state_message`). */
@@ -125,14 +150,21 @@ async function refresh(): Promise<void> {
   expiresAt = jwtExpiryMs(accessToken) ?? Date.now() + 25 * 60 * 1000;
 }
 
-/** Return the auth headers, logging in / refreshing the JWT as needed. */
+/** Return the auth headers for the current request, logging in / refreshing as needed. */
 async function authHeaders(): Promise<Record<string, string>> {
+  // Multi-tenant: a per-request client key wins and is sent as-is (stateless — no JWT cache).
+  const perReq = currentApiKey();
+  if (perReq) return { "X-API-Key": perReq };
+
+  // Fall back to the server's own env credentials (single-account / stdio).
   const mode = authMode();
   if (mode === "apiKey") return { "X-API-Key": API_KEY };
   if (mode === "none") {
     throw new MagileadsError(
-      "No Magileads credentials configured. Set MAGILEADS_API_KEY, or MAGILEADS_EMAIL + MAGILEADS_PASSWORD.",
-      0,
+      "No Magileads credentials for this request. Send the client's Magileads API key " +
+        "(X-Magileads-Api-Key header, Authorization: Bearer <key>, or ?api_key=<key>), " +
+        "or configure MAGILEADS_API_KEY / MAGILEADS_EMAIL+PASSWORD on the server.",
+      401,
       "no_credentials",
     );
   }
@@ -160,8 +192,9 @@ async function api<T>(path: string, init: RequestInit = {}, retryOn401 = true): 
     },
   });
 
-  // A mid-flight token expiry (password mode) → re-auth once and retry.
-  if (res.status === 401 && authMode() === "password" && retryOn401) {
+  // A mid-flight token expiry (env password mode only) → re-auth once and retry.
+  // Never for a per-request client key: a 401 there means the client's key is bad.
+  if (res.status === 401 && !currentApiKey() && authMode() === "password" && retryOn401) {
     accessToken = "";
     expiresAt = 0;
     return api<T>(path, init, false);

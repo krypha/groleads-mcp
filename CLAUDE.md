@@ -202,21 +202,28 @@ dedicated tool. Backed by `src/endpoints.generated.ts` (the allowlist).
 - Prefer the dedicated tools; the passthrough is the escape hatch. It CAN write, so it is the
   one place (besides `delete_contacts_by_selection`) that mutates data.
 
-## Auth (HTTP mode)
+## Auth (HTTP mode) — MULTI-TENANT, bring-your-own-key
 
-- `MCP_AUTH_TOKEN` is **required** in HTTP mode (network-reachable endpoint).
-- A client authenticates with **either** `Authorization: Bearer <token>` **or**
-  `?token=<token>` in the URL. The query form exists because the Hermes dashboard's
-  "Add MCP server" form has no headers field (its "Environment" field is stdio-only).
-- `/health` is intentionally unauthenticated.
+- There is **no gate token** (`MCP_AUTH_TOKEN` was removed at v0.9.0). Each HTTP request
+  carries the **calling client's own Magileads API key**, used for that request only, so
+  different clients hit different Magileads accounts.
+- `http.ts:extractClientKey` reads the key from `X-Magileads-Api-Key`, `Authorization: Bearer
+  <key>`, or `?api_key=` / `?token=` (the last two for URL-only dashboards). It then wraps the
+  per-request server in `runWithAuth({apiKey})`.
+- `magileads.ts` carries the key via **`AsyncLocalStorage`** (`runWithAuth` / `currentApiKey`):
+  `authHeaders()` uses a per-request key (sent as `X-API-Key`, STATELESS — no JWT cache) when
+  present, else falls back to the ENV credentials (`authMode()`). The 401-retry (env password
+  refresh) is skipped when a per-request key is in play. NEVER log the key.
+- Requests with no key are `401` unless the server has ENV creds (an optional default account).
+  **stdio is always single-account** (env only — no per-request key). `/health` is unauthenticated.
 
 ## Commands
 
 ```bash
 bun install
 bun run typecheck      # tsc --noEmit (Bun runs TS directly; no emit needed to run)
-bun run start:http     # run HTTP locally (needs MCP_AUTH_TOKEN + Magileads creds)
-bun run start          # run stdio locally
+bun run start:http     # run HTTP locally (multi-tenant; clients send their own key)
+bun run start          # run stdio locally (single account from env)
 bun run gen:endpoints  # regenerate the non-admin passthrough allowlist from the OpenAPI spec
 bun run build          # optional: bundle to dist/ via `bun build`
 ```
@@ -224,8 +231,8 @@ bun run build          # optional: bundle to dist/ via `bun build`
 **Verify a change without an MCP client** — drive JSON-RPC over the transport directly:
 
 ```bash
-# HTTP: start the server, then
-curl -s -X POST 'localhost:8080/mcp?token=T' \
+# HTTP: start the server, then (send the client's Magileads key)
+curl -s -X POST 'localhost:8080/mcp' -H 'X-Magileads-Api-Key: KEY' \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
@@ -242,13 +249,15 @@ live API.
 - `Dockerfile` (Bun image `oven/bun:1-alpine`, non-root `bun` user, `bun install --production`
   against `bun.lock`, `CMD bun run src/http.ts`, HEALTHCHECK on /health) + `docker-compose.yml`.
   Bun runs the TS directly — no build/dist stage. Dokploy builds the Dockerfile and terminates TLS.
-- Env in prod: `MCP_AUTH_TOKEN`, `MAGILEADS_API_KEY` (or email/password).
+- Env in prod: **none required** (multi-tenant). Optionally `MAGILEADS_API_KEY` (or
+  email/password) as a default account for keyless requests.
 
 ## Hermes integration
 
-Register as a remote HTTP MCP server in Hermes (dashboard or `~/.hermes/config.yaml`):
-`url: https://<your-domain>/mcp` + token (via `?token=` in the URL, or an
-`Authorization: Bearer` header in config.yaml). Hermes auto-discovers the tools.
+Register as a remote HTTP MCP server in Hermes (dashboard or `~/.hermes/config.yaml`). Each
+Hermes agent uses **its own** Magileads API key as the client key: `url:
+https://<your-domain>/mcp` with `?api_key=<key>` in the URL, or an `X-Magileads-Api-Key`
+header in config.yaml. Hermes auto-discovers the tools.
 
 ## Conventions
 

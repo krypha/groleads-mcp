@@ -1,12 +1,14 @@
-# Standalone deployment of the Magileads MCP server (HTTP transport).
-# Runs on its own — the AI agent (e.g. Hermes) connects to it by URL.
+# Standalone deployment of the Magileads MCP server (HTTP transport, multi-tenant).
+# Runs on its own — each AI agent / client connects by URL and presents its OWN
+# Magileads API key per request (X-Magileads-Api-Key header, Authorization: Bearer,
+# or ?api_key=). There is no shared gate token to configure.
 #
 # On Dokploy: point a Compose service at this repo; Dokploy builds the Dockerfile,
 # gives the service a domain, and terminates TLS at its reverse proxy.
 #
-# Set the required variables in a .env file next to this compose (see .env.example):
-#   MCP_AUTH_TOKEN      (required)  — the bearer token agents must send
-#   MAGILEADS_API_KEY   or  MAGILEADS_EMAIL + MAGILEADS_PASSWORD
+# MAGILEADS_API_KEY below is OPTIONAL — set it only if you want a single default
+# account for keyless requests. Leave it unset for a pure multi-tenant deployment
+# (keyless requests are then rejected).
 services:
   magileads-mcp:
     build: .
@@ -17,9 +19,8 @@ services:
       - "8080:8080"
     environment:
       - MCP_HTTP_PORT=8080
-      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
-      # --- Magileads auth: keep ONE of the following ---
-      - MAGILEADS_API_KEY=${MAGILEADS_API_KEY:-}
+      # --- Optional default account (keyless requests fall back to this) ---
+      # - MAGILEADS_API_KEY=${MAGILEADS_API_KEY:-}
       # - MAGILEADS_EMAIL=${MAGILEADS_EMAIL:-}
       # - MAGILEADS_PASSWORD=${MAGILEADS_PASSWORD:-}
       # - MAGILEADS_API_BASE=${MAGILEADS_API_BASE:-}
