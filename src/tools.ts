@@ -7,7 +7,6 @@ import {
   getContactList,
   listDataFields,
   countContacts,
-  deleteContactsSelection,
   listProgrammations,
   getProgrammationById,
   getWorkflow,
@@ -478,7 +477,14 @@ function templateToRegex(tpl: string): RegExp {
   return new RegExp(`^${literals.join("[^/]+")}$`);
 }
 
-const ENDPOINT_MATCHERS: (EndpointDef & { re: RegExp })[] = NON_ADMIN_ENDPOINTS.map((e) => ({
+/**
+ * DELETE est banni de bout en bout : aucun outil de ce serveur ne doit pouvoir
+ * supprimer de donnee. On retire donc ces endpoints de l'index appelable, si bien
+ * que l'agent ne peut ni les decouvrir, ni les atteindre.
+ */
+const CALLABLE_ENDPOINTS = NON_ADMIN_ENDPOINTS.filter((e) => e.method !== "DELETE");
+
+const ENDPOINT_MATCHERS: (EndpointDef & { re: RegExp })[] = CALLABLE_ENDPOINTS.map((e) => ({
   ...e,
   re: templateToRegex(e.path),
 }));
@@ -828,7 +834,7 @@ export function registerTools(server: McpServer): void {
         "List the fields you can filter on in a contact list — for each: `data_field_id`, " +
         "`identifier` (e.g. 'email', 'company', 'first_name'), `label`, and `type`. Use the " +
         "`identifier` values to name fields in `preview_contact_selection` / " +
-        "`delete_contacts_by_selection` criteria. Data fields are account-wide, so they apply " +
+        "`preview_contact_selection` and `query_contacts` criteria. Data fields are account-wide, so they apply " +
         "to every contact list.",
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("The contact list id to inspect."),
@@ -858,15 +864,13 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     "preview_contact_selection",
     {
-      title: "Preview a contact selection (read-only — deletes NOTHING)",
+      title: "Count the contacts matching a selection (read-only)",
       description:
-        "Count how a set of criteria would affect a contact list WITHOUT changing anything. " +
-        "Returns `{ list_name, matched_count, total_count }` plus `to_delete` / `to_keep` for the " +
-        "chosen `target`. ALWAYS call this before delete_contacts_by_selection: the `to_delete` it " +
-        "returns is exactly the `confirm_count` the delete tool requires. `match:'all'` = every " +
+        "Count how many contacts of a list a set of criteria covers, WITHOUT changing anything. " +
+        "Returns `{ list_name, matched_count, total_count }` plus `selected` / `not_selected` for " +
+        "the chosen `target`. Use it to size a segment before acting on it. `match:'all'` = every " +
         "criterion (AND), `match:'any'` = at least one (OR). `target:'matching'` selects the " +
-        "contacts that match; `target:'all_except_matching'` selects everyone who does NOT match " +
-        "(i.e. keep only the matches).",
+        "contacts that match; `target:'all_except_matching'` selects everyone who does NOT match.",
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("The contact list id."),
         criteria: z
@@ -898,113 +902,9 @@ export function registerTools(server: McpServer): void {
           total_count: sel.total_count,
           target: target ?? "matching",
           match: match ?? "all",
-          to_delete: sel.to_delete,
-          to_keep: sel.to_keep,
-          note: "Nothing was deleted. Pass to_delete as confirm_count to delete_contacts_by_selection.",
-        });
-      } catch (err) {
-        return fail(err);
-      }
-    },
-  );
-
-  server.registerTool(
-    "delete_contacts_by_selection",
-    {
-      title: "Delete contacts by selection (DESTRUCTIVE)",
-      description:
-        "Permanently delete contacts from a list that match your criteria. DESTRUCTIVE and " +
-        "guarded: it RE-COUNTS live and refuses unless `confirm_count` exactly equals the number " +
-        "that will be deleted (get it from `preview_contact_selection`'s `to_delete`). Same " +
-        "`criteria` / `match` / `target` semantics as preview — with `target:'all_except_matching'` " +
-        "it deletes everyone who does NOT match. Empty criteria are refused (that would wipe the " +
-        "whole list) unless you set `delete_entire_list:true`. Always preview first.",
-      inputSchema: {
-        contact_list_id: z.number().int().positive().describe("The contact list id."),
-        criteria: z
-          .array(criterionSchema)
-          .max(MAX_CRITERIA)
-          .describe("Filter conditions. Empty array is refused unless delete_entire_list:true."),
-        match: z
-          .enum(["all", "any"])
-          .optional()
-          .describe("Combine criteria with AND ('all', default) or OR ('any')."),
-        target: z
-          .enum(["matching", "all_except_matching"])
-          .optional()
-          .describe("'matching' (default) deletes the matches; 'all_except_matching' deletes non-matches."),
-        confirm_count: z
-          .number()
-          .int()
-          .min(0)
-          .describe("REQUIRED. Must equal the live to_delete count (from preview) or the delete is refused."),
-        delete_entire_list: z
-          .boolean()
-          .optional()
-          .describe("Explicit opt-in to allow empty criteria (delete every contact). Default false."),
-      },
-      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-    },
-    async ({
-      contact_list_id,
-      criteria,
-      match,
-      target,
-      confirm_count,
-      delete_entire_list,
-    }): Promise<TextResult> => {
-      try {
-        const crit = criteria ?? [];
-        const tgt = target ?? "matching";
-
-        // Guardrail 1: never let empty criteria silently wipe the list.
-        if (crit.length === 0 && !delete_entire_list) {
-          return fail(
-            new Error(
-              "Refusing: empty criteria would affect the whole list. " +
-                "Set delete_entire_list:true to intentionally delete every contact.",
-            ),
-          );
-        }
-
-        // Re-count live — this is the authoritative number, not the preview's.
-        const sel = await resolveSelection(contact_list_id, crit, match ?? "all", tgt);
-
-        // Guardrail 2: confirm_count must match the live to_delete exactly.
-        if (confirm_count !== sel.to_delete) {
-          return fail(
-            new Error(
-              `Refusing: confirm_count (${confirm_count}) does not match the live count of ` +
-                `contacts that would be deleted (${sel.to_delete}). Re-run ` +
-                `preview_contact_selection and pass its to_delete as confirm_count.`,
-            ),
-          );
-        }
-
-        // Guardrail 3: nothing to do — don't call the destructive endpoint for 0.
-        if (sel.to_delete === 0) {
-          return ok({
-            deleted: 0,
-            list_name: sel.list_name,
-            target: tgt,
-            note: "No contacts matched the selection; nothing was deleted.",
-          });
-        }
-
-        // target 'matching' → delete the matches; 'all_except_matching' → keep only
-        // the matches (reverse_selection flips it), deleting everyone else.
-        await deleteContactsSelection(contact_list_id, {
-          filter: sel.filter,
-          contact_ids: [],
-          excluded_contact_ids: [],
-          reverse_selection: tgt === "all_except_matching",
-        });
-
-        return ok({
-          deleted: sel.to_delete,
-          list_name: sel.list_name,
-          target: tgt,
-          remaining: sel.to_keep,
+          selected: sel.to_delete,
+          not_selected: sel.to_keep,
+          note: "Read-only: nothing was changed. This server exposes no tool that deletes contacts.",
         });
       } catch (err) {
         return fail(err);
@@ -1967,9 +1867,9 @@ export function registerTools(server: McpServer): void {
         "magileads_request.",
       inputSchema: {
         search: z.string().optional().describe("Substring filter on path, summary, or tag (case-insensitive)."),
-        method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).optional().describe("Filter by HTTP method."),
+        method: z.enum(["GET", "POST", "PUT", "PATCH"]).optional().describe("Filter by HTTP method."),
         reads_only: z.boolean().optional().describe("Only GET (read) endpoints."),
-        writes_only: z.boolean().optional().describe("Only write (POST/PUT/DELETE/PATCH) endpoints."),
+        writes_only: z.boolean().optional().describe("Only write (POST/PUT/PATCH) endpoints."),
         limit: z.number().int().optional().describe("Max endpoints to return (1–200, default 60)."),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
@@ -1978,7 +1878,7 @@ export function registerTools(server: McpServer): void {
       try {
         const q = search?.trim().toLowerCase();
         const cap = clamp(Math.trunc(limit ?? 60), 1, 200);
-        let rows = NON_ADMIN_ENDPOINTS.filter((e) => {
+        let rows = CALLABLE_ENDPOINTS.filter((e) => {
           if (method && e.method !== method) return false;
           if (reads_only && e.write) return false;
           if (writes_only && !e.write) return false;
@@ -1988,7 +1888,7 @@ export function registerTools(server: McpServer): void {
         const total = rows.length;
         rows = rows.slice(0, cap);
         return ok({
-          total_available: NON_ADMIN_ENDPOINTS.length,
+          total_available: CALLABLE_ENDPOINTS.length,
           matched: total,
           returned: rows.length,
           endpoints: rows.map((e) => ({ method: e.method, path: e.path, tag: e.tag, summary: e.summary, write: e.write })),
@@ -2041,14 +1941,14 @@ export function registerTools(server: McpServer): void {
     {
       title: "Call any non-admin API write endpoint (guarded)",
       description:
-        "Escape hatch for WRITES (POST/PUT/DELETE/PATCH) on any allow-listed non-admin Magileads " +
+        "Escape hatch for WRITES (POST/PUT/PATCH) on any allow-listed non-admin Magileads " +
         "endpoint not covered by a dedicated tool — creating lists/models, sending LinkedIn " +
         "messages, imports, PRM exclusions, status changes, etc. GUARDED: it does a DRY RUN by " +
         "default (shows exactly what would be sent and changes nothing); set `confirm:true` to " +
         "actually execute. Admin/billing/reseller endpoints are blocked. Discover paths with " +
         "list_api_endpoints. This tool can modify or delete data — review the dry run first.",
       inputSchema: {
-        method: z.enum(["POST", "PUT", "DELETE", "PATCH"]).describe("HTTP method for the write."),
+        method: z.enum(["POST", "PUT", "PATCH"]).describe("HTTP method for the write (DELETE is not available)."),
         path: z.string().min(1).describe("API path with a leading slash, {params} filled in."),
         query: z.record(z.any()).optional().describe("Optional query params (object/array values are JSON-encoded)."),
         body: z.any().optional().describe("Optional JSON request body."),

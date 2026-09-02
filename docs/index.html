@@ -1,0 +1,856 @@
+<title>Magileads MCP</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@600;700;800&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+
+<style>
+  /* ---------------------------------------------------------------------
+     Palette : reprise du système Magileads (teal #0f766e / cyan #0e7490),
+     neutres volontairement biaisés cyan. Le rouge est sémantique
+     (actions destructives) et n'est jamais utilisé comme accent.
+     --------------------------------------------------------------------- */
+  :root {
+    --ground: #f5f8f8;
+    --surface: #ffffff;
+    --surface-2: #eef4f4;
+    --ink: #0c1a1c;
+    --ink-soft: #2b4144;
+    --muted: #566e71;
+    --line: #dbe4e4;
+    --line-strong: #c3d2d2;
+    --accent: #0f766e;
+    --accent-2: #0e7490;
+    --accent-wash: #eafaf7;
+    --danger: #a52016;
+    --danger-wash: #fdeeec;
+    --warn: #7a5200;
+    --warn-wash: #fdf5e3;
+    --code-ground: #0c1a1c;
+    --code-ink: #d8e8e6;
+
+    --measure: 68ch;
+    --step--1: clamp(0.78rem, 0.76rem + 0.1vw, 0.83rem);
+    --step-0: clamp(0.98rem, 0.95rem + 0.14vw, 1.06rem);
+    --step-1: clamp(1.18rem, 1.1rem + 0.35vw, 1.35rem);
+    --step-2: clamp(1.45rem, 1.3rem + 0.7vw, 1.85rem);
+    --step-3: clamp(1.9rem, 1.6rem + 1.5vw, 2.9rem);
+  }
+
+  /* Thème système sombre — on ne redéfinit QUE les tokens, et on laisse
+     un choix explicite "light" gagner sur un OS sombre. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0a1315;
+      --surface: #0f1e20;
+      --surface-2: #14262a;
+      --ink: #e4eeee;
+      --ink-soft: #bed2d3;
+      --muted: #87a2a5;
+      --line: #1c2f32;
+      --line-strong: #2a4247;
+      --accent: #2dd4bf;
+      --accent-2: #38bdf8;
+      --accent-wash: #0d2b2a;
+      --danger: #ff9b90;
+      --danger-wash: #2b1512;
+      --warn: #e3b45f;
+      --warn-wash: #251d0c;
+      --code-ground: #06100f;
+      --code-ink: #cfe4e1;
+    }
+  }
+  /* …et le choix explicite "dark" gagne sur un OS clair. */
+  :root[data-theme="dark"] {
+    --ground: #0a1315;
+    --surface: #0f1e20;
+    --surface-2: #14262a;
+    --ink: #e4eeee;
+    --ink-soft: #bed2d3;
+    --muted: #87a2a5;
+    --line: #1c2f32;
+    --line-strong: #2a4247;
+    --accent: #2dd4bf;
+    --accent-2: #38bdf8;
+    --accent-wash: #0d2b2a;
+    --danger: #ff9b90;
+    --danger-wash: #2b1512;
+    --warn: #e3b45f;
+    --warn-wash: #251d0c;
+    --code-ground: #06100f;
+    --code-ink: #cfe4e1;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Source Sans 3", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: var(--step-0);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-2); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; border-radius: 3px; }
+
+  code, kbd, pre, .mono { font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
+
+  /* ------------------------------- ossature ------------------------------ */
+
+  .shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 clamp(1.1rem, 4vw, 2.5rem) 5rem;
+  }
+
+  @media (min-width: 62rem) {
+    .shell { grid-template-columns: 15rem minmax(0, 1fr); gap: clamp(2rem, 5vw, 4.5rem); }
+    .toc { position: sticky; top: 0; align-self: start; max-height: 100vh; overflow-y: auto; padding: 3.5rem 0 2rem; }
+  }
+
+  /* -------------------------------- en-tête ------------------------------ */
+
+  .masthead {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    gap: 1.4rem;
+    padding: clamp(2.5rem, 6vw, 4.5rem) 0 2.2rem;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    flex-wrap: wrap;
+    font-family: "JetBrains Mono", monospace;
+    font-size: var(--step--1);
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .version {
+    font-family: "JetBrains Mono", monospace;
+    font-size: var(--step--1);
+    letter-spacing: 0.04em;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    background: var(--accent-wash);
+    color: var(--accent);
+    border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
+    text-transform: none;
+  }
+
+  h1 {
+    font-family: Chivo, ui-sans-serif, system-ui, sans-serif;
+    font-weight: 800;
+    font-size: var(--step-3);
+    line-height: 1.03;
+    letter-spacing: -0.022em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  .lede {
+    margin: 0;
+    max-width: var(--measure);
+    font-size: var(--step-1);
+    line-height: 1.5;
+    color: var(--ink-soft);
+  }
+
+  /* Bandeau de faits : de l'information, pas de la décoration. */
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    gap: 1px;
+    margin-top: 0.6rem;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .fact { background: var(--surface); padding: 0.9rem 1.05rem; display: flex; flex-direction: column; gap: 0.1rem; }
+  .fact b {
+    font-family: Chivo, sans-serif;
+    font-weight: 700;
+    font-size: var(--step-2);
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .fact span { font-size: var(--step--1); color: var(--muted); letter-spacing: 0.02em; }
+
+  /* ------------------------------- sommaire ------------------------------ */
+
+  .toc { padding: 2.2rem 0 0; }
+  .toc h2 {
+    font-family: "JetBrains Mono", monospace;
+    font-size: var(--step--1);
+    font-weight: 500;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.85rem;
+  }
+  .toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.1rem; counter-reset: toc; }
+  .toc a {
+    display: block;
+    padding: 0.3rem 0.6rem 0.3rem 0.75rem;
+    border-left: 2px solid var(--line);
+    color: var(--ink-soft);
+    text-decoration: none;
+    font-size: 0.94rem;
+  }
+  .toc a:hover { border-left-color: var(--accent); background: var(--accent-wash); color: var(--accent); }
+
+  /* -------------------------------- contenu ------------------------------ */
+
+  main { min-width: 0; padding-top: 2.2rem; display: flex; flex-direction: column; gap: 3.2rem; }
+  section { scroll-margin-top: 1.5rem; display: flex; flex-direction: column; gap: 1rem; }
+  section > * { max-width: var(--measure); }
+  section > .wide, section > .tablewrap, section > .facts, section > .grid2 { max-width: none; }
+
+  h2 {
+    font-family: Chivo, sans-serif;
+    font-weight: 700;
+    font-size: var(--step-2);
+    letter-spacing: -0.018em;
+    line-height: 1.15;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: Chivo, sans-serif;
+    font-weight: 600;
+    font-size: var(--step-1);
+    letter-spacing: -0.01em;
+    margin: 0.6rem 0 0;
+  }
+  p { margin: 0; }
+  strong { font-weight: 600; }
+
+  ul.plain { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: 0.4rem; }
+
+  /* codes inline */
+  :not(pre) > code {
+    font-size: 0.87em;
+    padding: 0.1rem 0.34rem;
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--ink);
+    border: 1px solid var(--line);
+  }
+
+  /* --------------------------------- blocs ------------------------------- */
+
+  .codeblock { position: relative; max-width: none; }
+  .codeblock pre {
+    margin: 0;
+    background: var(--code-ground);
+    color: var(--code-ink);
+    padding: 1rem 1.1rem;
+    border-radius: 10px;
+    overflow-x: auto;
+    font-size: 0.855rem;
+    line-height: 1.6;
+    border: 1px solid var(--line-strong);
+  }
+  .codeblock pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
+  .copy {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--code-ink);
+    background: color-mix(in oklab, var(--code-ink) 12%, transparent);
+    border: 1px solid color-mix(in oklab, var(--code-ink) 22%, transparent);
+    border-radius: 6px;
+    padding: 0.22rem 0.5rem;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .codeblock:hover .copy, .copy:focus-visible { opacity: 1; }
+  .copy[data-done="1"] { color: var(--code-ground); background: var(--accent); border-color: var(--accent); }
+
+  /* -------------------------------- tableaux ----------------------------- */
+
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.93rem; }
+  th, td { text-align: left; padding: 0.6rem 0.85rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  thead th {
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 500;
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    background: var(--surface-2);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.mono, th.mono { font-family: "JetBrains Mono", monospace; font-size: 0.845rem; white-space: nowrap; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+
+  /* domaine d'outils */
+  .domain { font-family: Chivo, sans-serif; font-weight: 700; letter-spacing: -0.01em; }
+  .domain td { background: var(--surface-2); border-bottom: 1px solid var(--line-strong); }
+  .domain .count { float: right; font-family: "JetBrains Mono", monospace; font-weight: 400; font-size: 0.78rem; color: var(--muted); }
+
+  /* pastilles d'état : la forme encode la nature de l'action */
+  .pill {
+    display: inline-block;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.12rem 0.42rem;
+    border-radius: 4px;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .pill.read { background: var(--surface-2); color: var(--muted); border-color: var(--line-strong); }
+  .pill.write { background: var(--warn-wash); color: var(--warn); border-color: color-mix(in oklab, var(--warn) 34%, transparent); }
+  .pill.destr { background: var(--danger-wash); color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, transparent); }
+
+  /* ------------------------------- encadrés ------------------------------ */
+
+  .note {
+    border: 1px solid var(--line-strong);
+    border-left: 3px solid var(--accent);
+    background: var(--surface);
+    border-radius: 0 10px 10px 0;
+    padding: 0.85rem 1.05rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .note.guard { border-left-color: var(--danger); background: var(--danger-wash); }
+  .note .label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .note.guard .label { color: var(--danger); }
+
+  /* --------------------------- séquence de ciblage ----------------------- */
+  /* Numérotée parce que l'ordre porte une information : chaque étape
+     consomme la sortie de la précédente. */
+  .steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; counter-reset: step; max-width: none; }
+  .steps li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 1.85rem minmax(0, 1fr);
+    gap: 0.85rem;
+    align-items: start;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 0.8rem 1rem;
+  }
+  .steps li::before {
+    content: counter(step);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-wash);
+    border: 1px solid color-mix(in oklab, var(--accent) 28%, transparent);
+    border-radius: 6px;
+    text-align: center;
+    line-height: 1.75rem;
+    height: 1.85rem;
+  }
+  .steps b { font-family: "JetBrains Mono", monospace; font-weight: 500; font-size: 0.9rem; }
+
+  .grid2 { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: 0.4rem; }
+  .card h3 { margin: 0; font-size: 1.02rem; }
+
+  footer {
+    grid-column: 1 / -1;
+    margin-top: 3.5rem;
+    padding-top: 1.4rem;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: var(--step--1);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.2rem;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+    .copy { opacity: 1; }
+  }
+</style>
+
+<div class="shell">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span>Serveur MCP</span>
+      <span class="version">v0.9.0</span>
+    </div>
+    <h1>Magileads MCP</h1>
+    <p class="lede">
+      Expose Magileads comme un ensemble d'outils utilisables par un agent IA : ciblage,
+      listes de contacts, audit de campagne, pipeline PRM, et un accès générique au reste
+      de l'API. Chaque client se connecte avec <strong>sa propre clé</strong> — le serveur
+      ne conserve aucun secret.
+    </p>
+    <div class="facts">
+      <div class="fact"><b>24</b><span>outils exposés</span></div>
+      <div class="fact"><b>322</b><span>endpoints en accès générique</span></div>
+      <div class="fact"><b>2</b><span>transports (stdio, HTTP)</span></div>
+      <div class="fact"><b>0</b><span>outil qui supprime des contacts</span></div>
+    </div>
+  </header>
+
+  <nav class="toc" aria-label="Sommaire">
+    <h2>Sommaire</h2>
+    <ol>
+      <li><a href="#principe">Principe</a></li>
+      <li><a href="#transports">Transports</a></li>
+      <li><a href="#auth">Authentification</a></li>
+      <li><a href="#outils">Les 25 outils</a></li>
+      <li><a href="#ciblage">Ciblage Google Maps</a></li>
+      <li><a href="#garde-fous">Garde-fous</a></li>
+      <li><a href="#generique">Accès API générique</a></li>
+      <li><a href="#config">Configuration</a></li>
+      <li><a href="#lancer">Lancer en local</a></li>
+      <li><a href="#deployer">Déploiement</a></li>
+      <li><a href="#agent">Connecter un agent</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <section id="principe">
+      <h2>Principe</h2>
+      <p>
+        Le <strong>Model Context Protocol</strong> (MCP) est un protocole par lequel un agent
+        IA découvre puis appelle des outils externes. Ce serveur traduit l'API Magileads en
+        outils MCP : l'agent interroge un compte, lance un ciblage ou audite une campagne sans
+        connaître les détails de l'API — il voit des fonctions nommées, typées et documentées.
+      </p>
+      <p>
+        Les outils sont écrits en TypeScript, validés avec <code>zod</code>, et exécutés
+        directement par <a href="https://bun.sh" target="_blank" rel="noopener noreferrer">Bun</a>
+        (aucune étape de compilation).
+      </p>
+      <div class="note">
+        <span class="label">À retenir</span>
+        <p>
+          L'agent ne reçoit jamais de clé d'API : il fournit des paramètres métier, le serveur
+          exécute l'appel avec la clé du client et ne renvoie que le <em>résultat</em>.
+        </p>
+      </div>
+    </section>
+
+    <section id="transports">
+      <h2>Transports</h2>
+      <p>Deux modes de connexion, selon que l'agent tourne en local ou à distance.</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Transport</th><th class="mono">Point d'entrée</th><th>À utiliser quand</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>stdio</strong></td>
+              <td class="mono">bun run src/index.ts</td>
+              <td>L'agent lance le serveur comme sous-processus local (Claude Desktop / Code, Cursor, un script).</td>
+            </tr>
+            <tr>
+              <td><strong>HTTP</strong></td>
+              <td class="mono">bun run src/http.ts</td>
+              <td>L'agent se connecte par le réseau — agent distant ou conteneurisé. <strong>C'est le mode déployé.</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Le transport HTTP est un endpoint <strong>MCP Streamable HTTP sans état</strong> :
+        <code>POST /mcp</code> (réponse JSON), plus une sonde de vivacité non authentifiée
+        <code>GET /health</code>. Chaque requête est indépendante — un serveur et un transport
+        neufs sont créés puis fermés à chaque appel.
+      </p>
+    </section>
+
+    <section id="auth">
+      <h2>Authentification</h2>
+      <p>
+        Le transport HTTP est <strong>multi-tenant</strong> : chaque requête porte la clé
+        d'API Magileads <strong>du client appelant</strong>, utilisée pour cette requête
+        uniquement. Deux clients atteignent donc deux comptes différents. Il n'y a
+        <strong>aucun jeton d'accès partagé</strong> à gérer, et le serveur ne stocke aucun
+        secret par client.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Méthode</th><th class="mono">Forme</th><th>Remarque</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>En-tête dédié</td>
+              <td class="mono">X-Magileads-Api-Key: &lt;clé&gt;</td>
+              <td><strong>Recommandé.</strong></td>
+            </tr>
+            <tr>
+              <td>En-tête standard</td>
+              <td class="mono">Authorization: Bearer &lt;clé&gt;</td>
+              <td>Pratique pour les fichiers de configuration.</td>
+            </tr>
+            <tr>
+              <td>Paramètre d'URL</td>
+              <td class="mono">?api_key=&lt;clé&gt;</td>
+              <td>Pour les interfaces n'offrant qu'un champ URL. <code>?token=</code> est aussi accepté.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note guard">
+        <span class="label">Attention</span>
+        <p>
+          Une clé passée dans l'URL peut apparaître dans les journaux d'accès du
+          reverse-proxy. Préférer l'en-tête dès que le client le permet.
+        </p>
+      </div>
+      <p>
+        Une requête sans clé exploitable reçoit un <code>401</code>, <em>sauf</em> si le
+        serveur dispose d'un compte par défaut (voir <a href="#config">Configuration</a>),
+        auquel cas elle retombe sur ce compte. La clé du client n'est jamais journalisée.
+      </p>
+      <div class="note">
+        <span class="label">stdio</span>
+        <p>
+          Le transport stdio est <strong>toujours mono-compte</strong> : il utilise les
+          identifiants d'environnement, il n'y a pas de clé par requête.
+        </p>
+      </div>
+    </section>
+
+    <section id="outils">
+      <h2>Les 24 outils</h2>
+      <p>
+        Regroupés par domaine. La pastille indique la nature de l'action :
+        <strong>21 outils sont en <span class="pill read">lecture</span></strong> seule et
+        <strong>3 écrivent</strong> <span class="pill write">écriture</span>.
+        <strong>Aucun outil ne supprime de contacts.</strong>
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Outil</th><th>Rôle</th><th>Nature</th></tr>
+          </thead>
+          <tbody>
+            <tr class="domain"><td colspan="3">Ciblage Google Maps <span class="count">3 outils</span></td></tr>
+            <tr><td class="mono">generate_maps_search_urls</td><td>Génère les URLs de recherche Google Maps depuis une activité et des localisations.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">extract_maps_search</td><td>Extrait les contacts depuis des URLs Google Maps vers une liste.</td><td><span class="pill write">écriture</span></td></tr>
+            <tr><td class="mono">run_google_maps_targeting</td><td>Ciblage complet en un appel : génération puis extraction.</td><td><span class="pill write">écriture</span></td></tr>
+
+            <tr class="domain"><td colspan="3">Listes de contacts <span class="count">5 outils</span></td></tr>
+            <tr><td class="mono">list_contact_lists</td><td>Liste et recherche les listes de contacts.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">search_contact_lists</td><td>Recherche et <strong>classe</strong> les listes (par taille, e-mails, LinkedIn) sur l'intégralité du compte.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">get_contact_list</td><td>Profil détaillé d'une liste.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">get_contact_list_status</td><td>État des traitements en cours sur une liste (import, extraction…).</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">list_contact_fields</td><td>Champs filtrables d'une liste, avec leur identifiant.</td><td><span class="pill read">lecture</span></td></tr>
+
+            <tr class="domain"><td colspan="3">Contacts <span class="count">3 outils</span></td></tr>
+            <tr><td class="mono">query_contacts</td><td>Interroge les contacts d'une liste : filtres, tri, pagination.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">search_contacts</td><td>Recherche plein-texte dans une liste, paginée.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">preview_contact_selection</td><td>Compte les contacts couverts par une sélection, pour dimensionner un segment. <strong>Lecture seule.</strong></td><td><span class="pill read">lecture</span></td></tr>
+
+            <tr class="domain"><td colspan="3">Campagnes et audit <span class="count">4 outils</span></td></tr>
+            <tr><td class="mono">list_campaigns</td><td>Liste les campagnes de prospection.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">get_campaign</td><td>Paramétrage d'une campagne.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">get_scenario</td><td>Étapes complètes d'un scénario et contenu des messages.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">get_campaign_statistics</td><td>Statistiques d'une campagne : agrégées et par étape.</td><td><span class="pill read">lecture</span></td></tr>
+
+            <tr class="domain"><td colspan="3">Compte <span class="count">2 outils</span></td></tr>
+            <tr><td class="mono">get_account_overview</td><td>Vue d'ensemble du compte Magileads.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">list_linkedin_accounts</td><td>Comptes LinkedIn connectés et leur validité.</td><td><span class="pill read">lecture</span></td></tr>
+
+            <tr class="domain"><td colspan="3">PRM / pipeline <span class="count">4 outils</span></td></tr>
+            <tr><td class="mono">list_prm_statuses</td><td>Statuts du pipeline PRM.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">query_prm_contacts</td><td>Interroge les prospects du pipeline.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">get_prm_contact</td><td>Fiche complète d'un prospect.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">list_prm_nurturings</td><td>Séquences de nurturing.</td><td><span class="pill read">lecture</span></td></tr>
+
+            <tr class="domain"><td colspan="3">Accès API générique <span class="count">3 outils</span></td></tr>
+            <tr><td class="mono">list_api_endpoints</td><td>Découvre les endpoints non-admin appelables.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">magileads_get</td><td>Appelle n'importe quel endpoint GET non-admin.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">magileads_request</td><td>Appelle un endpoint d'écriture non-admin. <strong>Simulation par défaut.</strong></td><td><span class="pill write">écriture</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="ciblage">
+      <h2>Ciblage Google Maps</h2>
+      <p>
+        Le ciblage se fait en trois temps. L'ordre compte : chaque étape consomme la sortie de
+        la précédente.
+      </p>
+      <ol class="steps">
+        <li>
+          <div>
+            <b>generate_maps_search_urls</b>
+            <p>À partir d'une activité et d'une ou plusieurs localisations, produit les URLs de recherche Google Maps.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <b>extract_maps_search</b>
+            <p>Extrait les établissements depuis ces URLs et crée une nouvelle liste de contacts. L'extraction est <strong>asynchrone</strong>.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <b>get_contact_list_status</b>
+            <p>Suit l'avancement des traitements jusqu'à la fin du remplissage de la liste.</p>
+          </div>
+        </li>
+      </ol>
+      <div class="note">
+        <span class="label">Raccourci</span>
+        <p>
+          <code>run_google_maps_targeting</code> enchaîne les étapes 1 et 2 en un seul appel —
+          c'est l'outil à privilégier pour une demande du type « cible les dentistes à Lyon ».
+        </p>
+      </div>
+      <p>
+        Le ciblage <strong>consomme des crédits</strong> sur le compte Magileads et la
+        génération d'URLs peut prendre plusieurs dizaines de secondes : prévoir des délais
+        d'attente généreux côté client.
+      </p>
+    </section>
+
+    <section id="garde-fous">
+      <h2>Garde-fous</h2>
+      <p>
+        Un agent IA peut se tromper. Les actions irréversibles sont donc supprimées ou
+        verrouillées par le serveur, pas seulement déconseillées dans une consigne.
+      </p>
+      <div class="grid2">
+        <div class="card">
+          <h3>Aucune suppression de contacts</h3>
+          <p>
+            Le serveur <strong>n'expose aucun outil</strong> capable de supprimer des
+            contacts, et le code correspondant a été retiré. Un agent ne peut donc pas
+            vider une liste, même par erreur.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Écritures génériques</h3>
+          <p>
+            <code>magileads_request</code> est en <strong>simulation par défaut</strong> :
+            il montre la requête qui serait envoyée et ne change rien. Il faut
+            <code>confirm: true</code> pour exécuter réellement l'appel — et il n'accepte
+            que <code>POST</code>, <code>PUT</code> et <code>PATCH</code>.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Surface restreinte</h3>
+          <p>
+            L'accès générique passe par une <strong>liste blanche</strong> d'endpoints
+            non-admin. Les endpoints d'administration, de facturation, de revendeur et
+            d'équipe sont exclus et ne sont pas appelables.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Filtres bornés</h3>
+          <p>
+            Une sélection est limitée à <strong>30 critères</strong>, ce qui écarte les
+            filtres dégénérés ou abusifs avant même l'appel à l'API.
+          </p>
+        </div>
+      </div>
+      <div class="note">
+        <span class="label">Garantie</span>
+        <p>
+          Aucune voie ne permet de supprimer quoi que ce soit : il n'existe pas d'outil de
+          suppression, et la méthode <code>DELETE</code> est retirée de l'accès générique.
+          La suppression reste possible pour un humain, depuis l'interface Magileads.
+        </p>
+      </div>
+    </section>
+
+    <section id="generique">
+      <h2>Accès API générique</h2>
+      <p>
+        Au-delà des outils dédiés, l'agent peut atteindre le reste de l'API Magileads. Le
+        serveur embarque un index des endpoints appelables, généré depuis la spécification
+        OpenAPI, filtré des routes d'administration <strong>et de toutes les routes
+        <code>DELETE</code></strong> — 45 endpoints ainsi écartés, que l'agent ne peut ni
+        découvrir ni atteindre.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Méthode</th><th>Endpoints</th><th>Nature</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="mono">GET</td><td class="num">103</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">POST</td><td class="num">176</td><td><span class="pill write">écriture</span></td></tr>
+            <tr><td class="mono">PUT</td><td class="num">43</td><td><span class="pill write">écriture</span></td></tr>
+            <tr><td class="mono"><strong>Total</strong></td><td class="num"><strong>322</strong></td><td>répartis sur 30 domaines</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Le parcours habituel : <code>list_api_endpoints</code> pour découvrir ce qui existe,
+        puis <code>magileads_get</code> en lecture, ou <code>magileads_request</code> pour une
+        écriture — d'abord en simulation, puis avec <code>confirm: true</code>.
+      </p>
+    </section>
+
+    <section id="config">
+      <h2>Configuration</h2>
+      <p>
+        Tout passe par des variables d'environnement. Pour un déploiement purement
+        multi-tenant, elles peuvent <strong>toutes rester vides</strong>.
+      </p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th class="mono">Variable</th><th>Rôle</th><th>Défaut</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="mono">MAGILEADS_API_KEY</td><td>Compte par défaut, utilisé pour les requêtes sans clé et par stdio.</td><td>—</td></tr>
+            <tr><td class="mono">MAGILEADS_EMAIL<br>MAGILEADS_PASSWORD</td><td>Compte par défaut via connexion JWT, rafraîchie automatiquement.</td><td>—</td></tr>
+            <tr><td class="mono">MAGILEADS_API_BASE</td><td>URL de base de l'API.</td><td class="mono">https://app.api-magileads.net</td></tr>
+            <tr><td class="mono">MCP_HTTP_PORT</td><td>Port d'écoute du transport HTTP.</td><td class="mono">8080</td></tr>
+            <tr><td class="mono">MCP_HTTP_PATH</td><td>Chemin de l'endpoint MCP.</td><td class="mono">/mcp</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="lancer">
+      <h2>Lancer en local</h2>
+      <p>Le serveur tourne sur Bun, qui exécute le TypeScript directement.</p>
+      <div class="codeblock">
+        <button class="copy" type="button">Copier</button>
+        <pre><code>bun install
+
+# stdio (agent local) — compte unique depuis l'environnement
+MAGILEADS_API_KEY=... bun run start
+
+# HTTP (multi-tenant) — les clients envoient leur propre clé,
+# aucun identifiant serveur n'est nécessaire
+bun run start:http</code></pre>
+      </div>
+      <h3>Vérifier l'endpoint HTTP</h3>
+      <div class="codeblock">
+        <button class="copy" type="button">Copier</button>
+        <pre><code>curl -s localhost:8080/health
+# {"status":"ok"}
+
+curl -s -X POST localhost:8080/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'X-Magileads-Api-Key: VOTRE_CLE_MAGILEADS' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'</code></pre>
+      </div>
+    </section>
+
+    <section id="deployer">
+      <h2>Déploiement</h2>
+      <div class="codeblock">
+        <button class="copy" type="button">Copier</button>
+        <pre><code>docker compose up -d --build</code></pre>
+      </div>
+      <p>
+        L'image est basée sur <code>oven/bun</code>, lance <code>bun run src/http.ts</code>,
+        écoute sur le port <code>8080</code>, s'exécute en <strong>utilisateur non-root</strong>
+        et déclare un <code>HEALTHCHECK</code> sur <code>/health</code>.
+      </p>
+      <h3>Sur Dokploy</h3>
+      <ul class="plain">
+        <li>Créer une application depuis le dépôt et laisser Dokploy construire le <code>Dockerfile</code>.</li>
+        <li>Attribuer un domaine. <strong>Aucune variable d'environnement n'est requise</strong> en multi-tenant, puisque chaque client apporte sa clé.</li>
+        <li>Le reverse-proxy termine le TLS : les clients atteignent le serveur sur <code class="mono">https://&lt;domaine&gt;/mcp</code>.</li>
+      </ul>
+    </section>
+
+    <section id="agent">
+      <h2>Connecter un agent</h2>
+      <p>
+        Un agent compatible MCP découvre les outils automatiquement au démarrage. Deux façons
+        de lui transmettre la clé du client.
+      </p>
+      <h3>Par fichier de configuration — recommandé</h3>
+      <p>La clé reste dans la configuration du client et hors des URLs.</p>
+      <div class="codeblock">
+        <button class="copy" type="button">Copier</button>
+        <pre><code>mcp_servers:
+  magileads:
+    url: "https://&lt;domaine&gt;/mcp"
+    headers:
+      X-Magileads-Api-Key: "&lt;CLE_MAGILEADS_DU_CLIENT&gt;"</code></pre>
+      </div>
+      <h3>Par URL</h3>
+      <p>
+        Pour les interfaces qui n'offrent qu'un champ URL, sans en-têtes personnalisés :
+        transport <strong>HTTP</strong>, et
+        <code class="mono">https://&lt;domaine&gt;/mcp?api_key=&lt;CLE&gt;</code>.
+      </p>
+      <div class="note">
+        <span class="label">Isolation</span>
+        <p>
+          La clé d'un client ne quitte jamais sa configuration. Le serveur ne détient aucun
+          secret par client et route chaque requête vers le compte correspondant à la clé
+          reçue.
+        </p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>Magileads MCP v0.9.0</span>
+    <span>Bun ≥ 1.1 · TypeScript · MCP SDK 1.29</span>
+    <span>24 outils · 322 endpoints appelables</span>
+  </footer>
+
+</div>
+
+<script>
+  // Copie des blocs de code — utilitaire réel d'une page de documentation.
+  document.querySelectorAll(".codeblock").forEach(function (block) {
+    var btn = block.querySelector(".copy");
+    var code = block.querySelector("code");
+    if (!btn || !code) return;
+    btn.addEventListener("click", function () {
+      var text = code.innerText;
+      var done = function () {
+        btn.textContent = "Copié";
+        btn.dataset.done = "1";
+        setTimeout(function () {
+          btn.textContent = "Copier";
+          delete btn.dataset.done;
+        }, 1600);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {});
+      }
+    });
+  });
+</script>

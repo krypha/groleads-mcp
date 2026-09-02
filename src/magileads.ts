@@ -338,19 +338,6 @@ export type FilterNode = {
   values: (FilterValue | FilterNode)[];
 };
 
-/**
- * The DELETE body shape (Magileads `ContactLists.ContactsSelection`). An empty
- * `filter` ({mode:'and',values:[]}) matches EVERY contact. `reverse_selection`
- * flips "these" ↔ "all except these": with a filter F, false deletes the F-matches,
- * true keeps only the F-matches (i.e. deletes everything else).
- */
-export type ContactsSelection = {
-  filter: FilterNode;
-  contact_ids: number[];
-  excluded_contact_ids: number[];
-  reverse_selection: boolean;
-};
-
 /** An all-matching (empty) filter — matches every contact in the list. */
 export const EMPTY_FILTER: FilterNode = { mode: "and", values: [] };
 
@@ -375,17 +362,6 @@ export async function countContacts(listId: number, filter: FilterNode): Promise
     { method: "GET" },
   );
   return data.number_of_results ?? 0;
-}
-
-/** Delete contacts from a list by selection (DESTRUCTIVE). Returns the raw payload. */
-export async function deleteContactsSelection(
-  listId: number,
-  selection: ContactsSelection,
-): Promise<unknown> {
-  return api<unknown>(`/contact-lists/${listId}/contacts`, {
-    method: "DELETE",
-    body: JSON.stringify(selection),
-  });
 }
 
 /* -------------------------------------------------------------------------- */
