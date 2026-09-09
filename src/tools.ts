@@ -6,6 +6,7 @@ import {
   searchContactLists,
   getContactList,
   listDataFields,
+  addContactToList,
   countContacts,
   listProgrammations,
   getProgrammationById,
@@ -30,7 +31,7 @@ import {
   type Raw,
   type ContactsPage,
 } from "./magileads.js";
-import { NON_ADMIN_ENDPOINTS, type EndpointDef } from "./endpoints.generated.js";
+import { MAGILEADS_ENDPOINTS, type EndpointDef } from "./endpoints.generated.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -66,7 +67,7 @@ function fail(err: unknown): TextResult {
 const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), hi);
 
 /* -------------------------------------------------------------------------- */
-/* Contact-selection filter helpers (shared by preview + delete)               */
+/* Contact-selection filter helpers                                            */
 /* -------------------------------------------------------------------------- */
 
 /**
@@ -200,8 +201,7 @@ async function buildFilter(criteria: Criterion[], match: "all" | "any"): Promise
 
 /**
  * Resolve a selection to concrete numbers against the LIVE list: the filter, the
- * total contacts, the count matching the filter, and how many the delete would
- * actually remove given `target`. `to_delete` is the guardrail number.
+ * total contacts, the count matching the filter, and the selected complement.
  */
 async function resolveSelection(
   listId: number,
@@ -213,23 +213,23 @@ async function resolveSelection(
   filter: FilterNode;
   total_count: number;
   matched_count: number;
-  to_delete: number;
-  to_keep: number;
+  selected_count: number;
+  not_selected_count: number;
 }> {
   const list = await getContactList(listId);
   const filter = await buildFilter(criteria, match);
   // Count total + matched from the SAME endpoint so the arithmetic is consistent.
   const total_count = await countContacts(listId, EMPTY_FILTER);
   const matched_count = criteria.length === 0 ? total_count : await countContacts(listId, filter);
-  const to_delete = target === "matching" ? matched_count : Math.max(total_count - matched_count, 0);
-  const to_keep = Math.max(total_count - to_delete, 0);
+  const selected_count = target === "matching" ? matched_count : Math.max(total_count - matched_count, 0);
+  const not_selected_count = Math.max(total_count - selected_count, 0);
   return {
     list_name: list?.name ?? String(listId),
     filter,
     total_count,
     matched_count,
-    to_delete,
-    to_keep,
+    selected_count,
+    not_selected_count,
   };
 }
 
@@ -360,6 +360,20 @@ async function dataFieldMaps(): Promise<{
   return { idToIdentifier, identifierToId };
 }
 
+/** Resolve an import property to a real numeric data-field id (no special filter fields). */
+function resolveDataFieldId(field: string | number, identifierToId: Map<string, number>): number {
+  if (typeof field === "number" && Number.isInteger(field) && field > 0) return field;
+  const raw = String(field).trim();
+  const byIdentifier = identifierToId.get(raw.toLowerCase());
+  if (byIdentifier != null) return byIdentifier;
+  if (/^[1-9]\d*$/.test(raw)) return Number(raw);
+  const known = [...identifierToId.keys()].sort().join(", ") || "(none)";
+  throw new Error(
+    `Unknown contact field "${field}". Available identifiers: ${known}. ` +
+      "Call list_contact_fields to inspect the account fields.",
+  );
+}
+
 /** Resolve a human field name (or numeric id / special token) to the API field_name string. */
 function resolveFieldName(name: string, identifierToId: Map<string, number>): string {
   const raw = String(name).trim();
@@ -466,7 +480,7 @@ function customStatusView(
 }
 
 /* -------------------------------------------------------------------------- */
-/* Generic passthrough helpers (non-admin allowlist from the generated index)  */
+/* Generic passthrough helpers (all OpenAPI endpoints except DELETE)            */
 /* -------------------------------------------------------------------------- */
 
 const MAX_PASSTHROUGH_BYTES = 60_000; // cap giant payloads to protect agent context
@@ -477,12 +491,10 @@ function templateToRegex(tpl: string): RegExp {
   return new RegExp(`^${literals.join("[^/]+")}$`);
 }
 
-/**
- * DELETE est banni de bout en bout : aucun outil de ce serveur ne doit pouvoir
- * supprimer de donnee. On retire donc ces endpoints de l'index appelable, si bien
- * que l'agent ne peut ni les decouvrir, ni les atteindre.
- */
-const CALLABLE_ENDPOINTS = NON_ADMIN_ENDPOINTS.filter((e) => e.method !== "DELETE");
+/** DELETE is excluded by the generator and filtered again here as a runtime backstop. */
+const CALLABLE_ENDPOINTS: EndpointDef[] = MAGILEADS_ENDPOINTS.filter(
+  (endpoint) => String(endpoint.method) !== "DELETE",
+);
 
 const ENDPOINT_MATCHERS: (EndpointDef & { re: RegExp })[] = CALLABLE_ENDPOINTS.map((e) => ({
   ...e,
@@ -490,7 +502,7 @@ const ENDPOINT_MATCHERS: (EndpointDef & { re: RegExp })[] = CALLABLE_ENDPOINTS.m
 }));
 
 /**
- * Find the non-admin endpoint matching a concrete (method, path); null if none.
+ * Find the indexed endpoint matching a concrete (method, path); null if none.
  * Also matches the API's own cursor-pagination URL forms — `.../page/{n}` and
  * `.../{cursor}/page/{n}` — by falling back to the base template, so an agent can
  * follow `next_page`/`current_page` URLs through the passthrough.
@@ -823,7 +835,7 @@ export function registerTools(server: McpServer): void {
   );
 
   /* ------------------------------------------------------------------------ */
-  /* Contact manipulation: list fields · preview selection · delete selection  */
+  /* Contacts: fields · add one contact · preview a selection                  */
   /* ------------------------------------------------------------------------ */
 
   server.registerTool(
@@ -833,8 +845,8 @@ export function registerTools(server: McpServer): void {
       description:
         "List the fields you can filter on in a contact list — for each: `data_field_id`, " +
         "`identifier` (e.g. 'email', 'company', 'first_name'), `label`, and `type`. Use the " +
-        "`identifier` values to name fields in `preview_contact_selection` / " +
-        "`preview_contact_selection` and `query_contacts` criteria. Data fields are account-wide, so they apply " +
+        "`identifier` values in `add_contact_to_list`, `preview_contact_selection`, and " +
+        "`query_contacts`. Data fields are account-wide, so they apply " +
         "to every contact list.",
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("The contact list id to inspect."),
@@ -854,6 +866,82 @@ export function registerTools(server: McpServer): void {
           list_name: list?.name ?? String(contact_list_id),
           count: view.length,
           fields: view,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "add_contact_to_list",
+    {
+      title: "Add one contact to a contact list",
+      description:
+        "Import one contact with POST /contact-lists/{contact_list_id}/contact. Name each " +
+        "property with a readable data-field identifier such as `email`, `first_name`, " +
+        "`last_name`, `company`, or pass its numeric data_field_id; the tool resolves identifiers " +
+        "to the exact Magileads shape `{properties:[{data_field_id,value}]}`. This write is a dry " +
+        "run until `confirm:true`. Magileads may report an update instead of an addition when the " +
+        "contact already exists.",
+      inputSchema: {
+        contact_list_id: z.number().int().positive().describe("Destination contact list id."),
+        properties: z
+          .array(
+            z.object({
+              field: z
+                .union([z.string().min(1), z.number().int().positive()])
+                .describe("Readable field identifier (e.g. email) or numeric data_field_id."),
+              value: z.string().min(1).describe("Property value."),
+            }),
+          )
+          .min(1)
+          .max(100)
+          .describe("Contact properties. Duplicate fields are refused."),
+        confirm: z
+          .boolean()
+          .optional()
+          .describe("Must be true to import the contact; omitted/false returns a dry run."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ contact_list_id, properties, confirm }): Promise<TextResult> => {
+      try {
+        const [list, { identifierToId }] = await Promise.all([
+          getContactList(contact_list_id),
+          dataFieldMaps(),
+        ]);
+        const seen = new Set<number>();
+        const resolved = properties.map((property, index) => {
+          const data_field_id = resolveDataFieldId(property.field, identifierToId);
+          if (seen.has(data_field_id)) {
+            throw new Error(`properties[${index}]: duplicate data field ${data_field_id}.`);
+          }
+          seen.add(data_field_id);
+          return { data_field_id, value: property.value };
+        });
+        const body = { properties: resolved };
+
+        if (confirm !== true) {
+          return ok({
+            dry_run: true,
+            contact_list_id,
+            list_name: list.name,
+            would_call: {
+              method: "POST",
+              path: `/contact-lists/${contact_list_id}/contact`,
+              body,
+            },
+            note: "Nothing was sent. Re-call with confirm:true to import this contact.",
+          });
+        }
+
+        const result = await addContactToList(contact_list_id, resolved);
+        return ok({
+          executed: true,
+          contact_list_id,
+          list_name: list.name,
+          ...result,
         });
       } catch (err) {
         return fail(err);
@@ -902,9 +990,9 @@ export function registerTools(server: McpServer): void {
           total_count: sel.total_count,
           target: target ?? "matching",
           match: match ?? "all",
-          selected: sel.to_delete,
-          not_selected: sel.to_keep,
-          note: "Read-only: nothing was changed. This server exposes no tool that deletes contacts.",
+          selected: sel.selected_count,
+          not_selected: sel.not_selected_count,
+          note: "Read-only: nothing was changed. This server exposes no HTTP DELETE operation.",
         });
       } catch (err) {
         return fail(err);
@@ -1849,20 +1937,20 @@ export function registerTools(server: McpServer): void {
   );
 
   /* ------------------------------------------------------------------------ */
-  /* Generic API passthrough — reach any NON-ADMIN Magileads endpoint          */
-  /* Admin/billing/reseller/team endpoints are excluded by the generated       */
-  /* allowlist (src/endpoints.generated.ts). Writes are dry-run until          */
-  /* confirm:true. Prefer the dedicated tools above; use these for the rest.   */
+  /* Generic API passthrough — every OpenAPI endpoint except DELETE            */
+  /* The generated index includes every tag, including administration. Writes */
+  /* are dry-run until confirm:true. Prefer dedicated tools for common tasks.  */
   /* ------------------------------------------------------------------------ */
 
   server.registerTool(
     "list_api_endpoints",
     {
-      title: "Discover callable (non-admin) API endpoints",
+      title: "Discover callable Magileads API endpoints",
       description:
         "List the Magileads API endpoints the generic tools (magileads_get / magileads_request) " +
-        "can call — the account's whole non-admin surface (admin/billing/reseller/team endpoints are " +
-        "excluded). Filter by `search` (substring on path/summary/tag), `method`, or `writes_only`/" +
+        "can call — every endpoint in the OpenAPI specification except DELETE, including admin, " +
+        "billing, reseller, team, and user endpoints. Filter by `search` (substring on path/summary/" +
+        "tag), `method`, or `writes_only`/" +
         "`reads_only`. Use this to find the exact `path` + `method` to pass to magileads_get / " +
         "magileads_request.",
       inputSchema: {
@@ -1903,9 +1991,9 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     "magileads_get",
     {
-      title: "Call any non-admin API GET endpoint",
+      title: "Call any Magileads API GET endpoint",
       description:
-        "Read-only escape hatch: GET any allow-listed non-admin Magileads endpoint that no dedicated " +
+        "Read-only escape hatch: GET any indexed Magileads endpoint that no dedicated " +
         "tool covers. Provide `path` (e.g. '/blacklists' or '/contact-lists/123') with {params} filled " +
         "in, and optional `query` params (object; object values are JSON-encoded, e.g. " +
         "{ options: { per_page: 10 } }). Discover paths with list_api_endpoints. Only GET is allowed " +
@@ -1923,8 +2011,8 @@ export function registerTools(server: McpServer): void {
         if (!ep) {
           return fail(
             new Error(
-              `GET ${base} is not an allow-listed non-admin read endpoint ` +
-                `(it may be admin-only, a write, or not exist). Use list_api_endpoints to find valid paths.`,
+              `GET ${base} is not an indexed read endpoint ` +
+                `(it may use another method or not exist). Use list_api_endpoints to find valid paths.`,
             ),
           );
         }
@@ -1939,14 +2027,14 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     "magileads_request",
     {
-      title: "Call any non-admin API write endpoint (guarded)",
+      title: "Call any Magileads API write endpoint except DELETE (guarded)",
       description:
-        "Escape hatch for WRITES (POST/PUT/PATCH) on any allow-listed non-admin Magileads " +
+        "Escape hatch for WRITES (POST/PUT/PATCH) on any indexed Magileads " +
         "endpoint not covered by a dedicated tool — creating lists/models, sending LinkedIn " +
         "messages, imports, PRM exclusions, status changes, etc. GUARDED: it does a DRY RUN by " +
         "default (shows exactly what would be sent and changes nothing); set `confirm:true` to " +
-        "actually execute. Admin/billing/reseller endpoints are blocked. Discover paths with " +
-        "list_api_endpoints. This tool can modify or delete data — review the dry run first.",
+        "actually execute. Every OpenAPI tag is included, including administration; HTTP DELETE " +
+        "is unavailable. Discover paths with list_api_endpoints and review the dry run first.",
       inputSchema: {
         method: z.enum(["POST", "PUT", "PATCH"]).describe("HTTP method for the write (DELETE is not available)."),
         path: z.string().min(1).describe("API path with a leading slash, {params} filled in."),
@@ -1963,8 +2051,8 @@ export function registerTools(server: McpServer): void {
         if (!ep) {
           return fail(
             new Error(
-              `${method} ${base} is not an allow-listed non-admin endpoint ` +
-                `(it may be admin-only or not exist). Use list_api_endpoints to find valid write paths.`,
+              `${method} ${base} is not an indexed endpoint ` +
+                `(it may use another method or not exist). Use list_api_endpoints to find valid write paths.`,
             ),
           );
         }

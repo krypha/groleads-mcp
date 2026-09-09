@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "@groleads/mcp-google-maps",
+      "name": "magileads-mcp",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
         "zod": "^3.25.0",

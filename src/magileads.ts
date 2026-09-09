@@ -349,6 +349,35 @@ export async function listDataFields(): Promise<DataField[]> {
   return data.data_fields_list ?? [];
 }
 
+export type ContactPropertyInput = {
+  data_field_id: number;
+  value: string;
+};
+
+export type ImportContactResponse = {
+  state?: boolean;
+  contacts_added?: number;
+  contacts_updated?: number;
+  contacts_deleted?: number;
+  contacts_ignored?: number;
+  contacts_with_ignored_fields?: number;
+  [key: string]: unknown;
+};
+
+/**
+ * Import one contact into a list. The API expects data-field ids, so the tool
+ * layer resolves friendly identifiers before calling this client method.
+ */
+export function addContactToList(
+  listId: number,
+  properties: ContactPropertyInput[],
+): Promise<ImportContactResponse> {
+  return api<ImportContactResponse>(`/contact-lists/${listId}/contact`, {
+    method: "POST",
+    body: JSON.stringify({ properties }),
+  });
+}
+
 /**
  * Count the contacts of a list that match `filter`, via the paginated contacts
  * endpoint. `per_page:1` keeps the payload tiny; `number_of_results` is the FULL

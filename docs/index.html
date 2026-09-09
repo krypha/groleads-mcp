@@ -404,7 +404,7 @@
   <header class="masthead">
     <div class="eyebrow">
       <span>Serveur MCP</span>
-      <span class="version">v0.9.0</span>
+      <span class="version">v0.10.0</span>
     </div>
     <h1>Magileads MCP</h1>
     <p class="lede">
@@ -414,10 +414,10 @@
       ne conserve aucun secret.
     </p>
     <div class="facts">
-      <div class="fact"><b>24</b><span>outils exposés</span></div>
-      <div class="fact"><b>322</b><span>endpoints en accès générique</span></div>
+      <div class="fact"><b>25</b><span>outils exposés</span></div>
+      <div class="fact"><b>437</b><span>endpoints en accès générique</span></div>
       <div class="fact"><b>2</b><span>transports (stdio, HTTP)</span></div>
-      <div class="fact"><b>0</b><span>outil qui supprime des contacts</span></div>
+      <div class="fact"><b>0</b><span>route HTTP DELETE</span></div>
     </div>
   </header>
 
@@ -547,12 +547,12 @@
     </section>
 
     <section id="outils">
-      <h2>Les 24 outils</h2>
+      <h2>Les 25 outils</h2>
       <p>
         Regroupés par domaine. La pastille indique la nature de l'action :
         <strong>21 outils sont en <span class="pill read">lecture</span></strong> seule et
-        <strong>3 écrivent</strong> <span class="pill write">écriture</span>.
-        <strong>Aucun outil ne supprime de contacts.</strong>
+        <strong>4 écrivent</strong> <span class="pill write">écriture</span>.
+        <strong>Aucun outil n'accepte la méthode HTTP DELETE.</strong>
       </p>
       <div class="tablewrap">
         <table>
@@ -572,7 +572,8 @@
             <tr><td class="mono">get_contact_list_status</td><td>État des traitements en cours sur une liste (import, extraction…).</td><td><span class="pill read">lecture</span></td></tr>
             <tr><td class="mono">list_contact_fields</td><td>Champs filtrables d'une liste, avec leur identifiant.</td><td><span class="pill read">lecture</span></td></tr>
 
-            <tr class="domain"><td colspan="3">Contacts <span class="count">3 outils</span></td></tr>
+            <tr class="domain"><td colspan="3">Contacts <span class="count">4 outils</span></td></tr>
+            <tr><td class="mono">add_contact_to_list</td><td>Ajoute un contact avec des noms de champs lisibles. <strong>Simulation par défaut.</strong></td><td><span class="pill write">écriture</span></td></tr>
             <tr><td class="mono">query_contacts</td><td>Interroge les contacts d'une liste : filtres, tri, pagination.</td><td><span class="pill read">lecture</span></td></tr>
             <tr><td class="mono">search_contacts</td><td>Recherche plein-texte dans une liste, paginée.</td><td><span class="pill read">lecture</span></td></tr>
             <tr><td class="mono">preview_contact_selection</td><td>Compte les contacts couverts par une sélection, pour dimensionner un segment. <strong>Lecture seule.</strong></td><td><span class="pill read">lecture</span></td></tr>
@@ -594,9 +595,9 @@
             <tr><td class="mono">list_prm_nurturings</td><td>Séquences de nurturing.</td><td><span class="pill read">lecture</span></td></tr>
 
             <tr class="domain"><td colspan="3">Accès API générique <span class="count">3 outils</span></td></tr>
-            <tr><td class="mono">list_api_endpoints</td><td>Découvre les endpoints non-admin appelables.</td><td><span class="pill read">lecture</span></td></tr>
-            <tr><td class="mono">magileads_get</td><td>Appelle n'importe quel endpoint GET non-admin.</td><td><span class="pill read">lecture</span></td></tr>
-            <tr><td class="mono">magileads_request</td><td>Appelle un endpoint d'écriture non-admin. <strong>Simulation par défaut.</strong></td><td><span class="pill write">écriture</span></td></tr>
+            <tr><td class="mono">list_api_endpoints</td><td>Découvre tous les endpoints du Swagger sauf DELETE.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">magileads_get</td><td>Appelle n'importe quel endpoint GET indexé.</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">magileads_request</td><td>Appelle un endpoint POST, PUT ou PATCH. <strong>Simulation par défaut.</strong></td><td><span class="pill write">écriture</span></td></tr>
           </tbody>
         </table>
       </div>
@@ -650,11 +651,11 @@
       </p>
       <div class="grid2">
         <div class="card">
-          <h3>Aucune suppression de contacts</h3>
+          <h3>Aucune route HTTP DELETE</h3>
           <p>
-            Le serveur <strong>n'expose aucun outil</strong> capable de supprimer des
-            contacts, et le code correspondant a été retiré. Un agent ne peut donc pas
-            vider une liste, même par erreur.
+            Les opérations <code>DELETE</code> sont retirées lors de la génération de
+            l'index et refusées par le schéma des outils. Elles ne peuvent être ni
+            découvertes ni appelées par le MCP.
           </p>
         </div>
         <div class="card">
@@ -667,11 +668,11 @@
           </p>
         </div>
         <div class="card">
-          <h3>Surface restreinte</h3>
+          <h3>Surface OpenAPI complète</h3>
           <p>
-            L'accès générique passe par une <strong>liste blanche</strong> d'endpoints
-            non-admin. Les endpoints d'administration, de facturation, de revendeur et
-            d'équipe sont exclus et ne sont pas appelables.
+            L'accès générique couvre aussi les endpoints d'administration, de facturation,
+            de revendeur, d'équipe et de clés API. Toutes les écritures restent en
+            simulation tant que <code>confirm: true</code> n'est pas fourni.
           </p>
         </div>
         <div class="card">
@@ -685,9 +686,9 @@
       <div class="note">
         <span class="label">Garantie</span>
         <p>
-          Aucune voie ne permet de supprimer quoi que ce soit : il n'existe pas d'outil de
-          suppression, et la méthode <code>DELETE</code> est retirée de l'accès générique.
-          La suppression reste possible pour un humain, depuis l'interface Magileads.
+          Le MCP n'envoie jamais de requête HTTP <code>DELETE</code>. Les opérations
+          <code>POST</code>, <code>PUT</code> et <code>PATCH</code> restent des écritures :
+          leur simulation doit être relue avant confirmation.
         </p>
       </div>
     </section>
@@ -697,9 +698,8 @@
       <p>
         Au-delà des outils dédiés, l'agent peut atteindre le reste de l'API Magileads. Le
         serveur embarque un index des endpoints appelables, généré depuis la spécification
-        OpenAPI, filtré des routes d'administration <strong>et de toutes les routes
-        <code>DELETE</code></strong> — 45 endpoints ainsi écartés, que l'agent ne peut ni
-        découvrir ni atteindre.
+        OpenAPI. Tous les tags sont inclus, y compris l'administration ; seules les 45 routes
+        <code>DELETE</code> sont écartées, et l'agent ne peut ni les découvrir ni les atteindre.
       </p>
       <div class="tablewrap">
         <table>
@@ -707,10 +707,10 @@
             <tr><th>Méthode</th><th>Endpoints</th><th>Nature</th></tr>
           </thead>
           <tbody>
-            <tr><td class="mono">GET</td><td class="num">103</td><td><span class="pill read">lecture</span></td></tr>
-            <tr><td class="mono">POST</td><td class="num">176</td><td><span class="pill write">écriture</span></td></tr>
-            <tr><td class="mono">PUT</td><td class="num">43</td><td><span class="pill write">écriture</span></td></tr>
-            <tr><td class="mono"><strong>Total</strong></td><td class="num"><strong>322</strong></td><td>répartis sur 30 domaines</td></tr>
+            <tr><td class="mono">GET</td><td class="num">144</td><td><span class="pill read">lecture</span></td></tr>
+            <tr><td class="mono">POST</td><td class="num">220</td><td><span class="pill write">écriture</span></td></tr>
+            <tr><td class="mono">PUT</td><td class="num">73</td><td><span class="pill write">écriture</span></td></tr>
+            <tr><td class="mono"><strong>Total</strong></td><td class="num"><strong>437</strong></td><td>répartis sur 44 domaines</td></tr>
           </tbody>
         </table>
       </div>
@@ -825,9 +825,9 @@ curl -s -X POST localhost:8080/mcp \
   </main>
 
   <footer>
-    <span>Magileads MCP v0.9.0</span>
+    <span>Magileads MCP v0.10.0</span>
     <span>Bun ≥ 1.1 · TypeScript · MCP SDK 1.29</span>
-    <span>24 outils · 322 endpoints appelables</span>
+    <span>25 outils · 437 endpoints appelables</span>
   </footer>
 
 </div>

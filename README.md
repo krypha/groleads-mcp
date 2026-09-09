@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that exposes
 **Magileads** as tools for AI agents — Google Maps targeting, contact lists, campaign
-audit, PRM (pipeline), data queries, and a generic non-admin API passthrough.
+audit, PRM (pipeline), data queries, and every Magileads OpenAPI endpoint except DELETE.
 
 Turn a plain query — *"dentists in Lyon"* — into a filled Magileads contact list, audit a
 prospecting campaign, or read the whole account. **No LinkedIn account** is needed, only
@@ -37,8 +37,8 @@ whatever LLM powers it (Claude, GPT, Ollama, OpenRouter, …).
 | `list_contact_lists` | `name?` (filter), `limit?` (1–200, default 25) | `{ total, lists[] }` |
 | `get_contact_list_status` | `contact_list_id` | `{ id, name, contacts, emails, companies, jobs[] }` |
 | `list_contact_fields` | `contact_list_id` | `{ fields[] }` — each `{ data_field_id, identifier, label, type }` |
-| `preview_contact_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?` | `{ list_name, matched_count, total_count, to_delete, to_keep }` — **read-only** |
-| `delete_contacts_by_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?`, `confirm_count`, `delete_entire_list?` | `{ deleted, list_name, remaining }` — **destructive, guarded** |
+| `add_contact_to_list` | `contact_list_id`, `properties:[{field,value}]`, `confirm?` | imports one contact — **dry-run until `confirm:true`** |
+| `preview_contact_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?` | `{ list_name, matched_count, total_count, selected, not_selected }` — **read-only** |
 | `list_campaigns` | `name?` (filter), `limit?` (1–100, default 50) | `{ campaigns[] }` — each `{ id, name, status, start_date, scenario_id }` |
 | `get_campaign` | `campaign_id` | `{ id, name, status, channels[], scenario_id, target_lists:[{id,name,count}], total_contacts }` |
 | `get_scenario` | `scenario_id` | `{ steps[] }` — each step with full `subject`/`body` (not truncated) |
@@ -53,9 +53,9 @@ whatever LLM powers it (Claude, GPT, Ollama, OpenRouter, …).
 | `query_prm_contacts` | `status?`, `only_positive?`, `search?`, `options?`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — capped at 50 |
 | `get_prm_contact` | `contact_id` | `{ status, scoring, programmations[], calls[], history[] }` |
 | `list_prm_nurturings` | *(none)* | `{ nurturings[] }` |
-| `list_api_endpoints` | `search?`, `method?`, `reads_only?`, `writes_only?`, `limit?` | `{ endpoints[] }` — discover the callable non-admin API surface |
-| `magileads_get` | `path`, `query?` | raw JSON — GET any non-admin endpoint (read-only) |
-| `magileads_request` | `method`, `path`, `query?`, `body?`, `confirm?` | write any non-admin endpoint — **dry-run until `confirm:true`** |
+| `list_api_endpoints` | `search?`, `method?`, `reads_only?`, `writes_only?`, `limit?` | `{ endpoints[] }` — discover every endpoint except DELETE |
+| `magileads_get` | `path`, `query?` | raw JSON — GET any indexed endpoint (read-only) |
+| `magileads_request` | `method`, `path`, `query?`, `body?`, `confirm?` | call any POST/PUT/PATCH endpoint — **dry-run until `confirm:true`** |
 
 ## How targeting works
 
@@ -71,16 +71,18 @@ whatever LLM powers it (Claude, GPT, Ollama, OpenRouter, …).
 
 ## Manipulating contacts in a list
 
-Beyond building lists, the server can **prune** them by criteria — with a safety net so
-an agent can't wipe a list by accident.
+`list_contact_fields` returns the available fields (`identifier` such as `email`,
+`company`, or `first_name`, plus `data_field_id`, `label`, and `type`). Use those readable
+identifiers in both contact imports and filters.
 
-1. **Discover fields** — `list_contact_fields` returns the filterable fields
-   (`identifier` like `email` / `company` / `first_name`, plus `data_field_id`, `label`,
-   `type`). Name fields by their `identifier` in criteria.
-2. **Preview** — `preview_contact_selection` counts what a selection would affect and
-   **deletes nothing**. It returns `matched_count`, `total_count`, and — for the chosen
-   `target` — `to_delete` / `to_keep`.
-3. **Delete** — `delete_contacts_by_selection` removes contacts, behind two guardrails.
+`add_contact_to_list` resolves each `{ field, value }` property to the exact Magileads
+body `{ properties:[{ data_field_id, value }] }`, then calls
+`POST /contact-lists/{contact_list_id}/contact`. It returns a dry run by default; pass
+`confirm:true` to import. The API can report `contacts_updated` when an existing contact
+is matched.
+
+`preview_contact_selection` is read-only. It counts a filtered segment and returns
+`matched_count`, `total_count`, `selected`, and `not_selected`.
 
 **Criteria** are `{ field, op, value? }` objects:
 
@@ -94,19 +96,14 @@ an agent can't wipe a list by accident.
 
 - **`match`**: `all` (AND, default) or `any` (OR) across the criteria.
 - **`target`**: `matching` (default — select the contacts that match) or
-  `all_except_matching` (select everyone who does **not** match, i.e. keep only the matches).
-
-**Guardrails on `delete_contacts_by_selection`:**
-
-- **`confirm_count` is required** and must equal the **live** `to_delete` (re-counted at
-  delete time). Pass the `to_delete` you got from `preview_contact_selection`. If the list
-  changed in between (count differs), the delete is refused — preview again.
-- **Empty criteria are refused** (they would match the whole list) unless you explicitly
-  set `delete_entire_list: true`.
+  `all_except_matching` (select everyone who does **not** match).
 
 ```
-list_contact_fields → preview_contact_selection → (read to_delete) → delete_contacts_by_selection(confirm_count = to_delete)
+list_contact_fields → add_contact_to_list (dry run) → add_contact_to_list(confirm = true)
 ```
+
+No HTTP `DELETE` operation is present in the generated endpoint index or accepted by a
+tool.
 
 ## Auditing a prospecting campaign
 
@@ -188,27 +185,27 @@ exclusions, LinkedIn sends, imports, or deletes.
 
 > **Read-only, deliberately.** `get_prm_contact` does **not** pass the API's
 > `set_new_reply_read` flag, so viewing a prospect never marks their replies as read.
-> **Notes** are not part of the profile response (they live behind dedicated note endpoints
-> this server doesn't expose); they may still appear as items inside `history`.
+> **Notes** are not part of the profile response. Dedicated note endpoints can be discovered
+> and called through the generic API tools; they may also appear as items inside `history`.
 
 ## Generic API access (everything else)
 
 The dedicated tools above cover the common workflows. For anything else, three **generic
-passthrough** tools reach the account's **entire non-admin API surface** (admin, billing,
-reseller, team, and account-settings endpoints are excluded by an allowlist generated from
-the API's OpenAPI spec — see [`src/endpoints.generated.ts`](src/endpoints.generated.ts)):
+passthrough** tools reach every operation in the API's OpenAPI specification except HTTP
+`DELETE`, including admin, billing, reseller, team, API-key, and account endpoints. The
+generated index is committed in [`src/endpoints.generated.ts`](src/endpoints.generated.ts).
 
 - `list_api_endpoints` — discover the callable endpoints (filter by `search`, `method`,
   reads/writes). Use it to find the exact `path` + `method`.
 - `magileads_get` — **read-only**: GET any allow-listed endpoint. Pass `path` (with `{params}`
   filled in) and an optional `query` object (object values are JSON-encoded, e.g.
   `{ options: { per_page: 10 } }`). It even follows the API's own `next_page` / cursor URLs.
-- `magileads_request` — **writes** (POST/PUT/DELETE/PATCH): create lists/models, send LinkedIn
+- `magileads_request` — **writes** (POST/PUT/PATCH): create lists/models, send LinkedIn
   messages, imports, PRM exclusions, status changes, and so on.
 
 > **Write guardrail.** `magileads_request` performs a **dry run by default** — it returns
 > exactly what *would* be sent and changes nothing. Set `confirm: true` to actually execute.
-> Admin/billing endpoints are refused outright. Regenerate the allowlist with
+> HTTP `DELETE` is refused outright. Regenerate the endpoint index with
 > `bun run gen:endpoints` if the API adds endpoints.
 
 ## Transports
@@ -333,7 +330,7 @@ discovered.
 src/
 ├── magileads.ts             Self-contained Magileads client (dual auth + JWT refresh + API calls)
 ├── tools.ts                 The 25 MCP tool definitions + handlers (input validation, error wrapping)
-├── endpoints.generated.ts   Non-admin API allowlist for the generic passthrough tools (generated)
+├── endpoints.generated.ts   All OpenAPI operations except DELETE (generated)
 ├── server.ts                buildServer() — creates an McpServer with all tools registered
 ├── index.ts                 stdio entry point
 └── http.ts                  HTTP entry point (Streamable HTTP + bearer/query auth + /health)
@@ -355,7 +352,7 @@ bun install
 bun run typecheck      # tsc --noEmit (type safety)
 bun run dev            # run stdio
 bun run dev:http       # run HTTP
-bun run gen:endpoints  # refresh the non-admin API allowlist from the OpenAPI spec
+bun run gen:endpoints  # refresh the all-except-DELETE API index from the OpenAPI spec
 bun run build          # optional: bundle to dist/ with `bun build`
 ```
 

@@ -7,7 +7,7 @@ Instructions for Claude Code working in **this** repository. (User-facing docs l
 
 A standalone **MCP server** (`@modelcontextprotocol/sdk` v1.x, TypeScript, ESM/NodeNext)
 that exposes **Magileads** as tools for AI agents (Google Maps targeting, contact
-lists, campaign audit, PRM, plus a generic non-admin API passthrough).
+lists, campaign audit, PRM, plus every OpenAPI endpoint except DELETE).
 **Runs on Bun** — Bun executes the TypeScript entry points directly, so there is **no build
 step to run** (`tsc` is used only for type-checking). It runs in production, deployed via
 Docker on Dokploy (behind a domain of your choice), and is consumed by a **Nous Research
@@ -26,8 +26,8 @@ src/magileads.ts   Self-contained Magileads API client. Dual auth from env:
 src/tools.ts       The 25 tools + handlers. Every handler is wrapped so it NEVER throws
                    (returns {content:[...], isError:true} on failure via fail()). Inputs
                    are clamped (max_links 1–40, max_results 1–200, urls sliced to 10,
-                   criteria capped at 30 — never silently dropped on a delete).
-src/endpoints.generated.ts  GENERATED non-admin API allowlist (method/path/tag/summary) that
+                   criteria capped at 30, contacts capped at 50 per query).
+src/endpoints.generated.ts  GENERATED all-except-DELETE API index (method/path/tag/summary) that
                    the generic passthrough tools may call. Regenerate with
                    `bun run gen:endpoints` (scripts/generate-endpoints.mjs, from the OpenAPI spec).
 src/server.ts      buildServer() → McpServer with all tools registered. Shared by both
@@ -46,9 +46,8 @@ src/http.ts        HTTP transport: stateless StreamableHTTPServerTransport
 *Contact lists* — `list_contact_lists`, `get_contact_list_status`.
 
 *Contact manipulation* — `list_contact_fields` (read-only; the filterable fields of a
-list), `preview_contact_selection` (read-only; counts a criteria selection, deletes
-nothing), `delete_contacts_by_selection` (DESTRUCTIVE; deletes contacts by criteria
-behind two guardrails — see below).
+list), `add_contact_to_list` (guarded write; imports one contact), and
+`preview_contact_selection` (read-only; counts a criteria selection).
 
 *Campaign audit (all read-only)* — `list_campaigns`, `get_campaign`, `get_scenario`
 (full step content), `get_campaign_statistics` (aggregate + per-step). See below.
@@ -60,8 +59,8 @@ behind two guardrails — see below).
 `get_prm_contact`, `list_prm_nurturings`. See below.
 
 *Generic passthrough* — `list_api_endpoints` (read-only; discover the callable surface),
-`magileads_get` (read-only; GET any non-admin endpoint), `magileads_request` (writes any
-non-admin endpoint; dry-run until `confirm:true`). See below.
+`magileads_get` (read-only; GET any indexed endpoint), `magileads_request` (calls any
+POST/PUT/PATCH endpoint; dry-run until `confirm:true`). See below.
 
 ## Key behavioral facts (don't relearn these the hard way)
 
@@ -75,11 +74,19 @@ non-admin endpoint; dry-run until `confirm:true`). See below.
   `GET /data-fields` (not per-list); they apply to every contact list. `identifier`
   (e.g. "email", "company") is what agents name; `data_field_id` is what the API filters on.
 
-## Contact selection & deletion (the destructive path)
+## Contact import & selection
 
-Filters go to Magileads as `ContactLists.ContactsSelection` on
-`DELETE /contact-lists/{id}/contacts`:
-`{ filter, contact_ids:[], excluded_contact_ids:[], reverse_selection }`.
+- `add_contact_to_list` calls `POST /contact-lists/{id}/contact` with the exact Swagger body
+  `{properties:[{data_field_id,value}]}`. Its input accepts readable data-field identifiers
+  (`email`, `first_name`, etc.) or numeric ids, resolves them through `GET /data-fields`,
+  refuses duplicate fields, and performs a dry run unless `confirm:true`.
+- The Swagger response is `stateSuccess & ImportContactsResponse`: `state`,
+  `contacts_added`, `contacts_updated`, `contacts_deleted`, `contacts_ignored`, and
+  `contacts_with_ignored_fields`. The generic response schema contains all counters even
+  though this route imports one contact.
+- No tool accepts HTTP `DELETE`, and DELETE operations are absent from the generated index.
+
+Selection filters used by `preview_contact_selection` are:
 
 - **filter** = `{ mode:'and'|'or', values:[{ field_name:<data_field_id as STRING>, type, value }] }`.
   An empty `{mode:'and',values:[]}` matches EVERY contact.
@@ -87,13 +94,9 @@ Filters go to Magileads as `ContactLists.ContactsSelection` on
   not `starts_*`): contains, not_contains, equals, not_equals, start_with, end_with,
   more_than, more_or_equal_than, less_than, less_or_equal_than, does_exist, does_not_exist.
   `tools.ts` accepts friendly aliases (`starts_with`, `gt`, `has_value`, `is_empty`, …).
-- **target** `matching` → `reverse_selection:false` (delete the matches);
-  `all_except_matching` → `reverse_selection:true` (keep only the matches, delete the rest).
-- **Count / guardrail source**: `GET /contact-lists/{id}/contacts?options={per_page:1,filter}`
-  → read `number_of_results`. `preview_*` returns this; `delete_*` RE-COUNTS it live.
-- **Two guardrails in `delete_contacts_by_selection`**: (1) empty criteria are refused
-  unless `delete_entire_list:true`; (2) `confirm_count` must equal the live `to_delete`
-  or the delete is refused. Preview → pass its `to_delete` as `confirm_count`.
+- **target** `matching` selects matches; `all_except_matching` selects the complement.
+- **Count source**: `GET /contact-lists/{id}/contacts?options={per_page:1,filter}`
+  → read `number_of_results`.
 - Magileads login body is `{ email, password }` → `{ access_token, refresh_token }`.
 
 ## Campaign audit (the read-only path)
@@ -177,30 +180,29 @@ change, note, call, exclusion, LinkedIn send, import, delete).
   `set_new_reply_read`** (it marks replies read = a write). Engagement `scoring` is DERIVED:
   summed from each `programmations[].score_{open,link_click,answer,positive_answer,
   negative_answer,invitation_accepted}_count` — there is no top-level scoring object. **Notes are
-  NOT in the profile** (dedicated `/prm/contact/{id}/note*` endpoints, not exposed); they may
-  appear as items inside `history` (a heterogeneous, swagger-undocumented oneOf → passed raw,
-  capped at 30).
+  NOT in the profile**; dedicated `/prm/contact/{id}/note*` endpoints remain available through
+  the generic tools. Notes may appear as items inside `history` (a heterogeneous,
+  swagger-undocumented oneOf → passed raw, capped at 30).
 - `list_prm_nurturings` → `GET /prm/nurturings` → `{id, name, filter, contact_list_ids, created_on}`.
 - Auth errors (`prm_contact_does_not_exist`, unauthorized) surface via `fail()`.
 
 ## Generic passthrough (the "everything else" path)
 
-Three tools reach the account's whole **non-admin** API surface for endpoints without a
-dedicated tool. Backed by `src/endpoints.generated.ts` (the allowlist).
+Three tools reach every OpenAPI operation that has no dedicated tool, including admin,
+billing, reseller, team, API-key, and user endpoints. `DELETE` is the only HTTP method
+excluded. The generated index lives in `src/endpoints.generated.ts`.
 
-- **Admin is excluded at generation time** — `ADMIN_TAGS` in `scripts/generate-endpoints.mjs`
-  (Resellers/Organizations/Teams/Roles/Permissions/API Keys/External API keys/Subscriptions/
-  Crons/Webhooks/OVH/Zapier/Affiliation/Pools, and all of Users except `GET /users/me*`).
-  Regenerate with `bun run gen:endpoints`.
-- `magileads_get` allows only GET matches; `magileads_request` only POST/PUT/DELETE/PATCH.
+- `scripts/generate-endpoints.mjs` reads the live Swagger and excludes DELETE at generation
+  time. The runtime also filters it defensively. Regenerate with `bun run gen:endpoints`.
+- `magileads_get` allows only GET matches; `magileads_request` only POST/PUT/PATCH.
   `matchEndpoint` turns each template into a regex and ALSO strips a trailing `/page/{n}` or
   `/{cursor}/page/{n}` so agents can follow the API's own `next_page`/cursor URLs. `buildPath`
   accepts either a plain path or a full echoed URL (it keeps only pathname+query).
 - **Write guardrail**: `magileads_request` is a DRY RUN unless `confirm:true` — it returns
   `{dry_run:true, would_call}` and sends nothing. `destructiveHint:true`, `readOnlyHint:false`.
 - Responses are capped at ~60 KB (`capResult`) to protect agent context.
-- Prefer the dedicated tools; the passthrough is the escape hatch. It CAN write, so it is the
-  one place (besides `delete_contacts_by_selection`) that mutates data.
+- Prefer the dedicated tools; the passthrough is the escape hatch. It can mutate data after
+  explicit confirmation, including administration resources, so agents must inspect dry runs.
 
 ## Auth (HTTP mode) — MULTI-TENANT, bring-your-own-key
 
@@ -224,7 +226,7 @@ bun install
 bun run typecheck      # tsc --noEmit (Bun runs TS directly; no emit needed to run)
 bun run start:http     # run HTTP locally (multi-tenant; clients send their own key)
 bun run start          # run stdio locally (single account from env)
-bun run gen:endpoints  # regenerate the non-admin passthrough allowlist from the OpenAPI spec
+bun run gen:endpoints  # regenerate the all-except-DELETE API index from the OpenAPI spec
 bun run build          # optional: bundle to dist/ via `bun build`
 ```
 
