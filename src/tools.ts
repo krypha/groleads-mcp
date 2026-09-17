@@ -32,6 +32,7 @@ import {
   type ContactsPage,
 } from "./magileads.js";
 import { MAGILEADS_ENDPOINTS, type EndpointDef } from "./endpoints.generated.js";
+import type { Scope } from "./oauth/scopes.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -589,9 +590,38 @@ function contactsView(
   };
 }
 
-/** Register the Google Maps targeting tools onto an McpServer instance. */
-export function registerTools(server: McpServer): void {
-  server.registerTool(
+type ToolAccess = { scope: Scope; routes: readonly string[] };
+const catalog = new Map<string, ToolAccess>();
+let catalogReady = false;
+
+/** This is the source of truth for HTTP preflight and the generated API table. */
+export function toolAccessTable(): ReadonlyMap<string, ToolAccess> {
+  if (!catalogReady) registerTools({} as McpServer, []);
+  return catalog;
+}
+
+export function accessForTool(name: string): ToolAccess | undefined {
+  return toolAccessTable().get(name);
+}
+
+/** Each access declaration sits immediately beside its tool definition. */
+export function registerTools(target: McpServer, allowedScopes?: readonly Scope[]): void {
+  const seen = new Set<string>();
+  const register = (access: ToolAccess): McpServer["registerTool"] =>
+    ((name: string, ...args: unknown[]) => {
+      if (access.routes.length === 0) throw new Error(`Missing API routes for tool: ${name}`);
+      if (seen.has(name)) throw new Error(`Duplicate tool registration: ${name}`);
+      seen.add(name);
+      const previous = catalog.get(name);
+      if (previous && JSON.stringify(previous) !== JSON.stringify(access)) {
+        throw new Error(`Conflicting tool access declaration: ${name}`);
+      }
+      catalog.set(name, access);
+      if (allowedScopes && !allowedScopes.includes(access.scope)) return {};
+      return (target.registerTool as (...values: unknown[]) => unknown).call(target, name, ...args);
+    }) as McpServer["registerTool"];
+
+  register({ scope: "mcp:read", routes: ["POST /targeting/google/generate-maps-search-urls"] })(
     "generate_maps_search_urls",
     {
       title: "Generate Google Maps search URLs",
@@ -634,7 +664,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:write", routes: ["POST /targeting/google/extract-maps-search"] })(
     "extract_maps_search",
     {
       title: "Extract contacts from Google Maps URLs",
@@ -701,7 +731,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:write", routes: ["POST /targeting/google/generate-maps-search-urls", "POST /targeting/google/extract-maps-search"] })(
     "run_google_maps_targeting",
     {
       title: "Run a full Google Maps targeting (generate + extract)",
@@ -768,7 +798,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /contact-lists-paginated/page/1"] })(
     "list_contact_lists",
     {
       title: "List / search contact lists",
@@ -800,7 +830,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /contact-lists/{id}"] })(
     "get_contact_list_status",
     {
       title: "Get a contact list's status",
@@ -838,7 +868,7 @@ export function registerTools(server: McpServer): void {
   /* Contacts: fields · add one contact · preview a selection                  */
   /* ------------------------------------------------------------------------ */
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /contact-lists/{id}", "GET /data-fields"] })(
     "list_contact_fields",
     {
       title: "List a contact list's filterable fields",
@@ -873,7 +903,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:write", routes: ["GET /contact-lists/{id}", "GET /data-fields", "POST /contact-lists/{id}/contact"] })(
     "add_contact_to_list",
     {
       title: "Add one contact to a contact list",
@@ -949,7 +979,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /contact-lists/{id}", "GET /data-fields", "GET /contact-lists/{id}/contacts"] })(
     "preview_contact_selection",
     {
       title: "Count the contacts matching a selection (read-only)",
@@ -1006,7 +1036,7 @@ export function registerTools(server: McpServer): void {
   /* / scenario must belong to that account (else the API returns unauthorized).*/
   /* ------------------------------------------------------------------------ */
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /workflows/programmations"] })(
     "list_campaigns",
     {
       title: "List prospecting campaigns",
@@ -1049,7 +1079,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /workflows/programmations", "GET /contact-lists/{id}"] })(
     "get_campaign",
     {
       title: "Get a campaign's setup",
@@ -1113,7 +1143,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /workflows/{id}", "GET /models/email/{id}", "GET /models/linkedin/message/{id}", "GET /models/linkedin/invitation/{id}", "GET /models/sms/{id}", "GET /models/smv/{id}"] })(
     "get_scenario",
     {
       title: "Get a scenario's full steps and message content",
@@ -1174,7 +1204,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /statistics/programmations/{id}"] })(
     "get_campaign_statistics",
     {
       title: "Get a campaign's statistics (aggregate + per-step)",
@@ -1330,7 +1360,7 @@ export function registerTools(server: McpServer): void {
   /* Compact, capped responses (agents have limited context). No writes.       */
   /* ------------------------------------------------------------------------ */
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /users/me"] })(
     "get_account_overview",
     {
       title: "Get the Magileads account overview",
@@ -1388,7 +1418,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /integrations/linkedin"] })(
     "list_linkedin_accounts",
     {
       title: "List connected LinkedIn accounts",
@@ -1428,7 +1458,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /contact-lists/names"] })(
     "search_contact_lists",
     {
       title: "Search / rank contact lists",
@@ -1510,7 +1540,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /contact-lists/{id}"] })(
     "get_contact_list",
     {
       title: "Get a contact list's profile",
@@ -1561,7 +1591,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /data-fields", "GET /contact-lists/{id}/contacts", "GET /contact-lists/{id}/contacts/{cursor}/page/{n}"] })(
     "query_contacts",
     {
       title: "Query contacts in a list (filter + sort, paged)",
@@ -1619,7 +1649,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /data-fields", "POST /contact-lists/{id}/contacts/search", "GET /contact-lists/{id}/contacts/search/{cursor}/page/{n}"] })(
     "search_contacts",
     {
       title: "Free-text search contacts in a list (paged)",
@@ -1662,7 +1692,7 @@ export function registerTools(server: McpServer): void {
   /* No status changes, notes, calls, exclusions, sends, imports or deletes.   */
   /* ------------------------------------------------------------------------ */
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /prm/status", "GET /prm/status/custom"] })(
     "list_prm_statuses",
     {
       title: "List PRM pipeline statuses",
@@ -1711,7 +1741,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /prm/status", "GET /prm/status/custom", "GET /data-fields", "GET /prm/contacts", "GET /prm/contacts/{cursor}/page/{n}"] })(
     "query_prm_contacts",
     {
       title: "Query PRM (pipeline) contacts",
@@ -1803,7 +1833,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /prm/contact/{id}", "GET /prm/status", "GET /prm/status/custom", "GET /data-fields"] })(
     "get_prm_contact",
     {
       title: "Get a PRM (pipeline) contact's full profile",
@@ -1905,7 +1935,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET /prm/nurturings"] })(
     "list_prm_nurturings",
     {
       title: "List PRM nurturing sequences",
@@ -1942,7 +1972,7 @@ export function registerTools(server: McpServer): void {
   /* are dry-run until confirm:true. Prefer dedicated tools for common tasks.  */
   /* ------------------------------------------------------------------------ */
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["(local endpoint index)"] })(
     "list_api_endpoints",
     {
       title: "Discover callable Magileads API endpoints",
@@ -1988,7 +2018,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:read", routes: ["GET {indexed non-DELETE path}"] })(
     "magileads_get",
     {
       title: "Call any Magileads API GET endpoint",
@@ -2024,7 +2054,7 @@ export function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  register({ scope: "mcp:write", routes: ["POST|PUT|PATCH {indexed path}"] })(
     "magileads_request",
     {
       title: "Call any Magileads API write endpoint except DELETE (guarded)",
@@ -2071,4 +2101,5 @@ export function registerTools(server: McpServer): void {
       }
     },
   );
+  catalogReady = true;
 }

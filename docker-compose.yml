@@ -1,14 +1,11 @@
-# Standalone deployment of the Magileads MCP server (HTTP transport, multi-tenant).
-# Runs on its own — each AI agent / client connects by URL and presents its OWN
-# Magileads API key per request (X-Magileads-Api-Key header, Authorization: Bearer,
-# or ?api_key=). There is no shared gate token to configure.
+# Standalone Magileads MCP server (HTTP, multi-tenant).
+# MCP_HTTP_AUTH=oauth (default), api_key, or both. OAuth modes require all
+# OAUTH_* values; api_key mode can leave them blank. API keys are per client.
 #
 # On Dokploy: point a Compose service at this repo; Dokploy builds the Dockerfile,
 # gives the service a domain, and terminates TLS at its reverse proxy.
 #
-# MAGILEADS_API_KEY below is OPTIONAL — set it only if you want a single default
-# account for keyless requests. Leave it unset for a pure multi-tenant deployment
-# (keyless requests are then rejected).
+# Supply OAuth secrets from the deployment secret store when enabled.
 services:
   magileads-mcp:
     build: .
@@ -19,8 +16,12 @@ services:
       - "8080:8080"
     environment:
       - MCP_HTTP_PORT=8080
-      # --- Optional default account (keyless requests fall back to this) ---
-      # - MAGILEADS_API_KEY=${MAGILEADS_API_KEY:-}
-      # - MAGILEADS_EMAIL=${MAGILEADS_EMAIL:-}
-      # - MAGILEADS_PASSWORD=${MAGILEADS_PASSWORD:-}
-      # - MAGILEADS_API_BASE=${MAGILEADS_API_BASE:-}
+      - MCP_HTTP_AUTH=${MCP_HTTP_AUTH:-oauth}
+      - MCP_ALLOW_API_KEY_QUERY=${MCP_ALLOW_API_KEY_QUERY:-false}
+      - MAGILEADS_API_BASE=${MAGILEADS_API_BASE:-https://app.api-magileads.net}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      - OAUTH_MCP_RESOURCE=${OAUTH_MCP_RESOURCE:-}
+      - OAUTH_API_RESOURCE=${OAUTH_API_RESOURCE:-}
+      - OAUTH_INTERNAL_CLIENT_ID=${OAUTH_INTERNAL_CLIENT_ID:-}
+      - OAUTH_INTERNAL_CLIENT_SECRET=${OAUTH_INTERNAL_CLIENT_SECRET:-}
+      # - MAGILEADS_API_URL=${MAGILEADS_API_URL}

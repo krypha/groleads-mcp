@@ -20,14 +20,12 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { buildServer } from "./server.js";
 import { authMode, API_BASE } from "./magileads.js";
+import { log } from "./log.js";
 
 async function main(): Promise<void> {
   const mode = authMode();
   if (mode === "none") {
-    console.error(
-      "[magileads-mcp] No credentials configured. Set MAGILEADS_API_KEY, or " +
-        "MAGILEADS_EMAIL + MAGILEADS_PASSWORD, then restart.",
-    );
+    log("error", "No credentials configured. Set MAGILEADS_API_KEY or MAGILEADS_EMAIL + MAGILEADS_PASSWORD, then restart.");
     process.exit(1);
   }
 
@@ -35,12 +33,10 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  console.error(
-    `[magileads-mcp] server ready (stdio, auth: ${mode}, base: ${API_BASE}).`,
-  );
+  log("info", "stdio MCP ready", { authMode: mode, apiBase: API_BASE });
 }
 
 main().catch((err) => {
-  console.error("[magileads-mcp] Fatal error:", err);
+  log("error", "stdio MCP fatal error", { error: err });
   process.exit(1);
 });

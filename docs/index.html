@@ -495,11 +495,11 @@
     <section id="auth">
       <h2>Authentification</h2>
       <p>
-        Le transport HTTP est <strong>multi-tenant</strong> : chaque requête porte la clé
-        d'API Magileads <strong>du client appelant</strong>, utilisée pour cette requête
-        uniquement. Deux clients atteignent donc deux comptes différents. Il n'y a
-        <strong>aucun jeton d'accès partagé</strong> à gérer, et le serveur ne stocke aucun
-        secret par client.
+        Le transport HTTP est <strong>multi-tenant</strong> et propose trois modes :
+        <code>oauth</code> (par défaut), <code>api_key</code> ou <code>both</code>.
+        Avec une clé API, chaque requête porte la clé Magileads du client appelant,
+        utilisée uniquement pour cette requête. Le serveur ne stocke aucun secret
+        par client.
       </p>
       <div class="tablewrap">
         <table>
@@ -509,18 +509,18 @@
           <tbody>
             <tr>
               <td>En-tête dédié</td>
-              <td class="mono">X-Magileads-Api-Key: &lt;clé&gt;</td>
-              <td><strong>Recommandé.</strong></td>
+              <td class="mono">X-API-Key: &lt;clé&gt;</td>
+              <td><strong>Recommandé pour les clés API</strong> en mode <code>api_key</code> ou <code>both</code>.</td>
             </tr>
             <tr>
               <td>En-tête standard</td>
               <td class="mono">Authorization: Bearer &lt;clé&gt;</td>
-              <td>Pratique pour les fichiers de configuration.</td>
+              <td>Clé Magileads uniquement en mode <code>api_key</code> ; jeton OAuth en mode <code>oauth</code> ou <code>both</code>.</td>
             </tr>
             <tr>
               <td>Paramètre d'URL</td>
               <td class="mono">?api_key=&lt;clé&gt;</td>
-              <td>Pour les interfaces n'offrant qu'un champ URL. <code>?token=</code> est aussi accepté.</td>
+              <td>Désactivé par défaut. Nécessite <code>MCP_ALLOW_API_KEY_QUERY=true</code>. <code>?token=</code> est aussi accepté.</td>
             </tr>
           </tbody>
         </table>
@@ -533,9 +533,9 @@
         </p>
       </div>
       <p>
-        Une requête sans clé exploitable reçoit un <code>401</code>, <em>sauf</em> si le
-        serveur dispose d'un compte par défaut (voir <a href="#config">Configuration</a>),
-        auquel cas elle retombe sur ce compte. La clé du client n'est jamais journalisée.
+        Une requête sans identifiant exploitable reçoit un <code>401</code> ; il n'y a
+        pas de compte serveur par défaut pour HTTP. La clé du client n'est jamais
+        journalisée.
       </p>
       <div class="note">
         <span class="label">stdio</span>
@@ -724,8 +724,9 @@
     <section id="config">
       <h2>Configuration</h2>
       <p>
-        Tout passe par des variables d'environnement. Pour un déploiement purement
-        multi-tenant, elles peuvent <strong>toutes rester vides</strong>.
+        Tout passe par des variables d'environnement. Le mode <code>api_key</code>
+        n'exige pas de configuration OAuth ; les modes <code>oauth</code> et
+        <code>both</code> exigent les cinq paramètres OAuth indiqués ci-dessous.
       </p>
       <div class="tablewrap">
         <table>
@@ -733,8 +734,11 @@
             <tr><th class="mono">Variable</th><th>Rôle</th><th>Défaut</th></tr>
           </thead>
           <tbody>
-            <tr><td class="mono">MAGILEADS_API_KEY</td><td>Compte par défaut, utilisé pour les requêtes sans clé et par stdio.</td><td>—</td></tr>
-            <tr><td class="mono">MAGILEADS_EMAIL<br>MAGILEADS_PASSWORD</td><td>Compte par défaut via connexion JWT, rafraîchie automatiquement.</td><td>—</td></tr>
+            <tr><td class="mono">MCP_HTTP_AUTH</td><td><code>oauth</code>, <code>api_key</code> ou <code>both</code>.</td><td class="mono">oauth</td></tr>
+            <tr><td class="mono">MCP_ALLOW_API_KEY_QUERY</td><td>Autorise les clés dans l'URL si nécessaire.</td><td class="mono">false</td></tr>
+            <tr><td class="mono">OAUTH_ISSUER<br>OAUTH_MCP_RESOURCE<br>OAUTH_API_RESOURCE<br>OAUTH_INTERNAL_CLIENT_ID<br>OAUTH_INTERNAL_CLIENT_SECRET</td><td>Requis en mode <code>oauth</code> ou <code>both</code>.</td><td>—</td></tr>
+            <tr><td class="mono">MAGILEADS_API_KEY</td><td>Compte utilisé par stdio uniquement.</td><td>—</td></tr>
+            <tr><td class="mono">MAGILEADS_EMAIL<br>MAGILEADS_PASSWORD</td><td>Compte stdio via connexion JWT, rafraîchie automatiquement.</td><td>—</td></tr>
             <tr><td class="mono">MAGILEADS_API_BASE</td><td>URL de base de l'API.</td><td class="mono">https://app.api-magileads.net</td></tr>
             <tr><td class="mono">MCP_HTTP_PORT</td><td>Port d'écoute du transport HTTP.</td><td class="mono">8080</td></tr>
             <tr><td class="mono">MCP_HTTP_PATH</td><td>Chemin de l'endpoint MCP.</td><td class="mono">/mcp</td></tr>
@@ -753,9 +757,8 @@
 # stdio (agent local) — compte unique depuis l'environnement
 MAGILEADS_API_KEY=... bun run start
 
-# HTTP (multi-tenant) — les clients envoient leur propre clé,
-# aucun identifiant serveur n'est nécessaire
-bun run start:http</code></pre>
+# HTTP avec clés API propres à chaque client, sans configuration OAuth
+MCP_HTTP_AUTH=api_key bun run start:http</code></pre>
       </div>
       <h3>Vérifier l'endpoint HTTP</h3>
       <div class="codeblock">
@@ -766,7 +769,7 @@ bun run start:http</code></pre>
 curl -s -X POST localhost:8080/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -H 'X-Magileads-Api-Key: VOTRE_CLE_MAGILEADS' \
+  -H 'X-API-Key: VOTRE_CLE_MAGILEADS' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'</code></pre>
       </div>
     </section>
@@ -785,7 +788,7 @@ curl -s -X POST localhost:8080/mcp \
       <h3>Sur Dokploy</h3>
       <ul class="plain">
         <li>Créer une application depuis le dépôt et laisser Dokploy construire le <code>Dockerfile</code>.</li>
-        <li>Attribuer un domaine. <strong>Aucune variable d'environnement n'est requise</strong> en multi-tenant, puisque chaque client apporte sa clé.</li>
+        <li>Attribuer un domaine et définir <code>MCP_HTTP_AUTH=api_key</code> pour les clés seules, ou <code>both</code> avec les paramètres OAuth requis.</li>
         <li>Le reverse-proxy termine le TLS : les clients atteignent le serveur sur <code class="mono">https://&lt;domaine&gt;/mcp</code>.</li>
       </ul>
     </section>
@@ -804,11 +807,11 @@ curl -s -X POST localhost:8080/mcp \
   magileads:
     url: "https://&lt;domaine&gt;/mcp"
     headers:
-      X-Magileads-Api-Key: "&lt;CLE_MAGILEADS_DU_CLIENT&gt;"</code></pre>
+      X-API-Key: "&lt;CLE_MAGILEADS_DU_CLIENT&gt;"</code></pre>
       </div>
       <h3>Par URL</h3>
       <p>
-        Pour les interfaces qui n'offrent qu'un champ URL, sans en-têtes personnalisés :
+        Si <code>MCP_ALLOW_API_KEY_QUERY=true</code>, pour les interfaces qui n'offrent qu'un champ URL, sans en-têtes personnalisés :
         transport <strong>HTTP</strong>, et
         <code class="mono">https://&lt;domaine&gt;/mcp?api_key=&lt;CLE&gt;</code>.
       </p>

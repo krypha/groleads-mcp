@@ -5,10 +5,12 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that ex
 audit, PRM (pipeline), data queries, and every Magileads OpenAPI endpoint except DELETE.
 
 Turn a plain query — *"dentists in Lyon"* — into a filled Magileads contact list, audit a
-prospecting campaign, or read the whole account. **No LinkedIn account** is needed, only
-Magileads credentials. It **runs on [Bun](https://bun.sh)** and is **model-agnostic**: it
+prospecting campaign, or read the whole account. **No LinkedIn account** is needed.
+It **runs on [Bun](https://bun.sh)** and is **model-agnostic**: it
 works with any MCP-capable agent (Nous Research **Hermes**, Claude Desktop/Code, Cursor, …),
-whatever LLM powers it (Claude, GPT, Ollama, OpenRouter, …).
+whatever LLM powers it (Claude, GPT, Ollama, OpenRouter, …). The HTTP transport
+supports OAuth 2.1, per-client Magileads API keys, or both; the local stdio
+transport uses Magileads environment credentials.
 
 ---
 
@@ -218,33 +220,62 @@ generated index is committed in [`src/endpoints.generated.ts`](src/endpoints.gen
 The HTTP transport is a stateless MCP **Streamable HTTP** endpoint at `POST /mcp`
 (returns JSON), plus an unauthenticated `GET /health` liveness probe.
 
-## Authentication (multi-tenant)
+## Authentication (HTTP)
 
-The HTTP transport is **bring-your-own-key**: every request carries the calling client's
-**own Magileads API key**, and the server uses it for that request only — so different
-clients hit different Magileads accounts. There is **no shared gate token** to manage, and
-the server stores no per-client secrets.
+Choose `MCP_HTTP_AUTH=oauth` (default), `api_key`, or `both`. In `api_key` mode,
+the HTTP server starts without any OAuth configuration. In `both` mode, each
+request chooses **one** method; a Magileads API key and an OAuth bearer in the
+same request are rejected. There is no fallback to the server's environment
+credentials for HTTP requests.
 
-A client presents its Magileads API key as any of:
+For API-key access, each client sends its **own** Magileads key in
+`X-API-Key`. The MCP sends it to the Magileads API under that same header for
+that request only, so clients use separate Magileads accounts. In `api_key`-only
+mode, `Authorization: Bearer <Magileads API key>` also works for legacy clients.
+In `both` mode, `Authorization: Bearer` is reserved for OAuth; use the explicit
+`X-API-Key` header for API keys. Keys in `?api_key=` or `?token=` are
+disabled by default because URLs can appear in proxy logs. Set
+`MCP_ALLOW_API_KEY_QUERY=true` only for a URL-only legacy client when you accept
+that risk. Always use HTTPS in production. A bad key receives HTTP `401` when a
+tool calls the Magileads API; `tools/list` itself makes no backend call. API-key
+clients see the full tool set (including write tools); Magileads account permissions
+and each tool's confirmation guardrails still apply.
 
-- `X-Magileads-Api-Key: <key>` header — **preferred**
-- `Authorization: Bearer <key>` header — config-file friendly
-- `?api_key=<key>` (or `?token=<key>`) on the URL — for dashboards with only a URL field
-  (note the key may appear in reverse-proxy access logs)
+For OAuth access, the bearer must be signed by `OAUTH_ISSUER`, name
+`OAUTH_MCP_RESOURCE` in its audience, and carry `mcp:read` and/or `mcp:write`.
+A token intended for the API is rejected. An unauthenticated request receives
+`401` plus `WWW-Authenticate` pointing at protected-resource metadata. Both the
+bare metadata URL and the RFC 9728 URL suffixed with `/mcp` are served with CORS
+support when OAuth is enabled.
 
-A request with no usable key gets `401`, **unless** the server is configured with a default
-account (below), in which case keyless requests fall back to that account.
+Before a `tools/call`, the MCP exchanges the caller's bearer at the Magileads
+`/oauth/token` endpoint for a new bearer addressed to `OAUTH_API_RESOURCE` and
+limited to **exactly one** tool scope. The caller's bearer is never forwarded to
+the API. `tools/list` offers only tools covered by the caller's scopes; there is
+no implicit write-to-read scope inheritance. A missing tool scope returns `403`
+with `insufficient_scope`; an expired/revoked token or API `401` returns a fresh
+`401` challenge.
+
+The local stdio transport still uses its separate environment credentials.
 
 ## Configuration
 
-All via environment variables (see [`.env.example`](.env.example)). For a pure multi-tenant
-deployment you can leave them **all unset**.
+All via environment variables (see [`.env.example`](.env.example)). OAuth modes
+refuse to start unless all five required OAuth settings are present.
 
 | Variable(s) | Meaning |
 | --- | --- |
-| `MAGILEADS_API_KEY` | **Optional** default account (`X-API-Key`), used for keyless requests + stdio. |
-| `MAGILEADS_EMAIL` + `MAGILEADS_PASSWORD` | Optional default account via JWT login (auto-refreshed). |
-| `MAGILEADS_API_BASE` | Optional; defaults to `https://app.api-magileads.net`. |
+| `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
+| `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
+| `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
+| `OAUTH_MCP_RESOURCE` | Required for OAuth modes; exact resource URL/audience for this MCP, e.g. `https://mcp.example.com/mcp`. |
+| `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
+| `OAUTH_INTERNAL_CLIENT_ID` + `OAUTH_INTERNAL_CLIENT_SECRET` | Required for OAuth modes; confidential token-exchange client. Store the secret in the deployment secret store. |
+| `MAGILEADS_API_URL` | Optional API base URL; defaults to `OAUTH_API_RESOURCE`. |
+| `OAUTH_JWKS_URI` | Optional JWKS override; otherwise resolved from issuer discovery. |
+| `OAUTH_CLOCK_TOLERANCE` | Optional JWT clock tolerance in seconds (default `60`). |
+| `MAGILEADS_API_KEY` or `MAGILEADS_EMAIL` + `MAGILEADS_PASSWORD` | Optional credentials for **stdio only**; never a default HTTP account. |
+| `MAGILEADS_API_BASE` | Optional API-key HTTP and stdio API base URL (default `https://app.api-magileads.net`). |
 | `MCP_HTTP_PORT` | Listen port (default `8080`). |
 | `MCP_HTTP_PATH` | MCP endpoint path (default `/mcp`). |
 
@@ -261,68 +292,113 @@ bun install
 # stdio (local agent) — single account from env
 MAGILEADS_API_KEY=... bun run start
 
-# HTTP (multi-tenant) — clients send their own Magileads key; no server creds needed
+# HTTP OAuth — set the five required OAUTH_* values through your secret store first
 bun run start:http
+
+# HTTP API-key-only — no OAuth settings required
+MCP_HTTP_AUTH=api_key bun run start:http
 ```
 
-Smoke-test the HTTP endpoint (send your Magileads key as the client key):
+Smoke-test discovery and the unauthenticated challenge:
 
 ```bash
 curl -s localhost:8080/health                       # {"status":"ok"}
-curl -s -X POST localhost:8080/mcp \
+curl -s localhost:8080/.well-known/oauth-protected-resource/mcp
+curl -i -X POST localhost:8080/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -H 'X-Magileads-Api-Key: YOUR_MAGILEADS_KEY' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+# Expected: 401 with WWW-Authenticate pointing to the metadata URL.
+
+# API-key-only or dual mode: each client supplies its own key
+curl -s -X POST localhost:8080/mcp \
+  -H 'X-API-Key: YOUR_KEY' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
 ## Deploy with Docker / Dokploy
 
-```bash
-docker compose up -d --build   # no env vars needed for a multi-tenant deployment
+The Docker image runs the HTTP server on container port `8080`; expose it through
+an HTTPS reverse proxy and route the public MCP URL to `/mcp`. `GET /health` is
+unauthenticated and can be used as the health check. Configure the variables in
+Dokploy's environment/secret settings, or in an uncommitted `.env` file for
+Docker Compose (`.env` is git-ignored). **Do not put a customer's API key in the
+server environment:** each client supplies its own `X-API-Key` header.
+
+Choose one deployment profile:
+
+| Clients | `MCP_HTTP_AUTH` | Variables to set on the server |
+| --- | --- | --- |
+| Static Magileads API keys only (for example, a Hermes client without OAuth) | `api_key` | `MCP_HTTP_AUTH=api_key`; optionally `MAGILEADS_API_BASE` if the API is not at its default URL. No `OAUTH_*` values are needed. |
+| OAuth-capable clients only | `oauth` | The five `OAUTH_*` values below. |
+| OAuth clients **and** API-key clients on the same URL | `both` | `MCP_HTTP_AUTH=both` plus the same five `OAUTH_*` values. |
+
+For an API-key-only deployment, the minimal Compose/Dokploy configuration is:
+
+```dotenv
+MCP_HTTP_AUTH=api_key
+MCP_ALLOW_API_KEY_QUERY=false
+# MAGILEADS_API_BASE=https://app.api-magileads.net  # default
 ```
 
-On **Dokploy**: create an app from this repo, let it build the `Dockerfile`, and give it a
-domain. **No env vars are required** for multi-tenant (clients bring their own Magileads key);
-optionally set a default `MAGILEADS_API_KEY` for keyless requests. Dokploy's reverse proxy
-terminates TLS, so clients reach the server at `https://<your-domain>/mcp`.
+For OAuth or dual-mode deployment, obtain these values from the Magileads
+authorization-server team and store the client secret as a deployment secret:
+
+```dotenv
+# Use oauth instead of both if API-key access must be disabled.
+MCP_HTTP_AUTH=both
+OAUTH_ISSUER=https://<magileads-authorization-server-issuer>
+OAUTH_MCP_RESOURCE=https://<your-public-mcp-domain>/mcp
+OAUTH_API_RESOURCE=https://<magileads-api-resource-audience>
+OAUTH_INTERNAL_CLIENT_ID=<token-exchange-client-id>
+OAUTH_INTERNAL_CLIENT_SECRET=<token-exchange-client-secret>
+MCP_ALLOW_API_KEY_QUERY=false
+```
+
+`OAUTH_MCP_RESOURCE` must be the **exact public MCP URL**, including `/mcp`
+(or the configured `MCP_HTTP_PATH`); it is the audience accepted by this server.
+`OAUTH_API_RESOURCE` is the **different** audience requested for tokens sent to
+the Magileads API. The authorization server must publish OAuth discovery/JWKS,
+support authorization code + PKCE for clients, and permit this internal client
+to exchange MCP-audience tokens for API-audience tokens. If the API's network
+base URL differs from `OAUTH_API_RESOURCE`, set `MAGILEADS_API_URL` too (when
+using the supplied Compose file, uncomment its `MAGILEADS_API_URL` environment
+line). OAuth modes fail at startup if a required value is missing.
+
+```bash
+docker compose up -d --build
+```
+
+On **Dokploy**: create an app from this repo, build the `Dockerfile`, set the
+selected profile's variables, attach a domain, and terminate TLS at Dokploy's
+reverse proxy. Point its upstream at container port `8080`. Keep
+`MCP_ALLOW_API_KEY_QUERY=false` unless a legacy client truly cannot set a
+header; query-string keys can leak through proxy logs. In `both` mode, clients
+using API keys send `X-API-Key`; `Authorization: Bearer` is reserved for OAuth.
+If Compose publishes host port `8080`, restrict direct public access to that
+port so clients reach the service through HTTPS.
 
 The image is Bun-based (`oven/bun`), runs `bun run src/http.ts`, listens on `8080`, runs as a
 non-root user, and declares a `HEALTHCHECK` against `/health`.
+
+After deployment, check `https://<your-public-mcp-domain>/health`. For OAuth,
+also check `/.well-known/oauth-protected-resource/mcp`; for API keys, make a
+real tool call (for example `get_account_overview`) using a test account's
+`X-API-Key`. A successful `tools/list` alone does **not** validate the key
+against Magileads.
 
 ## Connect to a Hermes Agent
 
 [Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp) supports
 remote HTTP MCP servers and discovers their tools automatically at startup.
 
-### Option 1 — dashboard (simplest)
-
-In the dashboard's **Add MCP server** form — each Hermes agent uses **its own** Magileads
-API key as the client key:
-
-| Field | Value |
-| --- | --- |
-| **Name** | `magileads` |
-| **Transport** | `HTTP/SSE` |
-| **URL** | `https://<your-domain>/mcp?api_key=<THIS_CLIENT_MAGILEADS_KEY>` |
-| **Environment** | *(leave empty — it applies to stdio servers only, not HTTP)* |
-
-The key goes in the URL because this form has no headers field.
-
-### Option 2 — config.yaml (cleaner, keeps the key out of the URL)
-
-```yaml
-mcp_servers:
-  magileads:
-    url: "https://<your-domain>/mcp"
-    headers:
-      X-Magileads-Api-Key: "<THIS_CLIENT_MAGILEADS_KEY>"
-```
-
-Each client's Magileads key never leaves that client's config — the server holds no
-per-client secrets, and routes every request to the account behind the key it was given.
-Hermes namespaces the tools as `magileads.<tool>` (or similar) once
-discovered.
+An OAuth-capable Hermes client can connect in `oauth` or `both` mode. A Hermes
+client that only supports static credentials can use `api_key` or `both` mode:
+set its MCP URL to `https://<your-domain>/mcp` and configure its own
+`X-API-Key` header. If it cannot set headers, URL keys require the
+explicit `MCP_ALLOW_API_KEY_QUERY=true` opt-in described above.
 
 ## Project structure
 
@@ -333,8 +409,13 @@ src/
 ├── endpoints.generated.ts   All OpenAPI operations except DELETE (generated)
 ├── server.ts                buildServer() — creates an McpServer with all tools registered
 ├── index.ts                 stdio entry point
-└── http.ts                  HTTP entry point (Streamable HTTP + bearer/query auth + /health)
+├── oauth/                  OAuth config, JWT verification, metadata, token exchange
+├── http-config.ts          HTTP authentication mode and key-in-URL opt-in
+├── log.ts                  Credential-redacting stderr logger
+└── http.ts                  OAuth/API-key Streamable HTTP + /health
 scripts/generate-endpoints.mjs  Regenerates endpoints.generated.ts from the OpenAPI spec
+scripts/tool-table.ts         Prints the declared tool/route/scope table
+tests/oauth.test.ts           Isolated OAuth and fake-API smoke tests
 Dockerfile                   Bun image (oven/bun); runs `bun run src/http.ts`
 docker-compose.yml           Standalone deployment
 ```
@@ -353,6 +434,8 @@ bun run typecheck      # tsc --noEmit (type safety)
 bun run dev            # run stdio
 bun run dev:http       # run HTTP
 bun run gen:endpoints  # refresh the all-except-DELETE API index from the OpenAPI spec
+bun run tools:table     # print the tool/route/scope table for the API team
+bun run test:oauth     # fake issuer, token exchange, and API smoke test
 bun run build          # optional: bundle to dist/ with `bun build`
 ```
 
@@ -361,11 +444,14 @@ transport — never `console.log` to stdout there.
 
 ## Troubleshooting
 
-- **Tools fail / `401` / `token_not_exist`** — the client's Magileads API key is missing or
-  wrong. Check the `?api_key=` in the URL (Option 1) or the `X-Magileads-Api-Key` header
-  (Option 2). A `401` with no tool error means no key was sent at all.
-- **Every client sees the same account** — they're all sending the same key (or none, falling
-  back to the server's default `MAGILEADS_API_KEY`). Each client must send its own key.
+- **HTTP `401` with `WWW-Authenticate`** — complete or repeat OAuth authorization.
+  Check issuer, resource audience, expiry, and token exchange at the backend.
+- **HTTP `401` without `WWW-Authenticate`** — check the client's Magileads API key.
+- **HTTP `403 insufficient_scope`** — request the indicated `mcp:read` or `mcp:write`
+  scope. A write-only token does not imply read access.
+- **Every HTTP client sees the same account** — check that the Magileads
+  authorization server issues distinct user tokens and that the token exchange
+  preserves each subject's account identity.
 - **`generate_*` seems to hang** — it's slow (~30–60 s), not stuck. Give clients a
   generous timeout.
 - **Extraction "not finished"** — it's asynchronous. Poll `get_contact_list_status`

@@ -209,7 +209,7 @@ excluded. The generated index lives in `src/endpoints.generated.ts`.
 - There is **no gate token** (`MCP_AUTH_TOKEN` was removed at v0.9.0). Each HTTP request
   carries the **calling client's own Magileads API key**, used for that request only, so
   different clients hit different Magileads accounts.
-- `http.ts:extractClientKey` reads the key from `X-Magileads-Api-Key`, `Authorization: Bearer
+- `http.ts:extractClientKey` reads the key from `X-API-Key`, `Authorization: Bearer
   <key>`, or `?api_key=` / `?token=` (the last two for URL-only dashboards). It then wraps the
   per-request server in `runWithAuth({apiKey})`.
 - `magileads.ts` carries the key via **`AsyncLocalStorage`** (`runWithAuth` / `currentApiKey`):
@@ -234,7 +234,7 @@ bun run build          # optional: bundle to dist/ via `bun build`
 
 ```bash
 # HTTP: start the server, then (send the client's Magileads key)
-curl -s -X POST 'localhost:8080/mcp' -H 'X-Magileads-Api-Key: KEY' \
+curl -s -X POST 'localhost:8080/mcp' -H 'X-API-Key: KEY' \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
@@ -258,7 +258,7 @@ live API.
 
 Register as a remote HTTP MCP server in Hermes (dashboard or `~/.hermes/config.yaml`). Each
 Hermes agent uses **its own** Magileads API key as the client key: `url:
-https://<your-domain>/mcp` with `?api_key=<key>` in the URL, or an `X-Magileads-Api-Key`
+https://<your-domain>/mcp` with `?api_key=<key>` in the URL, or an `X-API-Key`
 header in config.yaml. Hermes auto-discovers the tools.
 
 ## Conventions

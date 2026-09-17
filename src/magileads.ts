@@ -3,10 +3,10 @@
  *
  * Standalone Node module. Authentication is resolved per request, in this order:
  *
- *   1. A PER-REQUEST client API key (multi-tenant) — the HTTP transport puts each
- *      calling client's own Magileads key into an AsyncLocalStorage store, so every
- *      tool call runs against THAT client's account. Sent as `X-API-Key`, stateless.
- *   2. Otherwise the server's own ENV credentials (single-account fallback / stdio):
+ *   1. An HTTP request carries EITHER its client's API key (X-API-Key upstream)
+ *      OR an OAuth token exchanged for an API-audience bearer. Credentials are
+ *      isolated in AsyncLocalStorage and never fall back to the server account.
+ *   2. Stdio alone uses the server's ENV credentials:
  *      - MAGILEADS_API_KEY               -> `X-API-Key`
  *      - MAGILEADS_EMAIL + MAGILEADS_PASSWORD -> POST /users/authentication (JWT, auto-refreshed)
  *
@@ -19,13 +19,14 @@ const API_BASE = (process.env.MAGILEADS_API_BASE || "https://app.api-magileads.n
   /\/+$/,
   "",
 );
+const OAUTH_API_BASE = (process.env.MAGILEADS_API_URL || process.env.OAUTH_API_RESOURCE || API_BASE).replace(/\/+$/, "");
 const API_KEY = process.env.MAGILEADS_API_KEY?.trim() || "";
 const EMAIL = process.env.MAGILEADS_EMAIL?.trim() || "";
 const PASSWORD = process.env.MAGILEADS_PASSWORD || "";
 
 export type AuthMode = "apiKey" | "password" | "none";
 
-/** The ENV auth mode — the fallback used when no per-request client key is present. */
+/** The ENV auth mode used by stdio. */
 export function authMode(): AuthMode {
   if (API_KEY) return "apiKey";
   if (EMAIL && PASSWORD) return "password";
@@ -33,12 +34,12 @@ export function authMode(): AuthMode {
 }
 
 /**
- * Per-request Magileads credential (multi-tenant). The HTTP transport puts the
- * calling client's own API key here for the duration of a request, so every tool
- * runs against THAT client's Magileads account — no shared/global credential.
- * When absent (stdio, or a request with no key), auth falls back to the env vars.
+ * Per-request HTTP credential. The discriminant makes it impossible for one HTTP
+ * authentication method to silently fall back to another or to stdio env auth.
  */
-export type RequestAuth = { apiKey?: string };
+export type RequestAuth =
+  | { kind: "apiKey"; apiKey: string; onUnauthorized?: () => void }
+  | { kind: "oauth"; exchangedBearer?: string; onUnauthorized?: () => void };
 const authStore = new AsyncLocalStorage<RequestAuth>();
 
 /** Run `fn` with `auth` as the active per-request credential. */
@@ -48,7 +49,8 @@ export function runWithAuth<T>(auth: RequestAuth, fn: () => T): T {
 
 /** The per-request client API key for the current async context, if any. */
 function currentApiKey(): string | undefined {
-  const k = authStore.getStore()?.apiKey;
+  const auth = authStore.getStore();
+  const k = auth?.kind === "apiKey" ? auth.apiKey : undefined;
   return k && k.trim() ? k.trim() : undefined;
 }
 
@@ -152,18 +154,23 @@ async function refresh(): Promise<void> {
 
 /** Return the auth headers for the current request, logging in / refreshing as needed. */
 async function authHeaders(): Promise<Record<string, string>> {
-  // Multi-tenant: a per-request client key wins and is sent as-is (stateless — no JWT cache).
-  const perReq = currentApiKey();
-  if (perReq) return { "X-API-Key": perReq };
+  const requestAuth = authStore.getStore();
+  if (requestAuth?.kind === "oauth") {
+    if (requestAuth.exchangedBearer) return { Authorization: `Bearer ${requestAuth.exchangedBearer}` };
+    throw new MagileadsError("No exchanged API token for this tool call.", 401, "no_exchanged_token");
+  }
+  if (requestAuth?.kind === "apiKey") {
+    const key = currentApiKey();
+    if (key) return { "X-API-Key": key };
+    throw new MagileadsError("No API key for this tool call.", 401, "no_api_key");
+  }
 
   // Fall back to the server's own env credentials (single-account / stdio).
   const mode = authMode();
   if (mode === "apiKey") return { "X-API-Key": API_KEY };
   if (mode === "none") {
     throw new MagileadsError(
-      "No Magileads credentials for this request. Send the client's Magileads API key " +
-        "(X-Magileads-Api-Key header, Authorization: Bearer <key>, or ?api_key=<key>), " +
-        "or configure MAGILEADS_API_KEY / MAGILEADS_EMAIL+PASSWORD on the server.",
+      "No Magileads credentials for stdio. Configure MAGILEADS_API_KEY or MAGILEADS_EMAIL+PASSWORD.",
       401,
       "no_credentials",
     );
@@ -182,7 +189,8 @@ async function authHeaders(): Promise<Record<string, string>> {
 
 async function api<T>(path: string, init: RequestInit = {}, retryOn401 = true): Promise<T> {
   const headers = await authHeaders();
-  const res = await fetch(`${API_BASE}${path}`, {
+  const base = authStore.getStore()?.kind === "oauth" ? OAUTH_API_BASE : API_BASE;
+  const res = await fetch(`${base}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
@@ -194,7 +202,10 @@ async function api<T>(path: string, init: RequestInit = {}, retryOn401 = true): 
 
   // A mid-flight token expiry (env password mode only) → re-auth once and retry.
   // Never for a per-request client key: a 401 there means the client's key is bad.
-  if (res.status === 401 && !currentApiKey() && authMode() === "password" && retryOn401) {
+  if (res.status === 401 && authStore.getStore()) {
+    authStore.getStore()?.onUnauthorized?.();
+  }
+  if (res.status === 401 && !authStore.getStore() && authMode() === "password" && retryOn401) {
     accessToken = "";
     expiresAt = 0;
     return api<T>(path, init, false);
