@@ -4,7 +4,7 @@ import http from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildServer } from "./server.js";
 import { runWithAuth } from "./magileads.js";
-import { accessForTool, toolAccessTable } from "./tools.js";
+import { accessForTool, scopesForTool, toolAccessTable } from "./tools.js";
 import { log } from "./log.js";
 import { loadHttpConfig, type HttpConfig } from "./http-config.js";
 import { oauthConfig } from "./oauth/config.js";
@@ -158,12 +158,16 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
   }
 
   const access = name ? accessForTool(name) : undefined;
-  if (access && caller && !caller.scopes.includes(access.scope)) return sendChallenge(res, 403, access.scope);
+  const requiredScopes = access ? scopesForTool(access) : [];
+  const scopeValue = requiredScopes.join(" ");
+  if (access && caller && !requiredScopes.every((scope) => caller.scopes.includes(scope))) {
+    return sendChallenge(res, 403, scopeValue);
+  }
 
   let exchangedBearer: string | undefined;
   if (access && credential.kind === "oauth") {
     try {
-      exchangedBearer = await exchangeToken(credential.bearer, access.scope);
+      exchangedBearer = await exchangeToken(credential.bearer, requiredScopes);
     } catch (error) {
       if (error instanceof ReauthenticationRequired) return sendChallenge(res, 401);
       log("error", "Token exchange unavailable", { error });
@@ -184,14 +188,14 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
       await server.connect(transport);
       await transport.handleRequest(req, res, body);
     });
-    if (apiUnauthorized && access && credential.kind === "oauth") invalidateExchange(credential.bearer, access.scope);
+    if (apiUnauthorized && access && credential.kind === "oauth") invalidateExchange(credential.bearer, requiredScopes);
     buffered?.finish(apiUnauthorized ? unauthorized : undefined);
   } catch (error) {
     buffered?.restore();
     log("error", "MCP request failed", { error });
     if (!res.headersSent) {
       if (apiUnauthorized) {
-        if (access && credential.kind === "oauth") invalidateExchange(credential.bearer, access.scope);
+        if (access && credential.kind === "oauth") invalidateExchange(credential.bearer, requiredScopes);
         unauthorized();
       }
       else json(res, 500, { jsonrpc: "2.0", error: { code: -32603, message: "Internal error." }, id: null });

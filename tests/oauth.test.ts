@@ -19,11 +19,18 @@ const { publicKey, privateKey } = await generateKeyPair("RS256");
 const jwk = { ...(await exportJWK(publicKey)), kid: "smoke-key", alg: "RS256", use: "sig" };
 let issuer = "";
 let apiOrigin = "";
-let exchangeMode: "normal" | "invalid_grant" | "unauthorized" = "normal";
+let exchangeMode: "normal" | "invalid_grant" | "unauthorized" | "reordered_scopes" | "broader_scopes" = "normal";
 let apiMode: "normal" | "unauthorized" = "normal";
 const exchanges: { subject: string; scope: string; resource: string; authorization: string }[] = [];
 const apiBearers: string[] = [];
 const apiKeys: string[] = [];
+const businessCalls: { method: string; path: string; bearer: string }[] = [];
+
+function hasExchangedScope(req: http.IncomingMessage, scope: string): boolean {
+  const bearer = req.headers.authorization;
+  if (typeof bearer !== "string" || !bearer.startsWith("Bearer exchanged-")) return false;
+  return bearer.slice("Bearer exchanged-".length).replaceAll("+", " ").split(" ").includes(scope);
+}
 
 const authorization = await start((req, res) => {
   if (req.url === "/.well-known/oauth-authorization-server") {
@@ -46,7 +53,23 @@ const api = await start(async (req, res) => {
     });
     if (exchangeMode === "invalid_grant") return respond(res, 400, { error: "invalid_grant" });
     if (exchangeMode === "unauthorized") return respond(res, 401, { error: "invalid_client" });
-    return respond(res, 200, { access_token: `exchanged-${body.get("scope")}`, expires_in: 300, scope: body.get("scope") });
+    const requestedScope = body.get("scope") || "";
+    const responseScope = exchangeMode === "reordered_scopes"
+      ? requestedScope.split(" ").reverse().join(" ")
+      : exchangeMode === "broader_scopes" ? `${requestedScope} unrelated:scope` : requestedScope;
+    return respond(res, 200, { access_token: `exchanged-${requestedScope.replaceAll(" ", "+")}`, expires_in: 300, scope: responseScope });
+  }
+  if (["/contact-lists/42", "/data-fields", "/contact-lists/42/contact",
+    "/targeting/google/generate-maps-search-urls", "/targeting/google/extract-maps-search"].includes(req.url || "")) {
+    businessCalls.push({ method: req.method || "", path: req.url || "", bearer: req.headers.authorization || "" });
+    const needed = req.url === "/contact-lists/42/contact" || req.url === "/targeting/google/extract-maps-search"
+      ? "mcp:write" : "mcp:read";
+    if (!hasExchangedScope(req, needed)) return respond(res, 401, { state_message: "insufficient_scope" });
+    if (req.url === "/contact-lists/42") return respond(res, 200, { contact_list_profile: { id: 42, name: "Test list" } });
+    if (req.url === "/data-fields") return respond(res, 200, { data_fields_list: [{ id: 1, identifier: "email", name: "Email" }] });
+    if (req.url === "/contact-lists/42/contact") return respond(res, 200, { state: true, contacts_added: 1 });
+    if (req.url === "/targeting/google/generate-maps-search-urls") return respond(res, 200, { google_maps_search_urls: ["https://maps.google.com/search?q=plumber"] });
+    return respond(res, 200, { contact_list_id: 42 });
   }
   if (req.url === "/users/me") {
     apiBearers.push(req.headers.authorization || "");
@@ -78,7 +101,7 @@ await new Promise<void>((resolve) => reservation.server.close(() => resolve()));
 process.env.OAUTH_MCP_RESOURCE = `http://127.0.0.1:${resourcePort}/mcp`;
 
 const { createHttpServer } = await import("../src/http.js");
-const { toolAccessTable } = await import("../src/tools.js");
+const { scopesForTool, scopeForRoute, toolAccessTable } = await import("../src/tools.js");
 const { clearExchangeCache } = await import("../src/oauth/exchange.js");
 const { loadOAuthConfig } = await import("../src/oauth/config.js");
 const { loadHttpConfig } = await import("../src/http-config.js");
@@ -128,6 +151,15 @@ test("metadata is available at both RFC and bare paths with CORS", async () => {
     });
     expect((await fetch(`${mcpOrigin}${path}`, { method: "OPTIONS" })).status).toBe(204);
   }
+});
+
+test("tool declarations compute route-scope unions for composite tools", () => {
+  const table = toolAccessTable();
+  expect(scopesForTool(table.get("add_contact_to_list")!)).toEqual(["mcp:read", "mcp:write"]);
+  expect(scopesForTool(table.get("run_google_maps_targeting")!)).toEqual(["mcp:read", "mcp:write"]);
+  expect(scopesForTool(table.get("extract_maps_search")!)).toEqual(["mcp:write"]);
+  expect(scopesForTool(table.get("search_contacts")!)).toEqual(["mcp:read"]);
+  expect(scopeForRoute(table.get("run_google_maps_targeting")!, "POST /targeting/google/generate-maps-search-urls")).toBe("mcp:read");
 });
 
 test("missing token receives discoverable 401 challenge", async () => {
@@ -201,23 +233,87 @@ test("write tool with read bearer gives 403 and required scope", async () => {
   const response = await rpc("tools/call", await token("mcp:read"), { name: "add_contact_to_list", arguments: {} });
   expect(response.status).toBe(403);
   expect(response.headers.get("www-authenticate")).toContain('error="insufficient_scope"');
-  expect(response.headers.get("www-authenticate")).toContain('scope="mcp:write"');
+  expect(response.headers.get("www-authenticate")).toContain('scope="mcp:read mcp:write"');
 });
 
 test("write scope does not imply read scope", async () => {
   const listed = await rpc("tools/list", await token("mcp:write"));
   expect(listed.status).toBe(200);
   const names = (await listed.json() as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
-  expect(names).toContain("add_contact_to_list");
+  expect(names).toContain("extract_maps_search");
+  expect(names).not.toContain("add_contact_to_list");
+  expect(names).not.toContain("run_google_maps_targeting");
   expect(names).not.toContain("get_account_overview");
+  const response = await rpc("tools/call", await token("mcp:write"), { name: "add_contact_to_list", arguments: {} });
+  expect(response.status).toBe(403);
+  expect(response.headers.get("www-authenticate")).toContain('scope="mcp:read mcp:write"');
 });
 
-test("a write call exchanges only write scope", async () => {
+test("contact import exchanges read and write scopes and completes its read-then-write API calls", async () => {
   const caller = await token("mcp:read mcp:write");
-  const response = await rpc("tools/call", caller, { name: "add_contact_to_list", arguments: {} });
-  expect(response.status).toBe(200); // The SDK rejects the intentionally incomplete tool arguments.
-  expect(exchanges.at(-1)?.scope).toBe("mcp:write");
+  const listed = await rpc("tools/list", caller);
+  const names = (await listed.json() as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
+  expect(names).toContain("add_contact_to_list");
+  const response = await rpc("tools/call", caller, {
+    name: "add_contact_to_list",
+    arguments: { contact_list_id: 42, properties: [{ field: "email", value: "test@example.com" }], confirm: true },
+  });
+  expect(response.status).toBe(200);
+  const result = (await response.json() as { result: { isError?: boolean; content: { text: string }[] } }).result;
+  expect(result.isError).not.toBe(true);
+  expect(JSON.parse(result.content[0].text).executed).toBe(true);
+  expect(exchanges.at(-1)?.scope).toBe("mcp:read mcp:write");
   expect(exchanges.at(-1)?.subject).toBe(caller);
+  expect(businessCalls.slice(-3).map(({ method, path }) => `${method} ${path}`).sort()).toEqual([
+    "GET /contact-lists/42", "GET /data-fields", "POST /contact-lists/42/contact",
+  ]);
+  expect(businessCalls.slice(-3).every(({ bearer }) => bearer === "Bearer exchanged-mcp:read+mcp:write")).toBe(true);
+});
+
+test("Google Maps composite exchanges both scopes; standalone extract needs only write", async () => {
+  const caller = await token("mcp:read mcp:write");
+  const composite = await rpc("tools/call", caller, {
+    name: "run_google_maps_targeting", arguments: { search: "plumber", contact_list_name: "Plumbers" },
+  });
+  expect(composite.status).toBe(200);
+  const compositeResult = (await composite.json() as { result: { isError?: boolean; content: { text: string }[] } }).result;
+  expect(compositeResult.isError).not.toBe(true);
+  expect(JSON.parse(compositeResult.content[0].text).contact_list_id).toBe(42);
+  expect(exchanges.at(-1)?.scope).toBe("mcp:read mcp:write");
+  expect(businessCalls.slice(-2).map(({ method, path }) => `${method} ${path}`)).toEqual([
+    "POST /targeting/google/generate-maps-search-urls", "POST /targeting/google/extract-maps-search",
+  ]);
+
+  const standalone = await rpc("tools/call", caller, {
+    name: "extract_maps_search",
+    arguments: { google_maps_search_urls: ["https://maps.google.com/search?q=plumber"], contact_list_name: "Plumbers" },
+  });
+  expect(standalone.status).toBe(200);
+  expect(exchanges.at(-1)?.scope).toBe("mcp:write");
+});
+
+test("token exchange accepts reordered scopes but refuses an unexpected extra scope", async () => {
+  const caller = await token("mcp:read mcp:write");
+  try {
+    exchangeMode = "reordered_scopes";
+    const accepted = await rpc("tools/call", caller, {
+      name: "add_contact_to_list",
+      arguments: { contact_list_id: 42, properties: [{ field: "email", value: "test@example.com" }] },
+    });
+    expect(accepted.status).toBe(200);
+    expect((await accepted.json() as { result: { isError?: boolean } }).result.isError).not.toBe(true);
+
+    exchangeMode = "broader_scopes";
+    clearExchangeCache();
+    const refused = await rpc("tools/call", caller, {
+      name: "add_contact_to_list",
+      arguments: { contact_list_id: 42, properties: [{ field: "email", value: "test@example.com" }] },
+    });
+    expect(refused.status).toBe(502);
+  } finally {
+    exchangeMode = "normal";
+    clearExchangeCache();
+  }
 });
 
 test("invalid_grant and API 401 both give fresh challenges", async () => {

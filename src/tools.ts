@@ -32,7 +32,7 @@ import {
   type ContactsPage,
 } from "./magileads.js";
 import { MAGILEADS_ENDPOINTS, type EndpointDef } from "./endpoints.generated.js";
-import type { Scope } from "./oauth/scopes.js";
+import { SCOPES, type Scope } from "./oauth/scopes.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -590,9 +590,26 @@ function contactsView(
   };
 }
 
-type ToolAccess = { scope: Scope; routes: readonly string[] };
+type ToolAccess = {
+  scope: Scope;
+  routes: readonly string[];
+  /** For a non-GET route whose API permission differs from the tool's primary scope. */
+  routeScopes?: Readonly<Record<string, Scope>>;
+};
 const catalog = new Map<string, ToolAccess>();
 let catalogReady = false;
+
+/** API GET routes are reads; non-GET routes use the declared tool scope unless overridden. */
+export function scopeForRoute(access: ToolAccess, route: string): Scope {
+  if (!access.routes.includes(route)) throw new Error(`Undeclared API route: ${route}`);
+  return access.routeScopes?.[route] ?? (route.startsWith("GET ") ? "mcp:read" : access.scope);
+}
+
+/** The complete, deterministic scope union needed for an API token exchange. */
+export function scopesForTool(access: ToolAccess): Scope[] {
+  const used = new Set(access.routes.map((route) => scopeForRoute(access, route)));
+  return SCOPES.filter((scope) => used.has(scope));
+}
 
 /** This is the source of truth for HTTP preflight and the generated API table. */
 export function toolAccessTable(): ReadonlyMap<string, ToolAccess> {
@@ -610,6 +627,10 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   const register = (access: ToolAccess): McpServer["registerTool"] =>
     ((name: string, ...args: unknown[]) => {
       if (access.routes.length === 0) throw new Error(`Missing API routes for tool: ${name}`);
+      if (access.routeScopes && Object.keys(access.routeScopes).some((route) => !access.routes.includes(route))) {
+        throw new Error(`Scope override references an undeclared route: ${name}`);
+      }
+      if (!scopesForTool(access).includes(access.scope)) throw new Error(`Tool scope does not match its API routes: ${name}`);
       if (seen.has(name)) throw new Error(`Duplicate tool registration: ${name}`);
       seen.add(name);
       const previous = catalog.get(name);
@@ -617,7 +638,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         throw new Error(`Conflicting tool access declaration: ${name}`);
       }
       catalog.set(name, access);
-      if (allowedScopes && !allowedScopes.includes(access.scope)) return {};
+      if (allowedScopes && !scopesForTool(access).every((scope) => allowedScopes.includes(scope))) return {};
       return (target.registerTool as (...values: unknown[]) => unknown).call(target, name, ...args);
     }) as McpServer["registerTool"];
 
@@ -731,7 +752,11 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
     },
   );
 
-  register({ scope: "mcp:write", routes: ["POST /targeting/google/generate-maps-search-urls", "POST /targeting/google/extract-maps-search"] })(
+  register({
+    scope: "mcp:write",
+    routes: ["POST /targeting/google/generate-maps-search-urls", "POST /targeting/google/extract-maps-search"],
+    routeScopes: { "POST /targeting/google/generate-maps-search-urls": "mcp:read" },
+  })(
     "run_google_maps_targeting",
     {
       title: "Run a full Google Maps targeting (generate + extract)",

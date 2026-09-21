@@ -1,6 +1,7 @@
-import { toolAccessTable } from "../src/tools.js";
+import { scopeForRoute, scopesForTool, toolAccessTable } from "../src/tools.js";
 
-process.stdout.write("| tool | route | scope |\n| --- | --- | --- |\n");
+process.stdout.write("| tool | route (API scope) | exchange scopes |\n| --- | --- | --- |\n");
 for (const [tool, access] of toolAccessTable()) {
-  process.stdout.write(`| ${tool} | ${access.routes.join("<br>").replace(/\|/g, "\\|")} | ${access.scope} |\n`);
+  const routes = access.routes.map((route) => `${route.replace(/\|/g, "\\|")} (${scopeForRoute(access, route)})`).join("<br>");
+  process.stdout.write(`| ${tool} | ${routes} | ${scopesForTool(access).join(" ")} |\n`);
 }

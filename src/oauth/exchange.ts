@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { oauthConfig } from "./config.js";
-import type { Scope } from "./scopes.js";
+import { SCOPES, type Scope } from "./scopes.js";
 import { log } from "../log.js";
 
 type Cached = { accessToken: string; expiresAt: number };
@@ -18,16 +18,23 @@ export function clearExchangeCache(): void {
   cache.clear();
 }
 
-function cacheKey(subjectToken: string, scope: Scope): string {
-  return createHash("sha256").update(scope).update("\0").update(subjectToken).digest("base64url");
+function scopeValue(scopes: readonly Scope[]): string {
+  const value = SCOPES.filter((scope) => scopes.includes(scope)).join(" ");
+  if (!value) throw new Error("Token exchange requires at least one scope.");
+  return value;
 }
 
-export function invalidateExchange(subjectToken: string, scope: Scope): void {
-  cache.delete(cacheKey(subjectToken, scope));
+function cacheKey(subjectToken: string, scopes: readonly Scope[]): string {
+  return createHash("sha256").update(scopeValue(scopes)).update("\0").update(subjectToken).digest("base64url");
 }
 
-export async function exchangeToken(subjectToken: string, scope: Scope): Promise<string> {
-  const key = cacheKey(subjectToken, scope);
+export function invalidateExchange(subjectToken: string, scopes: readonly Scope[]): void {
+  cache.delete(cacheKey(subjectToken, scopes));
+}
+
+export async function exchangeToken(subjectToken: string, scopes: readonly Scope[]): Promise<string> {
+  const requestedScope = scopeValue(scopes);
+  const key = cacheKey(subjectToken, scopes);
   const cached = cache.get(key);
   if (cached && cached.expiresAt - EARLY_MS > Date.now()) return cached.accessToken;
   cache.delete(key);
@@ -38,7 +45,7 @@ export async function exchangeToken(subjectToken: string, scope: Scope): Promise
     subject_token: subjectToken,
     subject_token_type: "urn:ietf:params:oauth:token-type:access_token",
     resource: config.apiResource,
-    scope,
+    scope: requestedScope,
   });
   const credentials = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString("base64");
   const response = await fetch(`${config.apiUrl}/oauth/token`, {
@@ -68,7 +75,10 @@ export async function exchangeToken(subjectToken: string, scope: Scope): Promise
     throw new Error("Token exchange failed.");
   }
   // The authorization server must not silently grant a broader or different scope.
-  if (typeof payload.scope === "string" && payload.scope.trim() !== scope) {
+  const returnedScopes = typeof payload.scope === "string" ? payload.scope.trim().split(/\s+/) : undefined;
+  if (returnedScopes &&
+      (new Set(returnedScopes).size !== scopes.length ||
+       scopes.some((scope) => !returnedScopes.includes(scope)))) {
     log("error", "Token exchange returned an unexpected scope");
     throw new Error("Token exchange returned an unexpected scope.");
   }

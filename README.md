@@ -250,9 +250,12 @@ support when OAuth is enabled.
 
 Before a `tools/call`, the MCP exchanges the caller's bearer at the Magileads
 `/oauth/token` endpoint for a new bearer addressed to `OAUTH_API_RESOURCE` and
-limited to **exactly one** tool scope. The caller's bearer is never forwarded to
-the API. `tools/list` offers only tools covered by the caller's scopes; there is
-no implicit write-to-read scope inheritance. A missing tool scope returns `403`
+limited to the **union of scopes required by all API routes the tool calls**.
+For example, `add_contact_to_list` and `run_google_maps_targeting` request
+`mcp:read mcp:write`, while a read-only tool requests only `mcp:read`.
+The caller's bearer is never forwarded to the API. `tools/list` offers only
+tools covered by **all** of the caller's required scopes; there is no implicit
+write-to-read scope inheritance. A missing required scope returns `403`
 with `insufficient_scope`; an expired/revoked token or API `401` returns a fresh
 `401` challenge.
 
@@ -434,7 +437,7 @@ bun run typecheck      # tsc --noEmit (type safety)
 bun run dev            # run stdio
 bun run dev:http       # run HTTP
 bun run gen:endpoints  # refresh the all-except-DELETE API index from the OpenAPI spec
-bun run tools:table     # print the tool/route/scope table for the API team
+bun run tools:table     # print each route's API scope and each tool's exchange scopes
 bun run test:oauth     # fake issuer, token exchange, and API smoke test
 bun run build          # optional: bundle to dist/ with `bun build`
 ```

@@ -1,6 +1,6 @@
 import type http from "node:http";
 import { oauthConfig } from "./config.js";
-import { SCOPES, type Scope } from "./scopes.js";
+import { SCOPES } from "./scopes.js";
 
 export function protectedResourceMetadata(): object {
   const config = oauthConfig();
@@ -16,7 +16,7 @@ function quoted(value: string): string {
   return value.replace(/[\\"\r\n]/g, "_");
 }
 
-export function challengeHeader(error: "invalid_token" | "insufficient_scope", scope?: Scope): string {
+export function challengeHeader(error: "invalid_token" | "insufficient_scope", scope?: string): string {
   const parts = [
     `Bearer resource_metadata="${quoted(oauthConfig().metadataUrl)}"`,
     `error="${error}"`,
@@ -26,7 +26,7 @@ export function challengeHeader(error: "invalid_token" | "insufficient_scope", s
   return parts.join(", ");
 }
 
-export function sendChallenge(res: http.ServerResponse, status: 401 | 403, scope?: Scope): void {
+export function sendChallenge(res: http.ServerResponse, status: 401 | 403, scope?: string): void {
   const error = status === 401 ? "invalid_token" : "insufficient_scope";
   const body = JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: status === 401 ? "Authorization required." : "Insufficient scope." }, id: null });
   res.writeHead(status, {
