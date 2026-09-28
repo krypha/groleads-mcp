@@ -1,5 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
 async function start(handler: http.RequestListener): Promise<{ server: http.Server; origin: string }> {
@@ -19,9 +20,16 @@ const { publicKey, privateKey } = await generateKeyPair("RS256");
 const jwk = { ...(await exportJWK(publicKey)), kid: "smoke-key", alg: "RS256", use: "sig" };
 let issuer = "";
 let apiOrigin = "";
-let exchangeMode: "normal" | "invalid_grant" | "unauthorized" | "reordered_scopes" | "broader_scopes" = "normal";
+let exchangeMode: "normal" | "invalid_grant" | "unauthorized" | "reordered_scopes" | "broader_scopes" |
+  "unavailable" | "rate_limited" | "invalid_type" | "invalid_issued_type" | "missing_expires" |
+  "expired" | "invalid_scope_type" | "omitted_optional" | "redirect" = "normal";
+let discoveryMode: "normal" | "unavailable" | "not_found" | "mismatched_issuer" | "unsafe_endpoint" | "oidc_only" = "normal";
+let jwksUnavailable = false;
 let apiMode: "normal" | "unauthorized" = "normal";
-const exchanges: { subject: string; scope: string; resource: string; authorization: string }[] = [];
+const exchanges: {
+  subject: string; scope: string; resource: string; authorization: string;
+  grant: string; subjectType: string; requestedType: string; contentType: string;
+}[] = [];
 const apiBearers: string[] = [];
 const apiKeys: string[] = [];
 const businessCalls: { method: string; path: string; bearer: string }[] = [];
@@ -32,15 +40,27 @@ function hasExchangedScope(req: http.IncomingMessage, scope: string): boolean {
   return bearer.slice("Bearer exchanged-".length).replaceAll("+", " ").split(" ").includes(scope);
 }
 
-const authorization = await start((req, res) => {
-  if (req.url === "/.well-known/oauth-authorization-server") {
-    respond(res, 200, { issuer, jwks_uri: `${issuer}/jwks`, token_endpoint: `${apiOrigin}/oauth/token` });
-  } else if (req.url === "/jwks") respond(res, 200, { keys: [jwk] });
-  else respond(res, 404, {});
-});
-issuer = authorization.origin;
-
-const api = await start(async (req, res) => {
+// Authorization and business API live on DIFFERENT origins. The MCP must use
+// the discovered token_endpoint, not assume it lives at the business API base.
+const authorization = await start(async (req, res) => {
+  if (req.url === "/.well-known/oauth-authorization-server/tenant" ||
+      req.url === "/tenant/.well-known/openid-configuration") {
+    if (discoveryMode === "not_found" || (discoveryMode === "oidc_only" &&
+        req.url === "/.well-known/oauth-authorization-server/tenant")) return respond(res, 404, {});
+    if (discoveryMode === "unavailable") {
+      res.setHeader("Retry-After", "10");
+      return respond(res, 503, { error: "temporarily_unavailable" });
+    }
+    return respond(res, 200, {
+      issuer: discoveryMode === "mismatched_issuer" ? `${issuer}/wrong` : issuer,
+      jwks_uri: `${new URL(issuer).origin}/oauth/jwks.json`,
+      token_endpoint: discoveryMode === "unsafe_endpoint" ? "http://untrusted.example/oauth/token" : `${new URL(issuer).origin}/oauth/token`,
+      token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
+    });
+  }
+  if (req.url === "/oauth/jwks.json") {
+    return respond(res, jwksUnavailable ? 503 : 200, jwksUnavailable ? {} : { keys: [jwk] });
+  }
   if (req.url === "/oauth/token" && req.method === "POST") {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -50,14 +70,49 @@ const api = await start(async (req, res) => {
       scope: body.get("scope") || "",
       resource: body.get("resource") || "",
       authorization: req.headers.authorization || "",
+      grant: body.get("grant_type") || "",
+      subjectType: body.get("subject_token_type") || "",
+      requestedType: body.get("requested_token_type") || "",
+      contentType: req.headers["content-type"] || "",
     });
     if (exchangeMode === "invalid_grant") return respond(res, 400, { error: "invalid_grant" });
     if (exchangeMode === "unauthorized") return respond(res, 401, { error: "invalid_client" });
+    if (exchangeMode === "unavailable" || exchangeMode === "rate_limited") {
+      res.setHeader("Retry-After", "10");
+      return respond(res, exchangeMode === "rate_limited" ? 429 : 503, { error: "temporarily_unavailable" });
+    }
+    if (exchangeMode === "redirect") {
+      res.writeHead(307, { Location: `${apiOrigin}/oauth/token` });
+      return res.end();
+    }
     const requestedScope = body.get("scope") || "";
     const responseScope = exchangeMode === "reordered_scopes"
       ? requestedScope.split(" ").reverse().join(" ")
       : exchangeMode === "broader_scopes" ? `${requestedScope} unrelated:scope` : requestedScope;
-    return respond(res, 200, { access_token: `exchanged-${requestedScope.replaceAll(" ", "+")}`, expires_in: 300, scope: responseScope });
+    const payload: Record<string, unknown> = {
+      access_token: `exchanged-${requestedScope.replaceAll(" ", "+")}`,
+      token_type: exchangeMode === "invalid_type" ? "N_A" : "Bearer",
+      issued_token_type: exchangeMode === "invalid_issued_type"
+        ? "urn:ietf:params:oauth:token-type:refresh_token" : "urn:ietf:params:oauth:token-type:access_token",
+      expires_in: exchangeMode === "expired" ? 0 : 300,
+      scope: exchangeMode === "invalid_scope_type" ? [requestedScope] : responseScope,
+    };
+    if (exchangeMode === "missing_expires") delete payload.expires_in;
+    if (exchangeMode === "omitted_optional") {
+      delete payload.issued_token_type;
+      delete payload.scope;
+    }
+    return respond(res, 200, payload);
+  }
+  respond(res, 404, {});
+});
+issuer = `${authorization.origin}/tenant`;
+
+let misplacedExchanges = 0;
+const api = await start(async (req, res) => {
+  if (req.url === "/oauth/token") {
+    misplacedExchanges++;
+    return respond(res, 404, {});
   }
   if (["/contact-lists/42", "/data-fields", "/contact-lists/42/contact",
     "/targeting/google/generate-maps-search-urls", "/targeting/google/extract-maps-search"].includes(req.url || "")) {
@@ -89,10 +144,12 @@ apiOrigin = api.origin;
 process.env.OAUTH_ISSUER = issuer;
 process.env.OAUTH_MCP_RESOURCE = "http://127.0.0.1:1/mcp";
 process.env.OAUTH_API_RESOURCE = apiOrigin;
-process.env.OAUTH_INTERNAL_CLIENT_ID = "test-client";
-process.env.OAUTH_INTERNAL_CLIENT_SECRET = "test-secret";
+process.env.OAUTH_INTERNAL_CLIENT_ID = crypto.randomUUID();
+process.env.OAUTH_INTERNAL_CLIENT_SECRET = crypto.randomUUID();
 process.env.MCP_HTTP_PATH = "/mcp";
 process.env.MAGILEADS_API_BASE = apiOrigin;
+delete process.env.MAGILEADS_API_URL;
+delete process.env.OAUTH_JWKS_URI;
 
 // The resource URL must be the actual server address; choose a free port first.
 const reservation = await start((_req, res) => respond(res, 503, {}));
@@ -101,8 +158,10 @@ await new Promise<void>((resolve) => reservation.server.close(() => resolve()));
 process.env.OAUTH_MCP_RESOURCE = `http://127.0.0.1:${resourcePort}/mcp`;
 
 const { createHttpServer } = await import("../src/http.js");
-const { scopesForTool, scopeForRoute, toolAccessTable } = await import("../src/tools.js");
-const { clearExchangeCache } = await import("../src/oauth/exchange.js");
+const { isToolExposed, scopesForTool, scopeForRoute, toolAccessTable } = await import("../src/tools.js");
+const { basicClientAuthorization, clearExchangeCache } = await import("../src/oauth/exchange.js");
+const { discoveryUrls, oauthEndpoint, resetDiscovery } = await import("../src/oauth/discovery.js");
+const { resetKeySet } = await import("../src/oauth/verify.js");
 const { loadOAuthConfig } = await import("../src/oauth/config.js");
 const { loadHttpConfig } = await import("../src/http-config.js");
 const { log, redact, redactString } = await import("../src/log.js");
@@ -162,6 +221,27 @@ test("tool declarations compute route-scope unions for composite tools", () => {
   expect(scopeForRoute(table.get("run_google_maps_targeting")!, "POST /targeting/google/generate-maps-search-urls")).toBe("mcp:read");
 });
 
+test("public plugin tool annotations match private-account and open-world behavior", async () => {
+  const response = await rpc("tools/list", await token("mcp:read mcp:write"));
+  expect(response.status).toBe(200);
+  const payload = await response.json() as {
+    result: { tools: { name: string; annotations: {
+      readOnlyHint: boolean; destructiveHint: boolean; openWorldHint: boolean;
+    } }[] };
+  };
+  const tools = payload.result.tools;
+  expect(tools).toHaveLength(25);
+  const openWorld = new Set([
+    "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting", "magileads_request",
+  ]);
+  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request"]);
+  for (const tool of tools) {
+    expect(tool.annotations.openWorldHint).toBe(openWorld.has(tool.name));
+    expect(tool.annotations.readOnlyHint).toBe(!writes.has(tool.name));
+    expect(tool.annotations.destructiveHint).toBe(tool.name === "magileads_request");
+  }
+});
+
 test("missing token receives discoverable 401 challenge", async () => {
   const response = await rpc("tools/list");
   expect(response.status).toBe(401);
@@ -174,12 +254,141 @@ test("missing OAuth configuration fails closed", () => {
   expect(() => loadOAuthConfig({ ...process.env, OAUTH_MCP_RESOURCE: "" })).toThrow("OAUTH_MCP_RESOURCE");
 });
 
+test("OAuth discovery uses RFC 8414 issuer paths and safe endpoint URLs", () => {
+  expect(discoveryUrls("https://auth.example/tenant/")).toEqual([
+    "https://auth.example/.well-known/oauth-authorization-server/tenant",
+    "https://auth.example/tenant/.well-known/openid-configuration",
+  ]);
+  expect(discoveryUrls("https://auth.example")[0]).toBe("https://auth.example/.well-known/oauth-authorization-server");
+  expect(() => oauthEndpoint("http://auth.example/oauth/token")).toThrow("HTTPS");
+  expect(() => oauthEndpoint("https://user:secret@auth.example/oauth/token")).toThrow("credentials");
+  expect(() => oauthEndpoint("https://auth.example/oauth/token#fragment")).toThrow("fragment");
+  expect(oauthEndpoint("http://127.0.0.1/oauth/token").hostname).toBe("127.0.0.1");
+});
+
+test("client_secret_basic form-encodes reserved characters", () => {
+  const clientId = `${crypto.randomUUID()}: /+`;
+  const clientSecret = `${crypto.randomUUID()}: /+`;
+  const header = basicClientAuthorization(clientId, clientSecret);
+  const components = Buffer.from(header.slice("Basic ".length), "base64").toString().split(":");
+  expect(components).toHaveLength(2);
+  expect(components[0]).toContain("%3A+%2F%2B");
+  expect(new URLSearchParams(`value=${components[0]}`).get("value")).toBe(clientId);
+  expect(new URLSearchParams(`value=${components[1]}`).get("value")).toBe(clientSecret);
+});
+
+async function publicPreflight(): Promise<{ code: number | null; output: string }> {
+  const child = spawn(process.execPath, ["run", "scripts/check-oauth.ts"], {
+    env: { ...process.env, OAUTH_ISSUER: issuer, OAUTH_MCP_RESOURCE: mcpOrigin + "/mcp" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += String(chunk); });
+  child.stderr.on("data", (chunk) => { output += String(chunk); });
+  return new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, output }));
+  });
+}
+
+test("public deployment preflight validates metadata without token exchange or account calls", async () => {
+  const beforeExchanges = exchanges.length;
+  const beforeBusinessCalls = businessCalls.length;
+  const result = await publicPreflight();
+  expect(result.code).toBe(0);
+  expect(result.output).toContain("Public OAuth checks passed");
+  expect(result.output).not.toContain(process.env.OAUTH_INTERNAL_CLIENT_SECRET!);
+  expect(exchanges.length).toBe(beforeExchanges);
+  expect(businessCalls.length).toBe(beforeBusinessCalls);
+  try {
+    discoveryMode = "unavailable";
+    const failed = await publicPreflight();
+    expect(failed.code).toBe(1);
+    expect(failed.output).toContain("FAIL Authorization-server discovery");
+  } finally {
+    discoveryMode = "normal";
+  }
+});
+
+test("discovery outages or invalid metadata fail without a reconnect and recover", async () => {
+  const caller = await token("mcp:read");
+  try {
+    for (const mode of ["unavailable", "not_found", "mismatched_issuer", "unsafe_endpoint"] as const) {
+      discoveryMode = mode;
+      resetDiscovery();
+      resetKeySet();
+      const response = await rpc("tools/list", caller);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("www-authenticate")).toBeNull();
+      if (mode === "unavailable") expect(response.headers.get("retry-after")).toBe("10");
+    }
+    discoveryMode = "normal";
+    // Failed discovery retries without restarting the MCP.
+    expect((await rpc("tools/list", caller)).status).toBe(200);
+  } finally {
+    discoveryMode = "normal";
+    resetDiscovery();
+    resetKeySet();
+  }
+});
+
+test("OpenID discovery fallback and unavailable JWKS are handled without false reconnects", async () => {
+  const caller = await token("mcp:read");
+  try {
+    discoveryMode = "oidc_only";
+    resetDiscovery();
+    resetKeySet();
+    expect((await rpc("tools/list", caller)).status).toBe(200);
+    jwksUnavailable = true;
+    resetKeySet();
+    const response = await rpc("tools/list", caller);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    jwksUnavailable = false;
+    expect((await rpc("tools/list", caller)).status).toBe(200);
+  } finally {
+    discoveryMode = "normal";
+    jwksUnavailable = false;
+    resetDiscovery();
+    resetKeySet();
+  }
+});
+
 test("HTTP auth mode is explicit and API-key-only needs no OAuth settings", () => {
   expect(loadHttpConfig({}).authMode).toBe("oauth");
   expect(loadHttpConfig({ MCP_HTTP_AUTH: "api_key" }).authMode).toBe("api_key");
   expect(loadHttpConfig({ MCP_HTTP_AUTH: "both" }).authMode).toBe("both");
   expect(() => loadHttpConfig({ MCP_HTTP_AUTH: "none" })).toThrow("MCP_HTTP_AUTH");
   expect(() => loadHttpConfig({ MCP_ALLOW_API_KEY_QUERY: "maybe" })).toThrow("MCP_ALLOW_API_KEY_QUERY");
+  expect(loadHttpConfig({}).toolProfile).toBe("full");
+  expect(loadHttpConfig({ MCP_TOOL_PROFILE: "public" }).toolProfile).toBe("public");
+  expect(() => loadHttpConfig({ MCP_TOOL_PROFILE: "anything" })).toThrow("MCP_TOOL_PROFILE");
+  expect(loadHttpConfig({ OPENAI_APPS_CHALLENGE_TOKEN: "portal-token" }).openaiAppsChallengeToken).toBe("portal-token");
+  expect(loadHttpConfig({ OPENAI_APPS_CHALLENGE_TOKEN: "" }).openaiAppsChallengeToken).toBeUndefined();
+});
+
+test("optional public plugin domain challenge returns only the portal token", async () => {
+  const path = "/.well-known/openai-apps-challenge";
+  expect((await fetch(`${mcpOrigin}${path}`)).status).toBe(404);
+  const previous = process.env.OPENAI_APPS_CHALLENGE_TOKEN;
+  const token = crypto.randomUUID();
+  let server: http.Server | undefined;
+  try {
+    process.env.OPENAI_APPS_CHALLENGE_TOKEN = token;
+    const instance = await ephemeralMcp("api_key", true);
+    server = instance.server;
+    const response = await fetch(`${instance.origin}${path}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.text()).toBe(token);
+    expect((await fetch(`${instance.origin}${path}`, { method: "POST" })).status).toBe(405);
+    expect((await fetch(`${instance.origin}/.well-known/openai-apps-challenge/extra`)).status).toBe(404);
+  } finally {
+    if (server) await close(server);
+    if (previous === undefined) delete process.env.OPENAI_APPS_CHALLENGE_TOKEN;
+    else process.env.OPENAI_APPS_CHALLENGE_TOKEN = previous;
+  }
 });
 
 test("wrong audience is refused", async () => {
@@ -226,7 +435,12 @@ test("read bearer sees and runs read tools, but not write tools; API gets only e
   expect(exchanges.at(-1)?.subject).toBe(caller);
   expect(exchanges.at(-1)?.scope).toBe("mcp:read");
   expect(exchanges.at(-1)?.resource).toBe(process.env.OAUTH_API_RESOURCE);
-  expect(exchanges.at(-1)?.authorization).toBe(`Basic ${Buffer.from("test-client:test-secret").toString("base64")}`);
+  expect(exchanges.at(-1)?.authorization).toBe(`Basic ${Buffer.from(`${process.env.OAUTH_INTERNAL_CLIENT_ID}:${process.env.OAUTH_INTERNAL_CLIENT_SECRET}`).toString("base64")}`);
+  expect(exchanges.at(-1)?.grant).toBe("urn:ietf:params:oauth:grant-type:token-exchange");
+  expect(exchanges.at(-1)?.subjectType).toBe("urn:ietf:params:oauth:token-type:access_token");
+  expect(exchanges.at(-1)?.requestedType).toBe("urn:ietf:params:oauth:token-type:access_token");
+  expect(exchanges.at(-1)?.contentType).toBe("application/x-www-form-urlencoded");
+  expect(misplacedExchanges).toBe(0);
 });
 
 test("write tool with read bearer gives 403 and required scope", async () => {
@@ -322,11 +536,6 @@ test("invalid_grant and API 401 both give fresh challenges", async () => {
   let response = await rpc("tools/call", await token("mcp:read"), { name: "get_account_overview", arguments: {} });
   expect(response.status).toBe(401);
   expect(response.headers.get("www-authenticate")).toContain("resource_metadata=");
-  exchangeMode = "unauthorized";
-  clearExchangeCache();
-  response = await rpc("tools/call", await token("mcp:read"), { name: "get_account_overview", arguments: {} });
-  expect(response.status).toBe(401);
-  expect(response.headers.get("www-authenticate")).toContain("resource_metadata=");
   exchangeMode = "normal";
   apiMode = "unauthorized";
   clearExchangeCache();
@@ -334,6 +543,57 @@ test("invalid_grant and API 401 both give fresh challenges", async () => {
   expect(response.status).toBe(401);
   expect(response.headers.get("www-authenticate")).toContain("resource_metadata=");
   apiMode = "normal";
+});
+
+test("internal client authentication failure is 502, not a user reconnect", async () => {
+  try {
+    exchangeMode = "unauthorized";
+    clearExchangeCache();
+    const before = apiBearers.length;
+    const response = await rpc("tools/call", await token("mcp:read"), { name: "get_account_overview", arguments: {} });
+    expect(response.status).toBe(502);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect(apiBearers.length).toBe(before);
+  } finally {
+    exchangeMode = "normal";
+    clearExchangeCache();
+  }
+});
+
+test("token endpoint outages, limits, and redirects never forward credentials or reconnect", async () => {
+  try {
+    for (const mode of ["unavailable", "rate_limited", "redirect"] as const) {
+      exchangeMode = mode;
+      clearExchangeCache();
+      const response = await rpc("tools/call", await token("mcp:read"), { name: "get_account_overview", arguments: {} });
+      expect(response.status).toBe(503);
+      expect(response.headers.get("www-authenticate")).toBeNull();
+      if (mode !== "redirect") expect(response.headers.get("retry-after")).toBe("10");
+    }
+    expect(misplacedExchanges).toBe(0);
+  } finally {
+    exchangeMode = "normal";
+    clearExchangeCache();
+  }
+});
+
+test("only valid Bearer access-token responses reach the business API", async () => {
+  try {
+    for (const mode of ["invalid_type", "invalid_issued_type", "missing_expires", "expired", "invalid_scope_type"] as const) {
+      exchangeMode = mode;
+      clearExchangeCache();
+      const before = apiBearers.length;
+      const response = await rpc("tools/call", await token("mcp:read"), { name: "get_account_overview", arguments: {} });
+      expect(response.status).toBe(502);
+      expect(apiBearers.length).toBe(before);
+    }
+    exchangeMode = "omitted_optional";
+    clearExchangeCache();
+    expect((await rpc("tools/call", await token("mcp:read"), { name: "get_account_overview", arguments: {} })).status).toBe(200);
+  } finally {
+    exchangeMode = "normal";
+    clearExchangeCache();
+  }
 });
 
 async function keyRpc(origin: string, key: string | undefined, method: string, params?: unknown, extraHeaders: Record<string, string> = {}, suffix = ""): Promise<Response> {
@@ -349,16 +609,18 @@ async function keyRpc(origin: string, key: string | undefined, method: string, p
   });
 }
 
-async function ephemeralMcp(mode: "api_key" | "both", withoutOAuth = false, allowQuery = false): Promise<{ server: http.Server; origin: string }> {
+async function ephemeralMcp(mode: "api_key" | "both", withoutOAuth = false, allowQuery = false, profile: "full" | "public" = "full"): Promise<{ server: http.Server; origin: string }> {
   const saved = {
     mode: process.env.MCP_HTTP_AUTH,
     allowQuery: process.env.MCP_ALLOW_API_KEY_QUERY,
+    profile: process.env.MCP_TOOL_PROFILE,
     issuer: process.env.OAUTH_ISSUER,
     resource: process.env.OAUTH_MCP_RESOURCE,
   };
   try {
     process.env.MCP_HTTP_AUTH = mode;
     process.env.MCP_ALLOW_API_KEY_QUERY = allowQuery ? "true" : "false";
+    process.env.MCP_TOOL_PROFILE = profile;
     if (withoutOAuth) {
       delete process.env.OAUTH_ISSUER;
       delete process.env.OAUTH_MCP_RESOURCE;
@@ -373,12 +635,44 @@ async function ephemeralMcp(mode: "api_key" | "both", withoutOAuth = false, allo
     else process.env.MCP_HTTP_AUTH = saved.mode;
     if (saved.allowQuery === undefined) delete process.env.MCP_ALLOW_API_KEY_QUERY;
     else process.env.MCP_ALLOW_API_KEY_QUERY = saved.allowQuery;
+    if (saved.profile === undefined) delete process.env.MCP_TOOL_PROFILE;
+    else process.env.MCP_TOOL_PROFILE = saved.profile;
     if (saved.issuer === undefined) delete process.env.OAUTH_ISSUER;
     else process.env.OAUTH_ISSUER = saved.issuer;
     if (saved.resource === undefined) delete process.env.OAUTH_MCP_RESOURCE;
     else process.env.OAUTH_MCP_RESOURCE = saved.resource;
   }
 }
+
+test("public profile keeps dedicated tools but hides the generic passthrough", async () => {
+  expect(isToolExposed("future_unreviewed_tool", "public")).toBe(false);
+  expect(isToolExposed("future_unreviewed_tool", "full")).toBe(true);
+  const { server, origin } = await ephemeralMcp("both", false, false, "public");
+  try {
+    const bearer = await token("mcp:read mcp:write");
+    const listed = await keyRpc(origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
+    expect(listed.status).toBe(200);
+    const names = (await listed.json() as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
+    expect(names).toHaveLength(22);
+    expect(names).toContain("run_google_maps_targeting");
+    expect(names).toContain("add_contact_to_list");
+    for (const excluded of ["list_api_endpoints", "magileads_get", "magileads_request"]) {
+      expect(names).not.toContain(excluded);
+    }
+    const beforeExchanges = exchanges.length;
+    const hidden = await keyRpc(origin, undefined, "tools/call",
+      { name: "magileads_request", arguments: { method: "POST", path: "/not-an-indexed-route", confirm: true } },
+      { Authorization: `Bearer ${bearer}` });
+    expect(hidden.status).toBe(200);
+    const hiddenResult = await hidden.json() as { error?: unknown; result?: { isError?: boolean } };
+    expect(hiddenResult.error !== undefined || hiddenResult.result?.isError === true).toBe(true);
+    expect(exchanges.length).toBe(beforeExchanges);
+    const keyListed = await keyRpc(origin, "key-alpha", "tools/list");
+    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(22);
+  } finally {
+    await close(server);
+  }
+});
 
 async function close(server: http.Server): Promise<void> {
   server.closeAllConnections();

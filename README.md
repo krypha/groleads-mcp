@@ -22,6 +22,7 @@ transport uses Magileads environment credentials.
 - [Configuration](#configuration)
 - [Run locally](#run-locally)
 - [Deploy with Docker / Dokploy](#deploy-with-docker--dokploy)
+- [ChatGPT cloud and public plugin](#chatgpt-cloud-and-public-plugin)
 - [Connect to a Hermes Agent](#connect-to-a-hermes-agent)
 - [Project structure](#project-structure)
 - [Development](#development)
@@ -249,7 +250,9 @@ bare metadata URL and the RFC 9728 URL suffixed with `/mcp` are served with CORS
 support when OAuth is enabled.
 
 Before a `tools/call`, the MCP exchanges the caller's bearer at the Magileads
-`/oauth/token` endpoint for a new bearer addressed to `OAUTH_API_RESOURCE` and
+`token_endpoint` published by issuer discovery (documented as `/oauth/token`),
+using `client_secret_basic` and an URL-encoded RFC 8693 request. It explicitly
+requests an access token addressed to `OAUTH_API_RESOURCE` and
 limited to the **union of scopes required by all API routes the tool calls**.
 For example, `add_contact_to_list` and `run_google_maps_targeting` request
 `mcp:read mcp:write`, while a read-only tool requests only `mcp:read`.
@@ -258,6 +261,41 @@ tools covered by **all** of the caller's required scopes; there is no implicit
 write-to-read scope inheritance. A missing required scope returns `403`
 with `insufficient_scope`; an expired/revoked token or API `401` returns a fresh
 `401` challenge.
+
+Discovery is shared between JWT verification and token exchange; the business
+API base URL does **not** determine the token endpoint. The issuer must match
+exactly, and discovered endpoints must use HTTPS (HTTP is allowed only on local
+loopback hosts for development). The response must contain a valid Bearer token
+and positive integer `expires_in`; when present, `issued_token_type` must be an
+access token and `scope` must match the requested scope set.
+
+An internal client's `invalid_client` / token-endpoint `401` is a deployment
+error (`502`), **not** a request to reconnect the user's account. Discovery/JWKS
+outages and token-endpoint network errors / `429` / `5xx` return `503` without
+an OAuth challenge; a valid upstream `Retry-After` in seconds is preserved.
+
+### Which server owns the OAuth endpoints?
+
+The [Magileads OAuth API](https://app.api-magileads.net/#/OAuth) owns the
+authorization server; the MCP only protects its resource and exchanges tokens.
+No new MCP tool or consent screen is needed.
+
+| Endpoint | Caller / responsibility |
+| --- | --- |
+| `GET /.well-known/oauth-authorization-server` | Client and MCP discover the issuer and endpoint URLs. |
+| `GET /oauth/jwks.json` | MCP loads the public keys to verify MCP-audience JWTs. |
+| `POST /oauth/register` | OAuth client registers its callback if it uses dynamic registration. The documented grants are `authorization_code` / `refresh_token`, not internal token exchange. |
+| `GET /oauth/authorize` | OAuth client starts authorization code + PKCE (`S256`), with the MCP resource and scopes. |
+| `GET/POST /oauth/authorization-transactions/{transaction_id}` | Magileads' logged-in consent frontend reads `response.transaction`, then approves or denies. Not handled by the MCP. |
+| `POST /oauth/token` | OAuth client obtains / refreshes its MCP token; the MCP separately exchanges it for an API token with its confidential internal client. |
+| `POST /oauth/revoke` | OAuth client revokes its token. The MCP does not store client refresh tokens. |
+
+OAuth-capable clients connect to the canonical public MCP URL. On the first
+`401`, they discover the API's authorization server, register if necessary,
+open its consent flow, and send the resulting MCP token as `Authorization:
+Bearer ...`. The MCP's internal client ID/secret stays on the server and must
+never be given to end users. API-key clients can still use `X-API-Key` in `both`
+or `api_key` mode without participating in OAuth.
 
 The local stdio transport still uses its separate environment credentials.
 
@@ -270,12 +308,13 @@ refuse to start unless all five required OAuth settings are present.
 | --- | --- |
 | `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
+| `MCP_TOOL_PROFILE` | `full` (default, 25 tools) or `public` (22 dedicated tools; generic passthrough hidden). Applies to every HTTP client on this deployment. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
 | `OAUTH_MCP_RESOURCE` | Required for OAuth modes; exact resource URL/audience for this MCP, e.g. `https://mcp.example.com/mcp`. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
 | `OAUTH_INTERNAL_CLIENT_ID` + `OAUTH_INTERNAL_CLIENT_SECRET` | Required for OAuth modes; confidential token-exchange client. Store the secret in the deployment secret store. |
 | `MAGILEADS_API_URL` | Optional API base URL; defaults to `OAUTH_API_RESOURCE`. |
-| `OAUTH_JWKS_URI` | Optional JWKS override; otherwise resolved from issuer discovery. |
+| `OAUTH_JWKS_URI` | Optional JWKS override; otherwise resolved from issuer discovery. Token exchange still requires issuer discovery. |
 | `OAUTH_CLOCK_TOLERANCE` | Optional JWT clock tolerance in seconds (default `60`). |
 | `MAGILEADS_API_KEY` or `MAGILEADS_EMAIL` + `MAGILEADS_PASSWORD` | Optional credentials for **stdio only**; never a default HTTP account. |
 | `MAGILEADS_API_BASE` | Optional API-key HTTP and stdio API base URL (default `https://app.api-magileads.net`). |
@@ -370,6 +409,22 @@ base URL differs from `OAUTH_API_RESOURCE`, set `MAGILEADS_API_URL` too (when
 using the supplied Compose file, uncomment its `MAGILEADS_API_URL` environment
 line). OAuth modes fail at startup if a required value is missing.
 
+For the documented Magileads deployment, `OAUTH_ISSUER` is normally
+`https://app.api-magileads.net`, but confirm it against the discovery response
+and JWT `iss`. Ask the backend team to provision **one confidential internal
+client** authorized for the token-exchange grant, the exact MCP source audience,
+the API target audience, and `mcp:read` / `mcp:write`; these are the two
+`OAUTH_INTERNAL_CLIENT_*` values. The public `/oauth/register` endpoint does
+**not** document provisioning this internal grant. Use the exact API audience
+they provide for `OAUTH_API_RESOURCE`; if needed, set
+`MAGILEADS_API_URL=https://app.api-magileads.net` separately.
+
+Use one **canonical** MCP URL across client configuration, protected-resource
+metadata, and the API's authorized resource/audience. Domain aliases are not
+interchangeable JWT audiences. Finally, the API team must apply the appropriate
+`mcp.oauth.scope:read` / `mcp.oauth.scope:write` middleware to every business
+route used by the tools (`bun run tools:table` lists the mapping).
+
 ```bash
 docker compose up -d --build
 ```
@@ -391,6 +446,35 @@ also check `/.well-known/oauth-protected-resource/mcp`; for API keys, make a
 real tool call (for example `get_account_overview`) using a test account's
 `X-API-Key`. A successful `tools/list` alone does **not** validate the key
 against Magileads.
+
+Run the read-only public OAuth preflight after deployment (no API key, client
+secret, or user token is required):
+
+```bash
+OAUTH_ISSUER=https://app.api-magileads.net \
+OAUTH_MCP_RESOURCE=https://<your-canonical-mcp-domain>/mcp \
+bun run check:oauth
+```
+
+It checks discovery, public signing keys, and exact MCP resource metadata; it
+does not register a client, exchange/revoke tokens, or change account data.
+A `404` at the documented discovery/JWKS endpoints must be fixed on the API
+deployment/reverse proxy before OAuth clients can connect; being listed in
+Swagger does not prove the endpoints are live. Once public checks pass,
+authorize with a test account and call `get_account_overview`, then a confirmed
+write tool on test data, to verify internal credentials and read/write route
+permissions. The automated local suite is `bun run test:oauth`.
+
+## ChatGPT cloud and public plugin
+
+The same public HTTPS MCP endpoint can be connected privately in ChatGPT
+developer mode, then submitted as a remote MCP-only plugin to the public
+directory. See the [ChatGPT deployment and submission guide](docs/chatgpt-publication.md)
+for the OAuth smoke test, public-domain verification (`OPENAI_APPS_CHALLENGE_TOKEN`),
+review materials, and test cases. Set `MCP_TOOL_PROFILE=public` for submission:
+it exposes the 22 dedicated business tools while hiding the three generic API
+passthrough tools. The default `full` profile preserves all 25 tools for private
+integrations. Connecting privately does not publish the plugin.
 
 ## Connect to a Hermes Agent
 

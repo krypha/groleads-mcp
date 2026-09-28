@@ -4,10 +4,11 @@ import http from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildServer } from "./server.js";
 import { runWithAuth } from "./magileads.js";
-import { accessForTool, scopesForTool, toolAccessTable } from "./tools.js";
+import { accessForTool, isToolExposed, scopesForTool, toolAccessTable } from "./tools.js";
 import { log } from "./log.js";
 import { loadHttpConfig, type HttpConfig } from "./http-config.js";
 import { oauthConfig } from "./oauth/config.js";
+import { AuthorizationServiceUnavailable } from "./oauth/discovery.js";
 import { exchangeToken, invalidateExchange, ReauthenticationRequired } from "./oauth/exchange.js";
 import { protectedResourceMetadata, sendChallenge } from "./oauth/metadata.js";
 import { bearerFrom, InvalidTokenError, verifyAccessToken } from "./oauth/verify.js";
@@ -142,7 +143,9 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
     } catch (error) {
       if (error instanceof InvalidTokenError) return sendChallenge(res, 401);
       log("error", "Token verification unavailable", { error });
-      return json(res, 503, { error: "Authorization service unavailable." });
+      const headers: Record<string, string> = error instanceof AuthorizationServiceUnavailable && error.retryAfter
+        ? { "Retry-After": error.retryAfter } : {};
+      return json(res, 503, { error: "Authorization service unavailable." }, headers);
     }
     if (caller.scopes.length === 0) return sendChallenge(res, 403, "mcp:read");
   }
@@ -157,7 +160,7 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
     return json(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: "Invalid JSON-RPC request." }, id: null });
   }
 
-  const access = name ? accessForTool(name) : undefined;
+  const access = name && isToolExposed(name, config.toolProfile) ? accessForTool(name) : undefined;
   const requiredScopes = access ? scopesForTool(access) : [];
   const scopeValue = requiredScopes.join(" ");
   if (access && caller && !requiredScopes.every((scope) => caller.scopes.includes(scope))) {
@@ -171,11 +174,15 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
     } catch (error) {
       if (error instanceof ReauthenticationRequired) return sendChallenge(res, 401);
       log("error", "Token exchange unavailable", { error });
+      if (error instanceof AuthorizationServiceUnavailable) {
+        return json(res, 503, { error: "Authorization service unavailable." },
+          error.retryAfter ? { "Retry-After": error.retryAfter } : {});
+      }
       return json(res, 502, { error: "Token exchange failed." });
     }
   }
 
-  const server = buildServer(caller?.scopes);
+  const server = buildServer(caller?.scopes, config.toolProfile);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   const buffered = access ? bufferResponse(res) : undefined;
   let apiUnauthorized = false;
@@ -215,6 +222,18 @@ export function createHttpServer(): http.Server {
   const paths = oauthEnabled ? new Set(["/.well-known/oauth-protected-resource", oauthConfig().metadataPath]) : new Set<string>();
   return http.createServer((req, res) => {
     const path = new URL(req.url || "/", "http://localhost").pathname;
+    if (path === "/.well-known/openai-apps-challenge" && config.openaiAppsChallengeToken) {
+      if (req.method !== "GET") return json(res, 405, { error: "Method not allowed." });
+      const token = config.openaiAppsChallengeToken;
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Length": Buffer.byteLength(token),
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      });
+      res.end(token);
+      return;
+    }
     if (paths.has(path)) {
       if (req.method === "OPTIONS") {
         res.writeHead(204, {
@@ -244,7 +263,7 @@ if ((import.meta as ImportMeta & { main?: boolean }).main) {
   try {
     const config = loadHttpConfig();
     createHttpServer().listen(config.port, () => {
-      log("info", "HTTP MCP ready", { port: config.port, path: config.mcpPath, authMode: config.authMode });
+      log("info", "HTTP MCP ready", { port: config.port, path: config.mcpPath, authMode: config.authMode, toolProfile: config.toolProfile });
     });
   } catch (error) {
     log("error", "HTTP MCP cannot start", { error });

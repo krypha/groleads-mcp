@@ -596,6 +596,24 @@ type ToolAccess = {
   /** For a non-GET route whose API permission differs from the tool's primary scope. */
   routeScopes?: Readonly<Record<string, Scope>>;
 };
+export type ToolProfile = "full" | "public";
+
+// The public catalogue is explicit: new tools need a review before exposure.
+// The generic passthrough is deliberately absent because it can reach admin,
+// billing, user and irreversible outbound actions.
+const PUBLIC_TOOLS = new Set([
+  "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting",
+  "list_contact_lists", "get_contact_list_status", "list_contact_fields",
+  "add_contact_to_list", "preview_contact_selection",
+  "list_campaigns", "get_campaign", "get_scenario", "get_campaign_statistics",
+  "get_account_overview", "list_linkedin_accounts", "search_contact_lists",
+  "get_contact_list", "query_contacts", "search_contacts",
+  "list_prm_statuses", "query_prm_contacts", "get_prm_contact", "list_prm_nurturings",
+]);
+
+export function isToolExposed(name: string, profile: ToolProfile): boolean {
+  return profile === "full" || PUBLIC_TOOLS.has(name);
+}
 const catalog = new Map<string, ToolAccess>();
 let catalogReady = false;
 
@@ -622,7 +640,7 @@ export function accessForTool(name: string): ToolAccess | undefined {
 }
 
 /** Each access declaration sits immediately beside its tool definition. */
-export function registerTools(target: McpServer, allowedScopes?: readonly Scope[]): void {
+export function registerTools(target: McpServer, allowedScopes?: readonly Scope[], profile: ToolProfile = "full"): void {
   const seen = new Set<string>();
   const register = (access: ToolAccess): McpServer["registerTool"] =>
     ((name: string, ...args: unknown[]) => {
@@ -639,6 +657,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       }
       catalog.set(name, access);
       if (allowedScopes && !scopesForTool(access).every((scope) => allowedScopes.includes(scope))) return {};
+      if (!isToolExposed(name, profile)) return {};
       return (target.registerTool as (...values: unknown[]) => unknown).call(target, name, ...args);
     }) as McpServer["registerTool"];
 
@@ -663,7 +682,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           .optional()
           .describe(`Max number of URLs to generate (1–${MAX_LINKS}, default 20).`),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     },
     async ({ search, locations, max_links }): Promise<TextResult> => {
       try {
@@ -834,7 +853,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         name: z.string().optional().describe("Optional name filter (contains match)."),
         limit: z.number().int().optional().describe("Max lists to return (1–200, default 25)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ name, limit }): Promise<TextResult> => {
       try {
@@ -865,7 +884,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("The contact list id to inspect."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_list_id }): Promise<TextResult> => {
       try {
@@ -906,7 +925,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("The contact list id to inspect."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_list_id }): Promise<TextResult> => {
       try {
@@ -958,7 +977,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           .optional()
           .describe("Must be true to import the contact; omitted/false returns a dry run."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_list_id, properties, confirm }): Promise<TextResult> => {
       try {
@@ -1029,7 +1048,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           .optional()
           .describe("Which contacts to select: 'matching' (default) or 'all_except_matching'."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_list_id, criteria, match, target }): Promise<TextResult> => {
       try {
@@ -1075,7 +1094,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         name: z.string().optional().describe("Optional case-insensitive substring filter on the campaign name."),
         limit: z.number().int().optional().describe("Max campaigns to scan/return (1–100, default 50)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ name, limit }): Promise<TextResult> => {
       try {
@@ -1117,7 +1136,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       inputSchema: {
         campaign_id: z.number().int().positive().describe("The campaign (programmation) id."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ campaign_id }): Promise<TextResult> => {
       try {
@@ -1183,7 +1202,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       inputSchema: {
         scenario_id: z.number().int().positive().describe("The scenario (workflow) id — from a campaign's scenario_id."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ scenario_id }): Promise<TextResult> => {
       try {
@@ -1247,7 +1266,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       inputSchema: {
         campaign_id: z.number().int().positive().describe("The campaign (programmation) id."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ campaign_id }): Promise<TextResult> => {
       try {
@@ -1395,7 +1414,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "exposes subscription STATUS but no numeric credit balance, so credit counts are not " +
         "reported. Takes no parameters.",
       inputSchema: {},
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async (): Promise<TextResult> => {
       try {
@@ -1453,7 +1472,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "validity_tested, checkpoint_required, is_sales_navigator_account, last_use. Takes no " +
         "parameters.",
       inputSchema: {},
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async (): Promise<TextResult> => {
       try {
@@ -1503,7 +1522,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         per_page: z.number().int().optional().describe("Rows per page (1–200, default 25)."),
         page: z.number().int().optional().describe("1-based page number (default 1)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ name, sort, per_page, page }): Promise<TextResult> => {
       try {
@@ -1576,7 +1595,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("The contact list id."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_list_id }): Promise<TextResult> => {
       try {
@@ -1646,7 +1665,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         per_page: z.number().int().optional().describe("Rows per page (1–50, default 50)."),
         page: z.number().int().optional().describe("1-based page number (default 1)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_list_id, filter, sort, per_page, page }): Promise<TextResult> => {
       try {
@@ -1689,7 +1708,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         per_page: z.number().int().optional().describe("Rows per page (1–50, default 50)."),
         page: z.number().int().optional().describe("1-based page number (default 1)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_list_id, query, per_page, page }): Promise<TextResult> => {
       try {
@@ -1728,7 +1747,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "numeric id + name). Each: id (null for default), key, name, color, visible, sorting, kind. " +
         "Takes no parameters.",
       inputSchema: {},
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async (): Promise<TextResult> => {
       try {
@@ -1788,7 +1807,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         per_page: z.number().int().optional().describe("Rows per page (1–50, default 50)."),
         page: z.number().int().optional().describe("1-based page number (default 1)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ options, status, only_positive, search, per_page, page }): Promise<TextResult> => {
       try {
@@ -1874,7 +1893,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       inputSchema: {
         contact_id: z.number().int().positive().describe("The PRM contact id."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ contact_id }): Promise<TextResult> => {
       try {
@@ -1968,7 +1987,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "List the account's PRM nurturing sequences: id, name, contact_list_ids, created_on, and the " +
         "`filter` that selects contacts into the sequence. Takes no parameters.",
       inputSchema: {},
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async (): Promise<TextResult> => {
       try {
@@ -2015,7 +2034,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         writes_only: z.boolean().optional().describe("Only write (POST/PUT/PATCH) endpoints."),
         limit: z.number().int().optional().describe("Max endpoints to return (1–200, default 60)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ search, method, reads_only, writes_only, limit }): Promise<TextResult> => {
       try {
@@ -2057,7 +2076,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         path: z.string().min(1).describe("API path with a leading slash, {params} filled in, e.g. '/blacklists'."),
         query: z.record(z.any()).optional().describe("Optional query params. Object/array values are JSON-encoded (e.g. options/filter)."),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ path, query }): Promise<TextResult> => {
       try {

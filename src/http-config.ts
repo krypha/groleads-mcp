@@ -5,6 +5,11 @@ const schema = z.object({
   MCP_ALLOW_API_KEY_QUERY: z.enum(["true", "false"]).default("false"),
   MCP_HTTP_PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   MCP_HTTP_PATH: z.string().default("/mcp"),
+  MCP_TOOL_PROFILE: z.enum(["full", "public"]).default("full"),
+  OPENAI_APPS_CHALLENGE_TOKEN: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().min(1).max(2048).optional(),
+  ),
 });
 
 export type HttpConfig = {
@@ -12,6 +17,8 @@ export type HttpConfig = {
   allowApiKeyQuery: boolean;
   port: number;
   mcpPath: string;
+  toolProfile: "full" | "public";
+  openaiAppsChallengeToken?: string;
 };
 
 export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig {
@@ -28,5 +35,7 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
     allowApiKeyQuery: value.MCP_ALLOW_API_KEY_QUERY === "true",
     port: value.MCP_HTTP_PORT,
     mcpPath: value.MCP_HTTP_PATH,
+    toolProfile: value.MCP_TOOL_PROFILE,
+    openaiAppsChallengeToken: value.OPENAI_APPS_CHALLENGE_TOKEN,
   };
 }

@@ -24,7 +24,8 @@
     "typecheck": "tsc --noEmit",
     "gen:endpoints": "bun run scripts/generate-endpoints.mjs",
     "tools:table": "bun run scripts/tool-table.ts",
-    "test:oauth": "bun test tests/oauth.test.ts"
+    "test:oauth": "bun test tests/oauth.test.ts",
+    "check:oauth": "bun run scripts/check-oauth.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
