@@ -12,10 +12,10 @@ décrivent la soumission « With MCP ».
 1. Déployer la version à tester sur l'URL canonique
    `https://mcp.magileads.io/mcp`, avec `MCP_HTTP_AUTH=oauth` (ou `both` si les
    clients existants ont encore besoin des clés API). Définir
-   `MCP_TOOL_PROFILE=public` pour le catalogue public : 22 outils métier
+   `MCP_TOOL_PROFILE=public` pour le catalogue public : 23 outils métier
    dédiés restent accessibles, les trois outils génériques
    (`list_api_endpoints`, `magileads_get`, `magileads_request`) sont masqués.
-   Le profil par défaut `full` conserve les 25 outils pour les intégrations
+   Le profil par défaut `full` conserve les 26 outils pour les intégrations
    privées. Sur une même URL, ce profil s'applique à tous les clients HTTP.
    Garder
    `MCP_ALLOW_API_KEY_QUERY=false` pour éviter les clés dans les URL et les logs.
@@ -60,10 +60,14 @@ distincte par client.
   accessible au réviseur sans MFA, SMS, confirmation e-mail ni VPN. Mettre les
   identifiants uniquement dans le champ privé prévu par le portail, jamais dans
   Git ou les logs.
-- Le profil public masque les trois outils de passthrough : ils couvrent aussi
-  des routes d'administration, de facturation, d'utilisateurs et d'envoi de
-  messages. Ce choix réduit le risque de revue, mais **ne garantit pas**
-  l'approbation. Les autres 22 outils doivent encore être testés avec un compte
+- Le profil public masque les trois outils de passthrough : même limités aux
+  routes métier explicitement autorisées en OAuth, ils couvrent des actions
+  d'envoi et de génération. Le profil public expose notamment `create_email_model`,
+  qui sauvegarde un modèle sans envoyer d'email, après `confirm:true`.
+  Il produit automatiquement le HTML requis par l'API pour les contenus en texte
+  seul, en conservant les variables de personnalisation et les retours à la ligne.
+  Ce choix réduit le risque de revue, mais **ne garantit pas**
+  l'approbation. Les 23 outils doivent encore être testés avec un compte
   de démonstration et leurs réponses auditées pour les données personnelles.
 
 Texte de fiche proposé, à faire approuver par Magileads :

@@ -2,7 +2,9 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that exposes
 **Magileads** as tools for AI agents — Google Maps targeting, contact lists, campaign
-audit, PRM (pipeline), data queries, and every Magileads OpenAPI endpoint except DELETE.
+audit, PRM (pipeline), email templates, data queries, and 249 explicitly authorized
+Magileads business API operations. Administrative/secret endpoints, DELETE and PATCH
+are not exposed.
 
 Turn a plain query — *"dentists in Lyon"* — into a filled Magileads contact list, audit a
 prospecting campaign, or read the whole account. **No LinkedIn account** is needed.
@@ -35,12 +37,13 @@ transport uses Magileads environment credentials.
 | Tool | Input | Output |
 | --- | --- | --- |
 | `generate_maps_search_urls` | `search` (string), `locations?` (string[]), `max_links?` (1–40, default 20) | `{ count, urls[] }` — Google Maps search URLs |
-| `extract_maps_search` | `google_maps_search_urls` (1–10), `max_results?` (1–200, default 100), `contact_list_name?` **or** `contact_list_id?` | `{ contact_list_id, … }` — extraction started |
-| `run_google_maps_targeting` | `search`, `locations?`, `contact_list_name`, `max_links?`, `max_results?` | `{ contact_list_id, urls[], … }` — generate **+** extract in one call |
+| `extract_maps_search` | `google_maps_search_urls` (1–10), `max_results?` (1–200, default 100), `contact_list_name?` **or** `contact_list_id?`, `confirm?` | local preview; `confirm:true` starts extraction |
+| `run_google_maps_targeting` | `search`, `locations?`, `contact_list_name`, `max_links?`, `max_results?`, `confirm?` | local plan; `confirm:true` generates **+** extracts |
 | `list_contact_lists` | `name?` (filter), `limit?` (1–200, default 25) | `{ total, lists[] }` |
 | `get_contact_list_status` | `contact_list_id` | `{ id, name, contacts, emails, companies, jobs[] }` |
 | `list_contact_fields` | `contact_list_id` | `{ fields[] }` — each `{ data_field_id, identifier, label, type }` |
 | `add_contact_to_list` | `contact_list_id`, `properties:[{field,value}]`, `confirm?` | imports one contact — **dry-run until `confirm:true`** |
+| `create_email_model` | `name`, `subject`, `text?`, `html?`, `folder_id?`, `tags_ids?`, `confirm?` | saves a template without sending — **local dry-run until `confirm:true`** |
 | `preview_contact_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?` | `{ list_name, matched_count, total_count, selected, not_selected }` — **read-only** |
 | `list_campaigns` | `name?` (filter), `limit?` (1–100, default 50) | `{ campaigns[] }` — each `{ id, name, status, start_date, scenario_id }` |
 | `get_campaign` | `campaign_id` | `{ id, name, status, channels[], scenario_id, target_lists:[{id,name,count}], total_contacts }` |
@@ -56,15 +59,18 @@ transport uses Magileads environment credentials.
 | `query_prm_contacts` | `status?`, `only_positive?`, `search?`, `options?`, `per_page?` (1–50), `page?` | `{ total, contacts[] }` — capped at 50 |
 | `get_prm_contact` | `contact_id` | `{ status, scoring, programmations[], calls[], history[] }` |
 | `list_prm_nurturings` | *(none)* | `{ nurturings[] }` |
-| `list_api_endpoints` | `search?`, `method?`, `reads_only?`, `writes_only?`, `limit?` | `{ endpoints[] }` — discover every endpoint except DELETE |
+| `list_api_endpoints` | `search?`, `method?`, `reads_only?`, `writes_only?`, `limit?` | `{ endpoints[] }` — authorized business endpoints and explicit scopes |
 | `magileads_get` | `path`, `query?` | raw JSON — GET any indexed endpoint (read-only) |
-| `magileads_request` | `method`, `path`, `query?`, `body?`, `confirm?` | call any POST/PUT/PATCH endpoint — **dry-run until `confirm:true`** |
+| `magileads_request` | `method`, `path`, `query?`, `body?`, `confirm?` | authorized GET/POST/PUT — reads execute; **all writes dry-run until `confirm:true`**, including GET writes |
 
 ## How targeting works
 
 1. **Generate** search URLs from a query (+ optional locations). ⚠️ This calls a
    location-aware endpoint and can take **~30–60 s** — that's normal.
-2. **Extract** businesses from up to 10 URLs into a contact list. This is
+2. **Preview, then confirm** extraction from up to 10 URLs into a contact list.
+   `extract_maps_search` and `run_google_maps_targeting` now require `confirm:true`
+   to execute; callers upgrading from earlier releases must add this approval.
+   Without it, neither tool makes an API call or consumes credits. Extraction is
    **asynchronous**: the tool returns a `contact_list_id` immediately, then the
    extraction runs in the background.
 3. **Poll** `get_contact_list_status` until the extraction job reads `completed`.
@@ -79,9 +85,11 @@ transport uses Magileads environment credentials.
 identifiers in both contact imports and filters.
 
 `add_contact_to_list` resolves each `{ field, value }` property to the exact Magileads
-body `{ properties:[{ data_field_id, value }] }`, then calls
+body `{ properties:[{ data_field_id, value }] }` after confirmation, then calls
 `POST /contact-lists/{contact_list_id}/contact`. It returns a dry run by default; pass
-`confirm:true` to import. The API can report `contacts_updated` when an existing contact
+`confirm:true` to import. The local preview lists the properties to resolve; account
+field definitions and list access are checked only after confirmation, before any
+import. The API can report `contacts_updated` when an existing contact
 is matched.
 
 `preview_contact_selection` is read-only. It counts a filtered segment and returns
@@ -194,22 +202,47 @@ exclusions, LinkedIn sends, imports, or deletes.
 ## Generic API access (everything else)
 
 The dedicated tools above cover the common workflows. For anything else, three **generic
-passthrough** tools reach every operation in the API's OpenAPI specification except HTTP
-`DELETE`, including admin, billing, reseller, team, API-key, and account endpoints. The
-generated index is committed in [`src/endpoints.generated.ts`](src/endpoints.generated.ts).
+passthrough** tools reach only the 249 method/path pairs in the backend's OAuth
+business contract, including registered pagination variants. The generated index is
+committed in [`src/endpoints.generated.ts`](src/endpoints.generated.ts); authorization
+comes from [`docs/oauth-business-routes.json`](docs/oauth-business-routes.json), not
+from HTTP methods or all of Swagger. The backend document is preserved in
+[`docs/oauth-server.md`](docs/oauth-server.md).
 
-- `list_api_endpoints` — discover the callable endpoints (filter by `search`, `method`,
-  reads/writes). Use it to find the exact `path` + `method`.
+- `list_api_endpoints` — discover callable endpoints and their `scope`/`write` fields
+  (filter by `search`, `method`, reads/writes). Read/write filters follow the explicit
+  scope, not the method. No token exchange or business API call is needed.
 - `magileads_get` — **read-only**: GET any allow-listed endpoint. Pass `path` (with `{params}`
   filled in) and an optional `query` object (object values are JSON-encoded, e.g.
-  `{ options: { per_page: 10 } }`). It even follows the API's own `next_page` / cursor URLs.
-- `magileads_request` — **writes** (POST/PUT/PATCH): create lists/models, send LinkedIn
-  messages, imports, PRM exclusions, status changes, and so on.
+  `{ options: { per_page: 10 } }`). Only GET operations requiring `mcp:read` are
+  accepted. Registered cursor URLs work; arbitrary pagination suffixes do not.
+- `magileads_request` — GET/POST/PUT business operations: POST searches, statistics
+  and synchronous exports require `mcp:read` and execute without confirmation.
+  Personalized model GETs require `mcp:write`, as do creation, modification,
+  extraction and sending. The concrete operation is resolved before Token Exchange.
+  For `POST /models/email` with a JSON object body, missing/blank HTML is generated
+  from nonempty text for ordinary templates. The normalized body is shown in the
+  preview and sent unchanged after confirmation. AI/editor payloads and explicit
+  HTML remain untouched; other endpoints (including partial PUT updates) remain
+  passthrough and are not silently rewritten.
 
-> **Write guardrail.** `magileads_request` performs a **dry run by default** — it returns
-> exactly what *would* be sent and changes nothing. Set `confirm: true` to actually execute.
-> HTTP `DELETE` is refused outright. Regenerate the endpoint index with
-> `bun run gen:endpoints` if the API adds endpoints.
+> **Write guardrail.** Every `mcp:write` generic operation performs a **local dry run**
+> until `confirm:true`, even if its method is GET. The preview includes `required_scope`;
+> neither Token Exchange nor a business endpoint is called. Read-scoped operations
+> need no confirmation. Administrative/secret endpoints, DELETE, PATCH and routes outside
+> the contract fail locally without a reconnect challenge. This restriction also applies
+> to API-key and stdio generic tools; it intentionally narrows the previous catalogue.
+
+For email templates, prefer `create_email_model` (also available in the public profile).
+Supply a name, subject and nonempty text and/or HTML body. The deployed API requires
+HTML even when text is provided (`400 empty_html` was observed during the live test).
+For text-only input, the tool supplies escaped HTML automatically, preserves line
+breaks and keeps the original text and placeholders such as `%first_name%` unchanged.
+Explicit HTML is preserved as supplied. Oversized generated HTML is refused rather
+than truncated. Preview first, then confirm. The tool saves a model only:
+it does not send emails, generate paid AI content or retry an uncertain write.
+The generic API is JSON-only; authorizing a multipart upload or file export route
+does not add binary upload/download handling to these tools.
 
 ## Transports
 
@@ -256,8 +289,10 @@ requests an access token addressed to `OAUTH_API_RESOURCE` and
 limited to the **union of scopes required by all API routes the tool calls**.
 For example, `add_contact_to_list` and `run_google_maps_targeting` request
 `mcp:read mcp:write`, while a read-only tool requests only `mcp:read`.
-The caller's bearer is never forwarded to the API. `tools/list` offers only
-tools covered by **all** of the caller's required scopes; there is no implicit
+The caller's bearer is never forwarded to the API. `tools/list` offers dedicated
+tools covered by **all** of the caller's required scopes. The generic request tool
+is available with either scope because it also handles POST reads; each actual call
+is checked against its concrete endpoint's scope. There is no implicit
 write-to-read scope inheritance. A missing required scope returns `403`
 with `insufficient_scope`; an expired/revoked token or API `401` returns a fresh
 `401` challenge.
@@ -308,7 +343,7 @@ refuse to start unless all five required OAuth settings are present.
 | --- | --- |
 | `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
-| `MCP_TOOL_PROFILE` | `full` (default, 25 tools) or `public` (22 dedicated tools; generic passthrough hidden). Applies to every HTTP client on this deployment. |
+| `MCP_TOOL_PROFILE` | `full` (default, 26 tools) or `public` (23 dedicated tools, including email template creation; generic passthrough hidden). Applies to every HTTP client on this deployment. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
 | `OAUTH_MCP_RESOURCE` | Required for OAuth modes; exact resource URL/audience for this MCP, e.g. `https://mcp.example.com/mcp`. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
@@ -465,6 +500,32 @@ authorize with a test account and call `get_account_overview`, then a confirmed
 write tool on test data, to verify internal credentials and read/write route
 permissions. The automated local suite is `bun run test:oauth`.
 
+### Validate email models after deployment
+
+This release needs **no new MCP environment variable** and does not change the
+OAuth issuer, audience or confidential-client exchange. Deploy the backend route
+scope changes as well as this MCP release; public discovery alone does not prove
+that those business middleware changes are live. The backend team can run its
+documented `oauth:check-readiness` deployment gate.
+
+Using an authorized demonstration account with both scopes, validate:
+
+1. `GET /models/email` via `magileads_get` in the full profile (`mcp:read`).
+2. `create_email_model` with a name, subject and text body, without confirmation:
+   expect a preview and no model created (works in full and public profiles).
+3. Re-call with `confirm:true`: expect a successful API response and model id.
+4. Re-read that id, then test a confirmed update through `magileads_request`
+   with `method:PUT` and `/models/email/{id}` in the full profile (`mcp:write`).
+5. Verify a read-only authorization cannot create a model. Do not send any emails.
+
+The local suite uses a fake issuer and API; it covers all route scopes, POST reads,
+generating GET confirmations, exact pagination, excluded routes and composite
+tools. Real creation/update and review in Claude/ChatGPT remain deployment checks.
+If a business route still returns `401`, inspect the API's rejection reason and
+the actual exchanged-token scope/audience without logging tokens. An internal-client
+failure is a deployment error; an excluded route or permission refusal should not
+be addressed by repeatedly reconnecting.
+
 ## ChatGPT cloud and public plugin
 
 The same public HTTPS MCP endpoint can be connected privately in ChatGPT
@@ -472,8 +533,8 @@ developer mode, then submitted as a remote MCP-only plugin to the public
 directory. See the [ChatGPT deployment and submission guide](docs/chatgpt-publication.md)
 for the OAuth smoke test, public-domain verification (`OPENAI_APPS_CHALLENGE_TOKEN`),
 review materials, and test cases. Set `MCP_TOOL_PROFILE=public` for submission:
-it exposes the 22 dedicated business tools while hiding the three generic API
-passthrough tools. The default `full` profile preserves all 25 tools for private
+it exposes the 23 dedicated business tools while hiding the three generic API
+passthrough tools. The default `full` profile exposes all 26 tools for private
 integrations. Connecting privately does not publish the plugin.
 
 ## Connect to a Hermes Agent
@@ -492,17 +553,21 @@ explicit `MCP_ALLOW_API_KEY_QUERY=true` opt-in described above.
 ```
 src/
 ├── magileads.ts             Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts                 The 25 MCP tool definitions + handlers (input validation, error wrapping)
-├── endpoints.generated.ts   All OpenAPI operations except DELETE (generated)
+├── tools.ts                 The 26 MCP tool definitions + handlers (input validation, error wrapping)
+├── endpoints.ts             Exact route resolution and explicit scopes
+├── endpoints.generated.ts   Authorized OAuth business operations (generated)
 ├── server.ts                buildServer() — creates an McpServer with all tools registered
 ├── index.ts                 stdio entry point
 ├── oauth/                  OAuth config, JWT verification, metadata, token exchange
 ├── http-config.ts          HTTP authentication mode and key-in-URL opt-in
 ├── log.ts                  Credential-redacting stderr logger
 └── http.ts                  OAuth/API-key Streamable HTTP + /health
-scripts/generate-endpoints.mjs  Regenerates endpoints.generated.ts from the OpenAPI spec
+docs/oauth-business-routes.json  Explicit backend authorization matrix (249 operations)
+scripts/generate-endpoints.mjs  Generates from the matrix; Swagger supplies descriptions only
 scripts/tool-table.ts         Prints the declared tool/route/scope table
 tests/oauth.test.ts           Isolated OAuth and fake-API smoke tests
+tests/endpoints.test.ts       Contract, exact pagination and scope assertions
+tests/email-model.test.ts     HTML fallback, escaping, placeholders and size limits
 Dockerfile                   Bun image (oven/bun); runs `bun run src/http.ts`
 docker-compose.yml           Standalone deployment
 ```
@@ -520,7 +585,8 @@ bun install
 bun run typecheck      # tsc --noEmit (type safety)
 bun run dev            # run stdio
 bun run dev:http       # run HTTP
-bun run gen:endpoints  # refresh the all-except-DELETE API index from the OpenAPI spec
+bun run gen:endpoints  # matrix + live Swagger descriptions (does not open additional routes)
+bun run gen:endpoints --offline  # matrix + committed descriptions, no network
 bun run tools:table     # print each route's API scope and each tool's exchange scopes
 bun run test:oauth     # fake issuer, token exchange, and API smoke test
 bun run build          # optional: bundle to dist/ with `bun build`

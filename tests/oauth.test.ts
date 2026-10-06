@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { CALLABLE_ENDPOINTS, matchEndpoint } from "../src/endpoints.js";
 
 async function start(handler: http.RequestListener): Promise<{ server: http.Server; origin: string }> {
   const server = http.createServer(handler);
@@ -25,14 +26,14 @@ let exchangeMode: "normal" | "invalid_grant" | "unauthorized" | "reordered_scope
   "expired" | "invalid_scope_type" | "omitted_optional" | "redirect" = "normal";
 let discoveryMode: "normal" | "unavailable" | "not_found" | "mismatched_issuer" | "unsafe_endpoint" | "oidc_only" = "normal";
 let jwksUnavailable = false;
-let apiMode: "normal" | "unauthorized" = "normal";
+let apiMode: "normal" | "unauthorized" | "forbidden" = "normal";
 const exchanges: {
   subject: string; scope: string; resource: string; authorization: string;
   grant: string; subjectType: string; requestedType: string; contentType: string;
 }[] = [];
 const apiBearers: string[] = [];
 const apiKeys: string[] = [];
-const businessCalls: { method: string; path: string; bearer: string }[] = [];
+const businessCalls: { method: string; path: string; bearer: string; body?: unknown }[] = [];
 
 function hasExchangedScope(req: http.IncomingMessage, scope: string): boolean {
   const bearer = req.headers.authorization;
@@ -137,6 +138,21 @@ const api = await start(async (req, res) => {
     if (req.headers.authorization !== "Bearer exchanged-mcp:read") return respond(res, 401, {});
     return respond(res, 200, { user_profile: { id: 7, first_name: "Test", last_name: "User", subscriptions: {} } });
   }
+  const endpoint = matchEndpoint(req.method || "GET", new URL(req.url || "/", "http://localhost").pathname);
+  if (endpoint) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+    businessCalls.push({ method: req.method || "", path: req.url || "", bearer: req.headers.authorization || "", body });
+    if (apiMode === "forbidden") return respond(res, 403, { state_message: "unauthorized_model" });
+    if (!hasExchangedScope(req, endpoint.scope)) return respond(res, 401, { state_message: "insufficient_scope" });
+    if (req.url === "/models/email" && req.method === "POST") {
+      // Measured on the deployed API: text alone is refused with empty_html.
+      if (typeof body?.html !== "string" || !body.html.trim()) return respond(res, 400, { state_message: "empty_html" });
+      return respond(res, 200, { state: true, model_id: 81 });
+    }
+    return respond(res, 200, { state: true, results: [], operation: endpoint.path });
+  }
   respond(res, 404, {});
 });
 apiOrigin = api.origin;
@@ -158,12 +174,13 @@ await new Promise<void>((resolve) => reservation.server.close(() => resolve()));
 process.env.OAUTH_MCP_RESOURCE = `http://127.0.0.1:${resourcePort}/mcp`;
 
 const { createHttpServer } = await import("../src/http.js");
-const { isToolExposed, scopesForTool, scopeForRoute, toolAccessTable } = await import("../src/tools.js");
+const { isToolExposed, preflightToolCall, scopesForTool, scopeForRoute, toolAccessTable } = await import("../src/tools.js");
 const { basicClientAuthorization, clearExchangeCache } = await import("../src/oauth/exchange.js");
 const { discoveryUrls, oauthEndpoint, resetDiscovery } = await import("../src/oauth/discovery.js");
 const { resetKeySet } = await import("../src/oauth/verify.js");
 const { loadOAuthConfig } = await import("../src/oauth/config.js");
 const { loadHttpConfig } = await import("../src/http-config.js");
+const { runWithAuth, rawRequest } = await import("../src/magileads.js");
 const { log, redact, redactString } = await import("../src/log.js");
 const mcp = createHttpServer();
 await new Promise<void>((resolve) => mcp.listen(Number(resourcePort), "127.0.0.1", resolve));
@@ -196,8 +213,241 @@ async function rpc(method: string, bearer?: string, params?: unknown): Promise<R
   });
 }
 
+async function toolResult(response: Response): Promise<{ isError?: boolean; content: { text: string }[] }> {
+  const payload = await response.json() as { result: { isError?: boolean; content: { text: string }[] } };
+  return payload.result;
+}
+
+test("generic preflight derives all endpoint scopes and leaves write previews local", () => {
+  for (const row of CALLABLE_ENDPOINTS) {
+    const path = row.path.replace(/\{[^}]+\}/g, "7");
+    expect(preflightToolCall("magileads_request", { method: row.method, path }))
+      .toEqual({ scopes: [row.scope], exchange: !row.write });
+    expect(preflightToolCall("magileads_request", { method: row.method, path, confirm: true }))
+      .toEqual({ scopes: [row.scope], exchange: true });
+  }
+});
+
+test("all dedicated write previews are local, including contact import and composite targeting", async () => {
+  const caller = await token("mcp:read mcp:write");
+  const before = businessCalls.length;
+  const beforeExchanges = exchanges.length;
+  const cases = [
+    { name: "add_contact_to_list", arguments: { contact_list_id: 42, properties: [{ field: "email", value: "example@example.com" }] } },
+    { name: "extract_maps_search", arguments: { google_maps_search_urls: ["https://maps.google.com/search?q=plumber"], contact_list_name: "Test" } },
+    { name: "run_google_maps_targeting", arguments: { search: "plumber", contact_list_name: "Test" } },
+    { name: "create_email_model", arguments: { name: "Test", subject: "Hello", text: "Hello %first_name%" } },
+  ];
+  for (const params of cases) {
+    const response = await rpc("tools/call", caller, params);
+    expect(response.status).toBe(200);
+    expect(JSON.parse((await toolResult(response)).content[0].text).dry_run).toBe(true);
+  }
+  expect(businessCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+});
+
+test("the OAuth API client rejects omitted scopes and excluded routes before making a request", async () => {
+  const before = businessCalls.length;
+  let unauthorized = false;
+  const auth = { kind: "oauth" as const, scopes: ["mcp:read" as const], exchangedBearer: "exchanged-mcp:read",
+    onUnauthorized: () => { unauthorized = true; } };
+  await expect(runWithAuth(auth, () => rawRequest("POST", "/models/email", { name: "Test" })))
+    .rejects.toThrow("does not cover");
+  await expect(runWithAuth(auth, () => rawRequest("GET", "/api-keys"))).rejects.toThrow("not authorized");
+  expect(businessCalls.length).toBe(before);
+  expect(unauthorized).toBe(false);
+});
+
+test("every POST read executes with a read-only bearer, including search and Maps URL generation", async () => {
+  const caller = await token("mcp:read");
+  for (const row of CALLABLE_ENDPOINTS.filter((row) => row.method === "POST" && !row.write)) {
+    const path = row.path.replace(/\{[^}]+\}/g, "7");
+    const before = businessCalls.length;
+    const response = await rpc("tools/call", caller, { name: "magileads_request", arguments: { method: "POST", path, body: {} } });
+    expect(response.status).toBe(200);
+    expect((await toolResult(response)).isError).not.toBe(true);
+    expect(businessCalls.length).toBe(before + 1);
+    expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:read");
+    expect(exchanges.at(-1)?.scope).toBe("mcp:read");
+  }
+});
+
+test("personalized GET writes require confirmation and an exchanged write token", async () => {
+  for (const row of CALLABLE_ENDPOINTS.filter((row) => row.method === "GET" && row.write)) {
+    const caller = await token("mcp:write");
+    const path = row.path.replace(/\{[^}]+\}/g, "7");
+    const args = { method: "GET", path };
+    const before = businessCalls.length;
+    const beforeExchanges = exchanges.length;
+    const preview = await rpc("tools/call", caller, { name: "magileads_request", arguments: args });
+    expect(preview.status).toBe(200);
+    const previewData = JSON.parse((await toolResult(preview)).content[0].text);
+    expect(previewData.dry_run).toBe(true);
+    expect(previewData.would_call.required_scope).toBe("mcp:write");
+    expect(businessCalls.length).toBe(before);
+    expect(exchanges.length).toBe(beforeExchanges);
+    const confirmed = await rpc("tools/call", caller, { name: "magileads_request", arguments: { ...args, confirm: true } });
+    expect(confirmed.status).toBe(200);
+    expect((await toolResult(confirmed)).isError).not.toBe(true);
+    expect(businessCalls.length).toBe(before + 1);
+    expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:write");
+    const unsafeRead = await rpc("tools/call", await token("mcp:read mcp:write"), { name: "magileads_get", arguments: { path } });
+    expect(unsafeRead.status).toBe(200);
+    expect((await toolResult(unsafeRead)).isError).toBe(true);
+    expect(unsafeRead.headers.get("www-authenticate")).toBeNull();
+    expect(businessCalls.length).toBe(before + 1);
+  }
+});
+
+test("model list, confirmed creation and update have the correct separate scopes", async () => {
+  const caller = await token("mcp:read mcp:write");
+  clearExchangeCache();
+  const list = await rpc("tools/call", caller, { name: "magileads_get", arguments: { path: "/models/email" } });
+  expect((await toolResult(list)).isError).not.toBe(true);
+  expect(exchanges.at(-1)?.scope).toBe("mcp:read");
+  const args = { name: "Salutation prénom", subject: "Salut %first_name%", text: "Salut %first_name%" };
+  const before = businessCalls.length;
+  const beforeExchanges = exchanges.length;
+  const preview = await rpc("tools/call", caller, { name: "create_email_model", arguments: args });
+  expect(JSON.parse((await toolResult(preview)).content[0].text).dry_run).toBe(true);
+  expect(businessCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+  const created = await rpc("tools/call", caller, { name: "create_email_model", arguments: { ...args, confirm: true } });
+  expect(created.status).toBe(200);
+  const data = JSON.parse((await toolResult(created)).content[0].text);
+  expect(data.executed).toBe(true);
+  expect(data.result.model_id).toBe(81);
+  expect(businessCalls.at(-1)?.body).toEqual({ ...args, html: "<p>Salut %first_name%</p>" });
+  expect(exchanges.at(-1)?.scope).toBe("mcp:write");
+  const updated = await rpc("tools/call", caller, { name: "magileads_request",
+    arguments: { method: "PUT", path: "/models/email/81", body: { text: "Bonjour %first_name%" }, confirm: true } });
+  expect((await toolResult(updated)).isError).not.toBe(true);
+  expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:write");
+  expect(businessCalls.slice(before).map((call) => call.path)).toEqual(["/models/email", "/models/email/81"]);
+});
+
+test("generic email creation previews and sends the same normalized HTML body", async () => {
+  const caller = await token("mcp:write");
+  const body = { name: "Generic test", subject: "Salut %first_name%", text: "Salut %first_name%\nA < B & C", tags_ids: [7] };
+  const args = { method: "POST", path: "/models/email", body };
+  const before = businessCalls.length;
+  const beforeExchanges = exchanges.length;
+  const preview = await rpc("tools/call", caller, { name: "magileads_request", arguments: args });
+  const previewBody = JSON.parse((await toolResult(preview)).content[0].text).would_call.body;
+  expect(previewBody).toEqual({ ...body, html: "<p>Salut %first_name%<br>A &lt; B &amp; C</p>" });
+  expect(businessCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+  const created = await rpc("tools/call", caller, { name: "magileads_request", arguments: { ...args, confirm: true } });
+  expect((await toolResult(created)).isError).not.toBe(true);
+  expect(businessCalls.at(-1)?.body).toEqual(previewBody);
+  expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:write");
+});
+
+test("dedicated creation handles blank HTML and keeps explicit HTML unchanged", async () => {
+  const caller = await token("mcp:write");
+  for (const input of [
+    { name: "Blank HTML", subject: "Hello", text: "Salut %first_name%", html: " \n " },
+    { name: "Explicit HTML", subject: "Hello", text: "Plain alternative", html: '<div style="color:red">Salut %first_name%</div>' },
+    { name: "HTML only", subject: "Hello", html: "<p>Hello</p>" },
+    { name: "Blank alternative", subject: "Hello", text: "", html: "<p>Hello</p>" },
+  ]) {
+    const preview = await rpc("tools/call", caller, { name: "create_email_model", arguments: input });
+    const previewBody = JSON.parse((await toolResult(preview)).content[0].text).would_call.body;
+    const created = await rpc("tools/call", caller, { name: "create_email_model", arguments: { ...input, confirm: true } });
+    expect((await toolResult(created)).isError).not.toBe(true);
+    expect(businessCalls.at(-1)?.body).toEqual(previewBody);
+    expect(previewBody.html).toBe(input.html.trim() ? input.html : "<p>Salut %first_name%</p>");
+  }
+});
+
+test("API content validation errors remain tool errors, not reconnects or retries", async () => {
+  const caller = await token("mcp:write");
+  const before = businessCalls.length;
+  const response = await rpc("tools/call", caller, { name: "magileads_request",
+    arguments: { method: "POST", path: "/models/email", body: { name: "Missing body" }, confirm: true } });
+  expect(response.status).toBe(200);
+  expect(response.headers.get("www-authenticate")).toBeNull();
+  const result = await toolResult(response);
+  expect(result.isError).toBe(true);
+  expect(result.content[0].text).toContain("empty_html");
+  expect(businessCalls.length).toBe(before + 1);
+});
+
+test("all generic write dry runs and discovery avoid exchange and business calls", async () => {
+  const caller = await token("mcp:read mcp:write");
+  const before = businessCalls.length;
+  const beforeExchanges = exchanges.length;
+  for (const row of CALLABLE_ENDPOINTS.filter((row) => row.write)) {
+    const path = row.path.replace(/\{[^}]+\}/g, "7");
+    const response = await rpc("tools/call", caller, { name: "magileads_request", arguments: { method: row.method, path, confirm: false } });
+    expect(response.status).toBe(200);
+    const data = JSON.parse((await toolResult(response)).content[0].text);
+    expect(data.dry_run).toBe(true);
+    expect(data.would_call.required_scope).toBe(row.scope);
+  }
+  const discovered = await rpc("tools/call", caller, { name: "list_api_endpoints", arguments: { search: "models/email", reads_only: true } });
+  const rows = JSON.parse((await toolResult(discovered)).content[0].text).endpoints;
+  expect(rows.every((row: { scope: string }) => row.scope === "mcp:read")).toBe(true);
+  expect(rows.some((row: { path: string }) => row.path.includes("{contact_id}"))).toBe(false);
+  expect(businessCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+});
+
+test("excluded endpoints and unregistered pagination fail locally without a challenge or exchange", async () => {
+  const caller = await token("mcp:read mcp:write");
+  const before = businessCalls.length;
+  const beforeExchanges = exchanges.length;
+  for (const [method, path] of [["GET", "/api-keys"], ["GET", "/users"], ["GET", "/users/me/page/2"],
+    ["PUT", "/resellers/7/role/7"], ["DELETE", "/models/email/7"], ["PATCH", "/models/email/7"]]) {
+    const response = await rpc("tools/call", caller, { name: "magileads_request", arguments: { method, path, confirm: true } });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect((await toolResult(response)).isError).toBe(true);
+  }
+  expect(businessCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+});
+
+test("wrong scope blocks model writes before exchange; missing body is refused locally", async () => {
+  const before = businessCalls.length;
+  const beforeExchanges = exchanges.length;
+  const response = await rpc("tools/call", await token("mcp:read"), { name: "magileads_request",
+    arguments: { method: "POST", path: "/models/email", body: { name: "Test" }, confirm: true } });
+  expect(response.status).toBe(403);
+  expect(response.headers.get("www-authenticate")).toContain('scope="mcp:write"');
+  const invalid = await rpc("tools/call", await token("mcp:write"), { name: "create_email_model",
+    arguments: { name: "Test", subject: "Test" } });
+  expect((await toolResult(invalid)).isError).toBe(true);
+  expect(businessCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+});
+
+test("a business permission refusal is surfaced without reconnecting", async () => {
+  apiMode = "forbidden";
+  try {
+    const response = await rpc("tools/call", await token("mcp:read"), { name: "magileads_get", arguments: { path: "/models/email/999" } });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    const result = await toolResult(response);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("unauthorized_model");
+  } finally { apiMode = "normal"; }
+});
+
+test("dedicated and generic contact search both request the read scope", async () => {
+  const caller = await token("mcp:read");
+  const dedicated = await rpc("tools/call", caller, { name: "search_contacts", arguments: { contact_list_id: 42, query: "example" } });
+  expect((await toolResult(dedicated)).isError).not.toBe(true);
+  expect(exchanges.at(-1)?.scope).toBe("mcp:read");
+  const generic = await rpc("tools/call", caller, { name: "magileads_request",
+    arguments: { method: "POST", path: "/contact-lists/42/contacts/search", body: { query: "example" } } });
+  expect((await toolResult(generic)).isError).not.toBe(true);
+  expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:read");
+});
+
 test("metadata is available at both RFC and bare paths with CORS", async () => {
-  expect(toolAccessTable().size).toBe(25);
+  expect(toolAccessTable().size).toBe(26);
   for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
     const response = await fetch(`${mcpOrigin}${path}`);
     expect(response.status).toBe(200);
@@ -230,15 +480,15 @@ test("public plugin tool annotations match private-account and open-world behavi
     } }[] };
   };
   const tools = payload.result.tools;
-  expect(tools).toHaveLength(25);
+  expect(tools).toHaveLength(26);
   const openWorld = new Set([
     "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting", "magileads_request",
   ]);
-  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request"]);
+  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model"]);
   for (const tool of tools) {
     expect(tool.annotations.openWorldHint).toBe(openWorld.has(tool.name));
     expect(tool.annotations.readOnlyHint).toBe(!writes.has(tool.name));
-    expect(tool.annotations.destructiveHint).toBe(tool.name === "magileads_request");
+    expect(tool.annotations.destructiveHint).toBe(writes.has(tool.name));
   }
 });
 
@@ -427,7 +677,9 @@ test("read bearer sees and runs read tools, but not write tools; API gets only e
   const names = (await listed.json() as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
   expect(names).toContain("get_account_overview");
   expect(names).not.toContain("add_contact_to_list");
-  expect(names).not.toContain("magileads_request");
+  // The generic request tool now also handles read-scoped POST searches.
+  expect(names).toContain("magileads_request");
+  expect(names).not.toContain("create_email_model");
   const response = await rpc("tools/call", caller, { name: "get_account_overview", arguments: {} });
   expect(response.status).toBe(200);
   expect(apiBearers.at(-1)).toBe("Bearer exchanged-mcp:read");
@@ -487,7 +739,7 @@ test("contact import exchanges read and write scopes and completes its read-then
 test("Google Maps composite exchanges both scopes; standalone extract needs only write", async () => {
   const caller = await token("mcp:read mcp:write");
   const composite = await rpc("tools/call", caller, {
-    name: "run_google_maps_targeting", arguments: { search: "plumber", contact_list_name: "Plumbers" },
+    name: "run_google_maps_targeting", arguments: { search: "plumber", contact_list_name: "Plumbers", confirm: true },
   });
   expect(composite.status).toBe(200);
   const compositeResult = (await composite.json() as { result: { isError?: boolean; content: { text: string }[] } }).result;
@@ -500,7 +752,7 @@ test("Google Maps composite exchanges both scopes; standalone extract needs only
 
   const standalone = await rpc("tools/call", caller, {
     name: "extract_maps_search",
-    arguments: { google_maps_search_urls: ["https://maps.google.com/search?q=plumber"], contact_list_name: "Plumbers" },
+    arguments: { google_maps_search_urls: ["https://maps.google.com/search?q=plumber"], contact_list_name: "Plumbers", confirm: true },
   });
   expect(standalone.status).toBe(200);
   expect(exchanges.at(-1)?.scope).toBe("mcp:write");
@@ -512,7 +764,7 @@ test("token exchange accepts reordered scopes but refuses an unexpected extra sc
     exchangeMode = "reordered_scopes";
     const accepted = await rpc("tools/call", caller, {
       name: "add_contact_to_list",
-      arguments: { contact_list_id: 42, properties: [{ field: "email", value: "test@example.com" }] },
+      arguments: { contact_list_id: 42, properties: [{ field: "email", value: "test@example.com" }], confirm: true },
     });
     expect(accepted.status).toBe(200);
     expect((await accepted.json() as { result: { isError?: boolean } }).result.isError).not.toBe(true);
@@ -521,7 +773,7 @@ test("token exchange accepts reordered scopes but refuses an unexpected extra sc
     clearExchangeCache();
     const refused = await rpc("tools/call", caller, {
       name: "add_contact_to_list",
-      arguments: { contact_list_id: 42, properties: [{ field: "email", value: "test@example.com" }] },
+      arguments: { contact_list_id: 42, properties: [{ field: "email", value: "test@example.com" }], confirm: true },
     });
     expect(refused.status).toBe(502);
   } finally {
@@ -653,9 +905,21 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     const listed = await keyRpc(origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
     expect(listed.status).toBe(200);
     const names = (await listed.json() as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
-    expect(names).toHaveLength(22);
+    expect(names).toHaveLength(23);
     expect(names).toContain("run_google_maps_targeting");
     expect(names).toContain("add_contact_to_list");
+    expect(names).toContain("create_email_model");
+    const beforeModelPreview = businessCalls.length;
+    const preview = await keyRpc(origin, undefined, "tools/call", { name: "create_email_model",
+      arguments: { name: "Public template", subject: "Hello", text: "Hello %first_name%" } },
+      { Authorization: `Bearer ${bearer}` });
+    expect(JSON.parse((await toolResult(preview)).content[0].text).dry_run).toBe(true);
+    expect(businessCalls.length).toBe(beforeModelPreview);
+    const created = await keyRpc(origin, undefined, "tools/call", { name: "create_email_model",
+      arguments: { name: "Public template", subject: "Hello", text: "Hello %first_name%", confirm: true } },
+      { Authorization: `Bearer ${bearer}` });
+    expect((await toolResult(created)).isError).not.toBe(true);
+    expect(businessCalls.at(-1)?.path).toBe("/models/email");
     for (const excluded of ["list_api_endpoints", "magileads_get", "magileads_request"]) {
       expect(names).not.toContain(excluded);
     }
@@ -668,7 +932,7 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     expect(hiddenResult.error !== undefined || hiddenResult.result?.isError === true).toBe(true);
     expect(exchanges.length).toBe(beforeExchanges);
     const keyListed = await keyRpc(origin, "key-alpha", "tools/list");
-    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(22);
+    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(23);
   } finally {
     await close(server);
   }

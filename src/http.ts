@@ -4,13 +4,14 @@ import http from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { buildServer } from "./server.js";
 import { runWithAuth } from "./magileads.js";
-import { accessForTool, isToolExposed, scopesForTool, toolAccessTable } from "./tools.js";
+import { accessForTool, isToolExposed, preflightToolCall, toolAccessTable } from "./tools.js";
 import { log } from "./log.js";
 import { loadHttpConfig, type HttpConfig } from "./http-config.js";
 import { oauthConfig } from "./oauth/config.js";
 import { AuthorizationServiceUnavailable } from "./oauth/discovery.js";
 import { exchangeToken, invalidateExchange, ReauthenticationRequired } from "./oauth/exchange.js";
 import { protectedResourceMetadata, sendChallenge } from "./oauth/metadata.js";
+import type { Scope } from "./oauth/scopes.js";
 import { bearerFrom, InvalidTokenError, verifyAccessToken } from "./oauth/verify.js";
 
 function json(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -161,14 +162,22 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
   }
 
   const access = name && isToolExposed(name, config.toolProfile) ? accessForTool(name) : undefined;
-  const requiredScopes = access ? scopesForTool(access) : [];
+  let plan: { scopes: Scope[]; exchange: boolean } = { scopes: [], exchange: false };
+  try {
+    if (access && name) plan = preflightToolCall(name, (body as { params?: { arguments?: unknown } }).params?.arguments);
+  } catch (error) {
+    // Invalid/excluded routes are local tool errors, not authentication failures.
+    return json(res, 200, { jsonrpc: "2.0", id: (body as { id?: unknown }).id ?? null,
+      result: { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : "Invalid operation." }] } });
+  }
+  const requiredScopes = plan.scopes;
   const scopeValue = requiredScopes.join(" ");
   if (access && caller && !requiredScopes.every((scope) => caller.scopes.includes(scope))) {
     return sendChallenge(res, 403, scopeValue);
   }
 
   let exchangedBearer: string | undefined;
-  if (access && credential.kind === "oauth") {
+  if (access && plan.exchange && credential.kind === "oauth") {
     try {
       exchangedBearer = await exchangeToken(credential.bearer, requiredScopes);
     } catch (error) {
@@ -189,7 +198,7 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
   const unauthorized = () => credential.kind === "oauth" ? sendChallenge(res, 401) : apiKeyUnauthorized(res);
   try {
     const requestAuth = credential.kind === "oauth"
-      ? { kind: "oauth" as const, exchangedBearer, onUnauthorized: () => { apiUnauthorized = true; } }
+      ? { kind: "oauth" as const, exchangedBearer, scopes: requiredScopes, onUnauthorized: () => { apiUnauthorized = true; } }
       : { kind: "apiKey" as const, apiKey: credential.apiKey, onUnauthorized: () => { apiUnauthorized = true; } };
     await runWithAuth(requestAuth, async () => {
       await server.connect(transport);

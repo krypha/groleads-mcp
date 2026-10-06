@@ -1,7 +1,7 @@
 {
   "name": "magileads-mcp",
-  "version": "0.10.0",
-  "description": "Magileads MCP — exposes Magileads (targeting, contact lists, campaign audit, PRM, and all OpenAPI endpoints except DELETE) as tools for AI agents. Runs on Bun. Stdio + HTTP transports.",
+  "version": "0.11.0",
+  "description": "Magileads MCP — targeting, contact lists, campaign audit, PRM, email templates and explicitly authorized business API operations. Runs on Bun. Stdio + HTTP transports.",
   "type": "module",
   "bin": {
     "magileads-mcp": "dist/index.js"
@@ -24,7 +24,7 @@
     "typecheck": "tsc --noEmit",
     "gen:endpoints": "bun run scripts/generate-endpoints.mjs",
     "tools:table": "bun run scripts/tool-table.ts",
-    "test:oauth": "bun test tests/oauth.test.ts",
+    "test:oauth": "bun test tests/endpoints.test.ts tests/email-model.test.ts tests/oauth.test.ts",
     "check:oauth": "bun run scripts/check-oauth.ts"
   },
   "dependencies": {

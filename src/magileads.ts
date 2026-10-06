@@ -14,6 +14,8 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { resolveEndpoint } from "./endpoints.js";
+import type { Scope } from "./oauth/scopes.js";
 
 const API_BASE = (process.env.MAGILEADS_API_BASE || "https://app.api-magileads.net").replace(
   /\/+$/,
@@ -39,7 +41,7 @@ export function authMode(): AuthMode {
  */
 export type RequestAuth =
   | { kind: "apiKey"; apiKey: string; onUnauthorized?: () => void }
-  | { kind: "oauth"; exchangedBearer?: string; onUnauthorized?: () => void };
+  | { kind: "oauth"; exchangedBearer?: string; scopes: readonly Scope[]; onUnauthorized?: () => void };
 const authStore = new AsyncLocalStorage<RequestAuth>();
 
 /** Run `fn` with `auth` as the active per-request credential. */
@@ -188,6 +190,13 @@ async function authHeaders(): Promise<Record<string, string>> {
 /* -------------------------------------------------------------------------- */
 
 async function api<T>(path: string, init: RequestInit = {}, retryOn401 = true): Promise<T> {
+  const auth = authStore.getStore();
+  if (auth?.kind === "oauth") {
+    const { endpoint } = resolveEndpoint(init.method || "GET", path);
+    if (!auth.scopes.includes(endpoint.scope)) {
+      throw new MagileadsError("The exchanged token does not cover this API operation.", 403, "insufficient_scope");
+    }
+  }
   const headers = await authHeaders();
   const base = authStore.getStore()?.kind === "oauth" ? OAUTH_API_BASE : API_BASE;
   const res = await fetch(`${base}${path}`, {

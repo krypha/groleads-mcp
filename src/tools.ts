@@ -31,7 +31,8 @@ import {
   type Raw,
   type ContactsPage,
 } from "./magileads.js";
-import { MAGILEADS_ENDPOINTS, type EndpointDef } from "./endpoints.generated.js";
+import { CALLABLE_ENDPOINTS, matchEndpoint, resolveEndpoint } from "./endpoints.js";
+import { MAX_EMAIL_HTML_LENGTH, normalizeEmailCreation } from "./email-model.js";
 import { SCOPES, type Scope } from "./oauth/scopes.js";
 
 const MAX_LINKS = 40;
@@ -481,76 +482,11 @@ function customStatusView(
 }
 
 /* -------------------------------------------------------------------------- */
-/* Generic passthrough helpers (all OpenAPI endpoints except DELETE)            */
+/* Generic passthrough helpers (explicit backend business contract)            */
 /* -------------------------------------------------------------------------- */
 
 const MAX_PASSTHROUGH_BYTES = 60_000; // cap giant payloads to protect agent context
 
-/** Turn a path template (`/contact-lists/{id}/contacts`) into an anchored regex. */
-function templateToRegex(tpl: string): RegExp {
-  const literals = tpl.split(/\{[^}]+\}/g).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  return new RegExp(`^${literals.join("[^/]+")}$`);
-}
-
-/** DELETE is excluded by the generator and filtered again here as a runtime backstop. */
-const CALLABLE_ENDPOINTS: EndpointDef[] = MAGILEADS_ENDPOINTS.filter(
-  (endpoint) => String(endpoint.method) !== "DELETE",
-);
-
-const ENDPOINT_MATCHERS: (EndpointDef & { re: RegExp })[] = CALLABLE_ENDPOINTS.map((e) => ({
-  ...e,
-  re: templateToRegex(e.path),
-}));
-
-/**
- * Find the indexed endpoint matching a concrete (method, path); null if none.
- * Also matches the API's own cursor-pagination URL forms — `.../page/{n}` and
- * `.../{cursor}/page/{n}` — by falling back to the base template, so an agent can
- * follow `next_page`/`current_page` URLs through the passthrough.
- */
-function matchEndpoint(method: string, path: string): EndpointDef | null {
-  const m = method.toUpperCase();
-  const clean = (path.split("?")[0] || "/").replace(/\/+$/, "") || "/";
-  const candidates = [clean];
-  const stripPage = clean.replace(/\/page\/\d+$/, ""); // .../page/{n}
-  if (stripPage !== clean) candidates.push(stripPage);
-  const stripCursor = clean.replace(/\/[^/]+\/page\/\d+$/, ""); // .../{cursor}/page/{n}
-  if (stripCursor !== clean && stripCursor !== stripPage) candidates.push(stripCursor);
-  for (const c of candidates) {
-    const hit = ENDPOINT_MATCHERS.find((e) => e.method === m && e.re.test(c));
-    if (hit) return hit;
-  }
-  return null;
-}
-
-/** Split a raw path (or full URL), merge an optional query object; returns {base (for matching), full (for the call)}. */
-function buildPath(rawPath: string, query?: Raw): { base: string; full: string } {
-  let raw = String(rawPath).trim();
-  let existing = "";
-  if (/^https?:\/\//i.test(raw)) {
-    try {
-      const u = new URL(raw); // accept the API's echoed next_page/current_page URLs
-      raw = u.pathname;
-      existing = u.search.replace(/^\?/, "");
-    } catch {
-      /* fall through */
-    }
-  } else {
-    const parts = raw.split("?");
-    raw = parts[0];
-    existing = parts[1] || "";
-  }
-  const base = ("/" + raw.replace(/^\/+/, "")).replace(/\/+$/, "") || "/";
-  const params = new URLSearchParams(existing);
-  if (query && typeof query === "object") {
-    for (const [k, v] of Object.entries(query)) {
-      if (v === undefined || v === null) continue;
-      params.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
-    }
-  }
-  const qs = params.toString();
-  return { base, full: qs ? `${base}?${qs}` : base };
-}
 
 /** Serialize a passthrough result, capping oversized payloads (invalid-JSON-safe). */
 function capResult(data: unknown): Raw {
@@ -593,18 +529,19 @@ function contactsView(
 type ToolAccess = {
   scope: Scope;
   routes: readonly string[];
-  /** For a non-GET route whose API permission differs from the tool's primary scope. */
+  dynamic?: boolean;
+  /** Optional assertion against the backend contract (never a method-based override). */
   routeScopes?: Readonly<Record<string, Scope>>;
 };
 export type ToolProfile = "full" | "public";
 
 // The public catalogue is explicit: new tools need a review before exposure.
-// The generic passthrough is deliberately absent because it can reach admin,
-// billing, user and irreversible outbound actions.
+// The generic passthrough remains hidden: its broad business surface includes
+// outbound sending and paid generation. Public writes use reviewed dedicated tools.
 const PUBLIC_TOOLS = new Set([
   "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting",
   "list_contact_lists", "get_contact_list_status", "list_contact_fields",
-  "add_contact_to_list", "preview_contact_selection",
+  "add_contact_to_list", "preview_contact_selection", "create_email_model",
   "list_campaigns", "get_campaign", "get_scenario", "get_campaign_statistics",
   "get_account_overview", "list_linkedin_accounts", "search_contact_lists",
   "get_contact_list", "query_contacts", "search_contacts",
@@ -617,10 +554,16 @@ export function isToolExposed(name: string, profile: ToolProfile): boolean {
 const catalog = new Map<string, ToolAccess>();
 let catalogReady = false;
 
-/** API GET routes are reads; non-GET routes use the declared tool scope unless overridden. */
+/** Dedicated routes use the same explicit backend contract as generic calls. */
 export function scopeForRoute(access: ToolAccess, route: string): Scope {
   if (!access.routes.includes(route)) throw new Error(`Undeclared API route: ${route}`);
-  return access.routeScopes?.[route] ?? (route.startsWith("GET ") ? "mcp:read" : access.scope);
+  if (route.startsWith("(")) return access.scope;
+  const split = route.indexOf(" ");
+  const endpoint = matchEndpoint(route.slice(0, split), route.slice(split + 1));
+  if (!endpoint) throw new Error(`Route missing from the backend OAuth contract: ${route}`);
+  const override = access.routeScopes?.[route];
+  if (override && override !== endpoint.scope) throw new Error(`Scope override disagrees with the contract: ${route}`);
+  return endpoint.scope;
 }
 
 /** The complete, deterministic scope union needed for an API token exchange. */
@@ -637,6 +580,27 @@ export function toolAccessTable(): ReadonlyMap<string, ToolAccess> {
 
 export function accessForTool(name: string): ToolAccess | undefined {
   return toolAccessTable().get(name);
+}
+
+/** Resolve concrete generic operations before exchange, including non-mutating previews. */
+export function preflightToolCall(name: string, args: unknown): { scopes: Scope[]; exchange: boolean } {
+  const access = accessForTool(name);
+  if (!access) return { scopes: [], exchange: false };
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args as Raw : {};
+  if (access.dynamic) {
+    if (typeof input.path !== "string" || (name === "magileads_request" && typeof input.method !== "string")) {
+      throw new Error("A concrete API path and HTTP method are required.");
+    }
+    const method = name === "magileads_get" ? "GET" : String(input.method);
+    const { endpoint } = resolveEndpoint(method, input.path);
+    if (name === "magileads_get" && endpoint.write) {
+      throw new Error("This GET generates content and requires mcp:write. Use magileads_request with method:GET and confirm:true.");
+    }
+    return { scopes: [endpoint.scope], exchange: !endpoint.write || input.confirm === true };
+  }
+  const scopes = scopesForTool(access);
+  return { scopes, exchange: name !== "list_api_endpoints" &&
+    !(scopes.includes("mcp:write") && input.confirm !== true) };
 }
 
 /** Each access declaration sits immediately beside its tool definition. */
@@ -656,7 +620,8 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         throw new Error(`Conflicting tool access declaration: ${name}`);
       }
       catalog.set(name, access);
-      if (allowedScopes && !scopesForTool(access).every((scope) => allowedScopes.includes(scope))) return {};
+      if (allowedScopes && !(access.dynamic && name === "magileads_request"
+        ? allowedScopes.length > 0 : scopesForTool(access).every((scope) => allowedScopes.includes(scope)))) return {};
       if (!isToolExposed(name, profile)) return {};
       return (target.registerTool as (...values: unknown[]) => unknown).call(target, name, ...args);
     }) as McpServer["registerTool"];
@@ -713,7 +678,8 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "a Magileads contact list. Accepts up to 10 URLs per call. Provide either `contact_list_name` " +
         "(creates a new list) or `contact_list_id` (appends to an existing one). Extraction runs " +
         "asynchronously: this returns the target list id immediately, then poll " +
-        "`get_contact_list_status` until its extraction job reaches 'completed'.",
+        "`get_contact_list_status` until its extraction job reaches 'completed'. " +
+        "Dry run until confirm:true; no extraction or credits consumed during the preview.",
       inputSchema: {
         google_maps_search_urls: z
           .array(z.string().url())
@@ -735,14 +701,16 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           .positive()
           .optional()
           .describe("Id of an EXISTING contact list to append the results to."),
+        confirm: z.boolean().optional().describe("Must be true to start extraction; otherwise returns a local preview."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
     async ({
       google_maps_search_urls,
       max_results,
       contact_list_name,
       contact_list_id,
+      confirm,
     }): Promise<TextResult> => {
       try {
         const name = contact_list_name?.trim();
@@ -754,11 +722,15 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         ).slice(0, MAX_URLS_PER_EXTRACT);
         if (!urls.length) return fail(new Error("No valid URLs provided."));
 
-        const res = await extractMaps({
+        const body = {
           google_maps_search_urls: urls,
           max_results: clamp(Math.trunc(max_results ?? 100), 1, MAX_RESULTS),
           ...(name ? { contact_list_name: name } : { contact_list_id: contact_list_id! }),
-        });
+        };
+        if (confirm !== true) return ok({ dry_run: true, would_call: {
+          method: "POST", path: "/targeting/google/extract-maps-search", required_scope: "mcp:write", body },
+          note: "Nothing was sent. Re-call with confirm:true to launch extraction, which may consume credits." });
+        const res = await extractMaps(body);
         return ok({
           contact_list_id: res.contact_list_id,
           urls_submitted: urls.length,
@@ -783,7 +755,8 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "One-shot convenience: generate Google Maps search URLs from a query and immediately extract " +
         "businesses from them into a contact list. Combines generate_maps_search_urls + " +
         "extract_maps_search. Use this when you don't need to review the URLs first. Extraction is " +
-        "asynchronous — poll get_contact_list_status afterwards.",
+        "asynchronous — poll get_contact_list_status afterwards. " +
+        "Local dry run until confirm:true; URL generation and extraction happen only after confirmation.",
       inputSchema: {
         search: z.string().min(1).describe("Business type / keyword, e.g. 'coworking space'."),
         locations: z
@@ -804,20 +777,28 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           .int()
           .optional()
           .describe(`Max businesses to extract (1–${MAX_RESULTS}, default 100).`),
+        confirm: z.boolean().optional().describe("Must be true to generate URLs and start extraction; otherwise returns a local plan."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    async ({ search, locations, contact_list_name, max_links, max_results }): Promise<TextResult> => {
+    async ({ search, locations, contact_list_name, max_links, max_results, confirm }): Promise<TextResult> => {
       try {
         const name = contact_list_name.trim();
         if (!name) return fail(new Error("contact_list_name must not be blank."));
-        const gen = await generateMapsUrls({
+        const generationBody = {
           search: search.trim(),
           ...(locations && locations.length
             ? { locations: locations.map((l) => l.trim()).filter(Boolean) }
             : {}),
-          max_links: clamp(Math.trunc(max_links ?? 5), 1, MAX_LINKS),
-        });
+          max_links: clamp(Math.trunc(max_links ?? 5), 1, MAX_URLS_PER_EXTRACT),
+        };
+        const extractionBody = { max_results: clamp(Math.trunc(max_results ?? 100), 1, MAX_RESULTS), contact_list_name: name };
+        if (confirm !== true) return ok({ dry_run: true, required_scopes: ["mcp:read", "mcp:write"], would_calls: [
+          { method: "POST", path: "/targeting/google/generate-maps-search-urls", required_scope: "mcp:read", body: generationBody },
+          { method: "POST", path: "/targeting/google/extract-maps-search", required_scope: "mcp:write",
+            body_to_complete: extractionBody, google_maps_search_urls_source: "Result of the first operation" },
+        ], note: "No API call was made. Re-call with confirm:true to generate URLs and launch extraction, which may consume credits." });
+        const gen = await generateMapsUrls(generationBody);
         const urls = (gen.google_maps_search_urls ?? [])
           .filter((u): u is string => typeof u === "string" && u.length > 0)
           .slice(0, MAX_URLS_PER_EXTRACT);
@@ -977,10 +958,14 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           .optional()
           .describe("Must be true to import the contact; omitted/false returns a dry run."),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     async ({ contact_list_id, properties, confirm }): Promise<TextResult> => {
       try {
+        if (confirm !== true) return ok({ dry_run: true, contact_list_id,
+          would_call: { method: "POST", path: `/contact-lists/${contact_list_id}/contact`, required_scope: "mcp:write" },
+          properties_to_resolve: properties,
+          note: "No API call was made. Field identifiers and list access will be validated before importing when confirm:true." });
         const [list, { identifierToId }] = await Promise.all([
           getContactList(contact_list_id),
           dataFieldMaps(),
@@ -994,22 +979,6 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           seen.add(data_field_id);
           return { data_field_id, value: property.value };
         });
-        const body = { properties: resolved };
-
-        if (confirm !== true) {
-          return ok({
-            dry_run: true,
-            contact_list_id,
-            list_name: list.name,
-            would_call: {
-              method: "POST",
-              path: `/contact-lists/${contact_list_id}/contact`,
-              body,
-            },
-            note: "Nothing was sent. Re-call with confirm:true to import this contact.",
-          });
-        }
-
         const result = await addContactToList(contact_list_id, resolved);
         return ok({
           executed: true,
@@ -2011,9 +1980,41 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   );
 
   /* ------------------------------------------------------------------------ */
-  /* Generic API passthrough — every OpenAPI endpoint except DELETE            */
-  /* The generated index includes every tag, including administration. Writes */
-  /* are dry-run until confirm:true. Prefer dedicated tools for common tasks.  */
+  /* Create an email template without sending it or calling an AI provider.    */
+  register({ scope: "mcp:write", routes: ["POST /models/email"] })(
+    "create_email_model",
+    {
+      title: "Create an email model (template)",
+      description: "Save an email template, without sending emails or generating paid AI content. " +
+        "Provide a name, subject and text and/or HTML body. Text-only content is safely converted to the HTML " +
+        "required by Magileads, preserving line breaks and placeholders such as %first_name%; explicit HTML is unchanged. " +
+        "Returns a local dry run until confirm:true. Prefer this tool over the generic API for template creation.",
+      inputSchema: {
+        name: z.string().trim().min(1).max(200).describe("Template name."),
+        subject: z.string().trim().min(1).max(1000).describe("Email subject."),
+        text: z.string().max(100_000).optional().describe("Plain-text body, preserving personalization placeholders. May be blank when a nonempty HTML body is supplied."),
+        html: z.string().max(MAX_EMAIL_HTML_LENGTH).optional().describe("Optional HTML body, preserved as supplied. If missing/blank, generated from text. Supply at least text or HTML."),
+        folder_id: z.number().int().positive().optional(),
+        tags_ids: z.array(z.number().int().positive()).max(100).optional(),
+        confirm: z.boolean().optional().describe("Must be true to save the template. Otherwise nothing is sent."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ name, subject, text, html, folder_id, tags_ids, confirm }): Promise<TextResult> => {
+      try {
+        if (!text?.trim() && !html?.trim()) throw new Error("Supply a nonempty text or HTML email body.");
+        const body = normalizeEmailCreation({ name, subject, ...(text !== undefined ? { text } : {}), ...(html !== undefined ? { html } : {}),
+          ...(folder_id !== undefined ? { folder_id } : {}), ...(tags_ids !== undefined ? { tags_ids } : {}) });
+        if (confirm !== true) return ok({ dry_run: true,
+          would_call: { method: "POST", path: "/models/email", required_scope: "mcp:write", body },
+          note: "Nothing was sent. Re-call with confirm:true to save this template. No email will be sent." });
+        const data = await rawRequest("POST", "/models/email", body);
+        return ok({ executed: true, method: "POST", path: "/models/email", ...capResult(data) });
+      } catch (error) { return fail(error); }
+    },
+  );
+
+  /* Generic API passthrough — explicit business route contract only.          */
   /* ------------------------------------------------------------------------ */
 
   register({ scope: "mcp:read", routes: ["(local endpoint index)"] })(
@@ -2022,16 +2023,16 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       title: "Discover callable Magileads API endpoints",
       description:
         "List the Magileads API endpoints the generic tools (magileads_get / magileads_request) " +
-        "can call — every endpoint in the OpenAPI specification except DELETE, including admin, " +
-        "billing, reseller, team, and user endpoints. Filter by `search` (substring on path/summary/" +
+        "can call — only operations in the backend OAuth business contract, with explicit scopes. " +
+        "Administrative/secret endpoints, DELETE and PATCH are excluded. Filter by `search` (substring on path/summary/" +
         "tag), `method`, or `writes_only`/" +
         "`reads_only`. Use this to find the exact `path` + `method` to pass to magileads_get / " +
         "magileads_request.",
       inputSchema: {
         search: z.string().optional().describe("Substring filter on path, summary, or tag (case-insensitive)."),
-        method: z.enum(["GET", "POST", "PUT", "PATCH"]).optional().describe("Filter by HTTP method."),
-        reads_only: z.boolean().optional().describe("Only GET (read) endpoints."),
-        writes_only: z.boolean().optional().describe("Only write (POST/PUT/PATCH) endpoints."),
+        method: z.enum(["GET", "POST", "PUT"]).optional().describe("Filter by HTTP method."),
+        reads_only: z.boolean().optional().describe("Only mcp:read endpoints, including POST reads."),
+        writes_only: z.boolean().optional().describe("Only mcp:write endpoints, including generating GET operations."),
         limit: z.number().int().optional().describe("Max endpoints to return (1–200, default 60)."),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
@@ -2053,8 +2054,8 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           total_available: CALLABLE_ENDPOINTS.length,
           matched: total,
           returned: rows.length,
-          endpoints: rows.map((e) => ({ method: e.method, path: e.path, tag: e.tag, summary: e.summary, write: e.write })),
-          note: "Pass a concrete path (fill {params}) to magileads_get (GET) or magileads_request (writes).",
+          endpoints: rows.map((e) => ({ method: e.method, path: e.path, tag: e.tag, summary: e.summary, scope: e.scope, write: e.write })),
+          note: "Use magileads_get for GET reads; magileads_request for POST reads and all writes (even GET writes).",
         });
       } catch (err) {
         return fail(err);
@@ -2062,34 +2063,27 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
     },
   );
 
-  register({ scope: "mcp:read", routes: ["GET {indexed non-DELETE path}"] })(
+  register({ scope: "mcp:read", routes: ["(resolved GET read endpoint)"], dynamic: true })(
     "magileads_get",
     {
       title: "Call any Magileads API GET endpoint",
       description:
         "Read-only escape hatch: GET any indexed Magileads endpoint that no dedicated " +
-        "tool covers. Provide `path` (e.g. '/blacklists' or '/contact-lists/123') with {params} filled " +
+        "tool covers. Provide `path` (e.g. '/models/email' or '/contact-lists/123') with {params} filled " +
         "in, and optional `query` params (object; object values are JSON-encoded, e.g. " +
         "{ options: { per_page: 10 } }). Discover paths with list_api_endpoints. Only GET is allowed " +
-        "here (use magileads_request for writes). Large responses are truncated with a note.",
+        "here; generating GET operations are refused (use magileads_request with method:GET and confirm:true). " +
+        "Large responses are truncated with a note.",
       inputSchema: {
-        path: z.string().min(1).describe("API path with a leading slash, {params} filled in, e.g. '/blacklists'."),
+        path: z.string().min(1).describe("API path with a leading slash, {params} filled in, e.g. '/models/email'."),
         query: z.record(z.any()).optional().describe("Optional query params. Object/array values are JSON-encoded (e.g. options/filter)."),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
     async ({ path, query }): Promise<TextResult> => {
       try {
-        const { base, full } = buildPath(path, query as Raw | undefined);
-        const ep = matchEndpoint("GET", base);
-        if (!ep) {
-          return fail(
-            new Error(
-              `GET ${base} is not an indexed read endpoint ` +
-                `(it may use another method or not exist). Use list_api_endpoints to find valid paths.`,
-            ),
-          );
-        }
+        const { endpoint: ep, full } = resolveEndpoint("GET", path, query as Raw | undefined);
+        if (ep.write) throw new Error("This GET requires mcp:write and confirmation. Use magileads_request with method:GET.");
         const data = await rawRequest("GET", full);
         return ok({ method: "GET", path: full, tag: ep.tag, ...capResult(data) });
       } catch (err) {
@@ -2098,48 +2092,42 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
     },
   );
 
-  register({ scope: "mcp:write", routes: ["POST|PUT|PATCH {indexed path}"] })(
+  register({ scope: "mcp:write", routes: ["(resolved endpoint scope)"], dynamic: true })(
     "magileads_request",
     {
-      title: "Call any Magileads API write endpoint except DELETE (guarded)",
+      title: "Call an authorized Magileads business endpoint (guarded writes)",
       description:
-        "Escape hatch for WRITES (POST/PUT/PATCH) on any indexed Magileads " +
+        "Escape hatch for GET/POST/PUT operations on an explicitly authorized Magileads business " +
         "endpoint not covered by a dedicated tool — creating lists/models, sending LinkedIn " +
-        "messages, imports, PRM exclusions, status changes, etc. GUARDED: it does a DRY RUN by " +
-        "default (shows exactly what would be sent and changes nothing); set `confirm:true` to " +
-        "actually execute. Every OpenAPI tag is included, including administration; HTTP DELETE " +
-        "is unavailable. Discover paths with list_api_endpoints and review the dry run first.",
+        "messages, imports, PRM exclusions, status changes, etc. The endpoint's explicit scope controls " +
+        "execution: mcp:read operations (including POST searches/statistics) execute without confirmation. " +
+        "mcp:write operations (including personalized GET generation) are DRY RUN until confirm:true. " +
+        "For POST /models/email, text-only non-AI/non-editor creations get escaped HTML; explicit HTML is preserved. " +
+        "DELETE, PATCH and undocumented/admin endpoints are unavailable. Discover paths with list_api_endpoints.",
       inputSchema: {
-        method: z.enum(["POST", "PUT", "PATCH"]).describe("HTTP method for the write (DELETE is not available)."),
+        method: z.enum(["GET", "POST", "PUT"]).describe("Actual HTTP method. Required scope is determined by the endpoint, not this method."),
         path: z.string().min(1).describe("API path with a leading slash, {params} filled in."),
         query: z.record(z.any()).optional().describe("Optional query params (object/array values are JSON-encoded)."),
         body: z.any().optional().describe("Optional JSON request body."),
-        confirm: z.boolean().optional().describe("Must be true to actually send the request; otherwise a dry run is returned."),
+        confirm: z.boolean().optional().describe("Must be true for any mcp:write operation, even GET; read operations need no confirmation."),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
     async ({ method, path, query, body, confirm }): Promise<TextResult> => {
       try {
-        const { base, full } = buildPath(path, query as Raw | undefined);
-        const ep = matchEndpoint(method, base);
-        if (!ep) {
-          return fail(
-            new Error(
-              `${method} ${base} is not an indexed endpoint ` +
-                `(it may use another method or not exist). Use list_api_endpoints to find valid write paths.`,
-            ),
-          );
-        }
-        if (confirm !== true) {
+        const { endpoint: ep, full } = resolveEndpoint(method, path, query as Raw | undefined);
+        if (method === "GET" && body !== undefined) throw new Error("GET operations accept query parameters, not a body.");
+        const requestBody = ep.method === "POST" && ep.path === "/models/email" ? normalizeEmailCreation(body) : body;
+        if (ep.write && confirm !== true) {
           return ok({
             dry_run: true,
-            would_call: { method, path: full, body: body ?? null },
-            endpoint: { tag: ep.tag, summary: ep.summary },
+            would_call: { method, path: full, body: requestBody ?? null, required_scope: ep.scope },
+            endpoint: { tag: ep.tag, summary: ep.summary, scope: ep.scope },
             note: "Nothing was sent. Re-call with confirm:true to execute this write.",
           });
         }
-        const data = await rawRequest(method, full, body);
-        return ok({ executed: true, method, path: full, tag: ep.tag, ...capResult(data) });
+        const data = await rawRequest(method, full, requestBody);
+        return ok({ executed: true, method, path: full, tag: ep.tag, scope: ep.scope, ...capResult(data) });
       } catch (err) {
         return fail(err);
       }

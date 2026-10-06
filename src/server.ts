@@ -6,7 +6,7 @@ import type { Scope } from "./oauth/scopes.js";
 export function buildServer(allowedScopes?: readonly Scope[], profile: ToolProfile = "full"): McpServer {
   const server = new McpServer({
     name: "magileads-mcp",
-    version: "0.10.0",
+    version: "0.11.0",
   });
   registerTools(server, allowedScopes, profile);
   return server;
