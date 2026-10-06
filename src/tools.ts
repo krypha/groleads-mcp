@@ -34,6 +34,7 @@ import {
 import { CALLABLE_ENDPOINTS, matchEndpoint, resolveEndpoint } from "./endpoints.js";
 import { MAX_EMAIL_HTML_LENGTH, normalizeEmailCreation } from "./email-model.js";
 import { SCOPES, type Scope } from "./oauth/scopes.js";
+import { CREATION_GUIDANCE } from "./instructions.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -623,6 +624,11 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       if (allowedScopes && !(access.dynamic && name === "magileads_request"
         ? allowedScopes.length > 0 : scopesForTool(access).every((scope) => allowedScopes.includes(scope)))) return {};
       if (!isToolExposed(name, profile)) return {};
+      // Repeat creation guidance in tool discovery for hosts that ignore initialize.instructions.
+      if (access.scope === "mcp:write") {
+        const config = args[0] as { description?: string };
+        args[0] = { ...config, description: `${config.description ?? ""} ${CREATION_GUIDANCE}`.trim() };
+      }
       return (target.registerTool as (...values: unknown[]) => unknown).call(target, name, ...args);
     }) as McpServer["registerTool"];
 

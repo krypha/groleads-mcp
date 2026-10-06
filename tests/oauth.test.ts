@@ -3,6 +3,7 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { CALLABLE_ENDPOINTS, matchEndpoint } from "../src/endpoints.js";
+import { CREATION_GUIDANCE } from "../src/instructions.js";
 
 async function start(handler: http.RequestListener): Promise<{ server: http.Server; origin: string }> {
   const server = http.createServer(handler);
@@ -298,6 +299,47 @@ test("personalized GET writes require confirmation and an exchanged write token"
     expect(unsafeRead.headers.get("www-authenticate")).toBeNull();
     expect(businessCalls.length).toBe(before + 1);
   }
+});
+
+test("initialization and all write descriptions advertise creation without duplicate checks", async () => {
+  const caller = await token("mcp:read mcp:write");
+  const before = businessCalls.length;
+  const initialized = await rpc("initialize", caller, {
+    protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1" },
+  });
+  expect(initialized.status).toBe(200);
+  const initialization = await initialized.json() as { result: { instructions: string; serverInfo: { version: string } } };
+  expect(initialization.result.instructions).toBe(CREATION_GUIDANCE);
+  expect(initialization.result.serverInfo.version).toBe("0.11.1");
+  const listed = await rpc("tools/list", caller);
+  const tools = (await listed.json() as { result: { tools: {
+    name: string; description: string; annotations: { readOnlyHint: boolean };
+  }[] } }).result.tools;
+  for (const tool of tools) {
+    expect(tool.description.includes(CREATION_GUIDANCE)).toBe(!tool.annotations.readOnlyHint);
+  }
+  expect(businessCalls.length).toBe(before);
+});
+
+test("separately confirmed same-name creations execute once each without listing any resource", async () => {
+  // A write-only caller cannot list anything: both creation paths must remain independent of reads.
+  const caller = await token("mcp:write");
+  const before = businessCalls.length;
+  const email = { name: "Salutation prénom", subject: "Salut %first_name%", text: "Salut %first_name%" };
+  for (const creation of [
+    { name: "create_email_model", arguments: { ...email, confirm: true } },
+    { name: "magileads_request", arguments: { method: "POST", path: "/contact-lists", body: { name: "Same name" }, confirm: true } },
+  ]) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await rpc("tools/call", caller, creation);
+      expect(response.status).toBe(200);
+      expect((await toolResult(response)).isError).not.toBe(true);
+    }
+  }
+  expect(businessCalls.slice(before).map(({ method, path }) => ({ method, path }))).toEqual([
+    { method: "POST", path: "/models/email" }, { method: "POST", path: "/models/email" },
+    { method: "POST", path: "/contact-lists" }, { method: "POST", path: "/contact-lists" },
+  ]);
 });
 
 test("model list, confirmed creation and update have the correct separate scopes", async () => {
@@ -904,7 +946,11 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     const bearer = await token("mcp:read mcp:write");
     const listed = await keyRpc(origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
     expect(listed.status).toBe(200);
-    const names = (await listed.json() as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
+    const tools = (await listed.json() as { result: { tools: { name: string; description: string }[] } }).result.tools;
+    const names = tools.map((tool) => tool.name);
+    for (const name of ["create_email_model", "add_contact_to_list", "extract_maps_search", "run_google_maps_targeting"]) {
+      expect(tools.find((tool) => tool.name === name)?.description).toContain(CREATION_GUIDANCE);
+    }
     expect(names).toHaveLength(23);
     expect(names).toContain("run_google_maps_targeting");
     expect(names).toContain("add_contact_to_list");

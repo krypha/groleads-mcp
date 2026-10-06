@@ -1,6 +1,6 @@
 {
   "name": "magileads-mcp",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Magileads MCP — targeting, contact lists, campaign audit, PRM, email templates and explicitly authorized business API operations. Runs on Bun. Stdio + HTTP transports.",
   "type": "module",
   "bin": {

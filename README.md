@@ -244,6 +244,21 @@ it does not send emails, generate paid AI content or retry an uncertain write.
 The generic API is JSON-only; authorizing a multipart upload or file export route
 does not add binary upload/download handling to these tools.
 
+### Creation and duplicates
+
+For all resource types, a requested creation does not require a duplicate/name search.
+Duplicate names/resources are acceptable unless the user explicitly asks for uniqueness,
+deduplication or reuse. A failed or truncated listing must not block creation just to
+prevent duplicates. Required permission checks, field resolution and existing target-ID
+lookups remain in place, as do backend uniqueness constraints and `confirm:true` guards.
+This guidance is exposed both in MCP initialization and every write-tool description,
+for the full and public profiles. The host agent still controls which tools it calls.
+
+Each confirmed creation executes once, without automatic retries after an uncertain
+result. If the user explicitly requests another creation, one newly authorized attempt
+can proceed without a mandatory duplicate check. Duplicate tolerance is not permission
+to send extra messages, incur extra payments, overwrite data or change permissions.
+
 ## Transports
 
 | Transport | Entry point | Use when |
@@ -510,7 +525,8 @@ documented `oauth:check-readiness` deployment gate.
 
 Using an authorized demonstration account with both scopes, validate:
 
-1. `GET /models/email` via `magileads_get` in the full profile (`mcp:read`).
+1. Independently test `GET /models/email` via `magileads_get` in the full profile
+   (`mcp:read`). This is not a prerequisite or duplicate check for creation.
 2. `create_email_model` with a name, subject and text body, without confirmation:
    expect a preview and no model created (works in full and public profiles).
 3. Re-call with `confirm:true`: expect a successful API response and model id.
