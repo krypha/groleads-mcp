@@ -1,0 +1,41 @@
+default:
+  tags:
+    - shell
+
+stages:
+  - build
+  - deploy
+
+variables:
+  IMAGE_NAME: docker.mc-media.com/magileads-mcp
+  DEPLOYMENT_NAME: magileads-mcp-main-generic-app
+
+docker_build:
+  stage: build
+  script:
+    - docker pull $IMAGE_NAME:latest || true
+    - >
+      DOCKER_BUILDKIT=1 docker build
+      --cache-from $IMAGE_NAME:latest
+      --label "org.opencontainers.image.title=$CI_PROJECT_TITLE"
+      --label "org.opencontainers.image.url=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.created=$CI_JOB_STARTED_AT"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.version=$CI_COMMIT_REF_NAME"
+      --tag $IMAGE_NAME:latest
+      .
+    - docker push $IMAGE_NAME:latest
+  only:
+    - main
+
+deploy_staging:
+  stage: deploy
+  environment:
+    name: staging
+  script:
+    - curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+    - chmod +x kubectl
+    - echo $KUBECONFIG | base64 -d > .kubeconfig
+    - KUBECONFIG=.kubeconfig ./kubectl rollout restart deployment $DEPLOYMENT_NAME
+  only:
+    - main
