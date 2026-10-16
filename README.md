@@ -290,8 +290,10 @@ tool calls the Magileads API; `tools/list` itself makes no backend call. API-key
 clients see the full tool set (including write tools); Magileads account permissions
 and each tool's confirmation guardrails still apply.
 
-For OAuth access, the bearer must be signed by `OAUTH_ISSUER`, name
-`OAUTH_MCP_RESOURCE` in its audience, and carry `mcp:read` and/or `mcp:write`.
+For OAuth access, the bearer must be signed by `OAUTH_ISSUER`, name the exact resource
+of the requested, privately authorized MCP domain in its sole audience, and carry
+`mcp:read` and/or `mcp:write`. RSA/RS256 access JWTs must have header `typ: JWT` or
+`typ: at+jwt`, an expiration and a subject; tokens with another audience or type are refused.
 A token intended for the API is rejected. An unauthenticated request receives
 `401` plus `WWW-Authenticate` pointing at protected-resource metadata. Both the
 bare metadata URL and the RFC 9728 URL suffixed with `/mcp` are served with CORS
@@ -340,7 +342,7 @@ No new MCP tool or consent screen is needed.
 | `POST /oauth/token` | OAuth client obtains / refreshes its MCP token; the MCP separately exchanges it for an API token with its confidential internal client. |
 | `POST /oauth/revoke` | OAuth client revokes its token. The MCP does not store client refresh tokens. |
 
-OAuth-capable clients connect to the canonical public MCP URL. On the first
+OAuth-capable clients connect to the primary or an active reseller MCP URL. On the first
 `401`, they discover the API's authorization server, register if necessary,
 open its consent flow, and send the resulting MCP token as `Authorization:
 Bearer ...`. The MCP's internal client ID/secret stays on the server and must
@@ -360,7 +362,7 @@ refuse to start unless all five required OAuth settings are present.
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
 | `MCP_TOOL_PROFILE` | `full` (default, 26 tools) or `public` (23 dedicated tools, including email template creation; generic passthrough hidden). Applies to every HTTP client on this deployment. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
-| `OAUTH_MCP_RESOURCE` | Required for OAuth modes; exact resource URL/audience for this MCP, e.g. `https://mcp.example.com/mcp`. |
+| `OAUTH_MCP_RESOURCE` | Required for OAuth modes; primary resource URL, e.g. `https://mcp.magileads.io/mcp`. Actual OAuth host authorization comes from private resource discovery, with no local fallback. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
 | `OAUTH_INTERNAL_CLIENT_ID` + `OAUTH_INTERNAL_CLIENT_SECRET` | Required for OAuth modes; confidential token-exchange client. Store the secret in the deployment secret store. |
 | `MAGILEADS_API_URL` | Optional API base URL; defaults to `OAUTH_API_RESOURCE`. |
@@ -395,8 +397,10 @@ Smoke-test discovery and the unauthenticated challenge:
 
 ```bash
 curl -s localhost:8080/health                       # {"status":"ok"}
-curl -s localhost:8080/.well-known/oauth-protected-resource/mcp
+# OAuth: use a Host present in the private resource list (replace this example).
+curl -s localhost:8080/.well-known/oauth-protected-resource/mcp -H 'Host: mcp.magileads.io'
 curl -i -X POST localhost:8080/mcp \
+  -H 'Host: mcp.magileads.io' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -469,9 +473,9 @@ the API target audience, and `mcp:read` / `mcp:write`; these are the two
 they provide for `OAUTH_API_RESOURCE`; if needed, set
 `MAGILEADS_API_URL=https://app.api-magileads.net` separately.
 
-Use one **canonical** MCP URL across client configuration, protected-resource
-metadata, and the API's authorized resource/audience. Domain aliases are not
-interchangeable JWT audiences. Finally, the API team must apply the appropriate
+For each primary or reseller domain, use the **same exact** URL across client
+configuration, protected-resource metadata and the API's authorized resource/audience.
+Domains are not interchangeable JWT audiences. Finally, the API team must apply the appropriate
 `mcp.oauth.scope:read` / `mcp.oauth.scope:write` middleware to every business
 route used by the tools (`bun run tools:table` lists the mapping).
 
@@ -514,6 +518,94 @@ Swagger does not prove the endpoints are live. Once public checks pass,
 authorize with a test account and call `get_account_overview`, then a confirmed
 write tool on test data, to verify internal credentials and read/write route
 permissions. The automated local suite is `bun run test:oauth`.
+
+### Reseller MCP domains without OAuth
+
+Multiple reseller hostnames can point to the same MCP deployment for API-key clients.
+The server does not require a `magileads.io` hostname in this flow. For example, the
+infrastructure can route `mcp.surleads.com` via a CNAME to
+`resellers-pool1.magileads.net`, then proxy it to this application's port `8080`.
+
+- Provision a valid TLS certificate for each customer hostname. A CNAME alone does
+  not provide HTTPS or an HTTP virtual-host route.
+- Proxy `POST /mcp` and `GET /health` without redirecting to another hostname.
+  Preserve the body, query string and authentication headers, especially `X-API-Key`.
+- Clients use `https://<reseller-domain>/mcp` and their own `X-API-Key` header.
+  They must support static API-key headers; this is not an OAuth connection.
+- Use `MCP_HTTP_AUTH=api_key` for an API-key-only deployment, or keep `both` on a
+  shared deployment that already serves OAuth clients. Do not disable working OAuth
+  connections just to enable reseller aliases. No per-reseller `OAUTH_*` change is
+  needed for API-key calls.
+- Keep the central Magileads business API base URL unchanged. The MCP hostname
+  does not choose the API origin or the account; the client's API key does.
+- `domain_mcp` registration, DNS, certificates and permitted-host routing are owned
+  by the reseller infrastructure. The MCP does not look up reseller configurations
+  or enforce that a particular key belongs to the hostname's reseller.
+
+Verify `/health`, authenticated `initialize`, `tools/list`, then `get_account_overview`
+through the real reseller URL. Missing/invalid keys must still be refused. The local
+suite tests distinct Host headers and account isolation in both authentication modes,
+but does not validate production DNS, certificates or proxy routing. OAuth on these
+aliases uses the private resource registry described below, independently of API-key access.
+
+### Reseller MCP domains with OAuth
+
+The MCP privately fetches `GET /oauth/mcp-resources` on the configured issuer's
+origin, using HTTP Basic with `OAUTH_INTERNAL_CLIENT_ID` and
+`OAUTH_INTERNAL_CLIENT_SECRET`. These credentials never leave the server, are not
+returned to clients, and are never forwarded to a redirected URL. The expected
+response is HTTP 200 with URL strings:
+
+```json
+{
+  "state": true,
+  "resources": [
+    "https://mcp.magileads.io/mcp",
+    "https://mcp-engage.lebonlogiciel.com/mcp"
+  ]
+}
+```
+
+No new secret or per-reseller environment variable is required. Keep the existing
+issuer, API resource and internal client. Provision/activate `domain_mcp` in the API
+and route it to this same MCP server with a valid HTTPS certificate.
+
+- Fetch immediately when the server starts listening, then every **60 seconds**.
+  Each success **replaces** the complete list, including removals; it is never merged.
+- On failure, a previously successful list may be used only while its age is
+  **strictly below 120 seconds**. Failed attempts do not renew this deadline.
+  Without a usable list, OAuth and public resource discovery return **503** without
+  a reconnect challenge. There is no fallback, even for `OAUTH_MCP_RESOURCE`.
+- OAuth requests and both protected-resource metadata routes resolve the original
+  HTTP **Host** against that list. Unknown hosts return **421** without reflecting
+  their value. `Forwarded` and `X-Forwarded-Host` are ignored for audience selection.
+  The proxy **must preserve the original Host**, not rewrite it to the container or
+  `resellers-pool1.magileads.net`. Restrict direct origin access at the network layer.
+- Reseller URLs must be normalized HTTPS DNS domains followed by exactly `/mcp`:
+  no ports, trailing slash, credentials, fragments, queries or alternate paths.
+  The API resource cannot also be an MCP resource. Malformed lists fail closed;
+  a valid empty list authorizes no host.
+- Metadata and every OAuth challenge use the requested authorized domain. A token
+  for Magileads is refused on Coefficy, a Coefficy token is refused on Magileads or
+  another reseller, and multi-domain audiences are refused before Token Exchange.
+  Only the exchanged API token is sent to the configured central API.
+- API-key calls remain isolated by their keys and do not depend on this registry.
+  A hostname does not add a reseller-membership requirement; the API's normal account
+  permissions and scopes remain authoritative. `/health` remains a liveness probe,
+  not proof that private discovery is working.
+
+Run `bun run check:oauth` separately for the primary and reseller URL by setting
+the public `OAUTH_ISSUER` and target `OAUTH_MCP_RESOURCE` in the diagnostic shell.
+It checks both metadata routes and the domain-local unauthenticated challenge,
+without receiving any private credential. These shell values do not reconfigure
+the running server.
+
+Before declaring integration complete, the affected OAuth client must finish
+authorization and execute a read on **both** Coefficy and Magileads; then verify that
+a token presented to the wrong domain is rejected. The local fake-issuer/API tests
+cover this boundary and registry outages, but do not establish external consent,
+DNS, TLS, proxy routing or production token-format compatibility. See the
+[deployment verification runbook](docs/reseller-oauth.md).
 
 ### Validate email models after deployment
 

@@ -7,7 +7,7 @@ import { CREATION_GUIDANCE } from "./instructions.js";
 export function buildServer(allowedScopes?: readonly Scope[], profile: ToolProfile = "full"): McpServer {
   const server = new McpServer({
     name: "magileads-mcp",
-    version: "0.11.1",
+    version: "0.12.0",
   }, { instructions: CREATION_GUIDANCE });
   registerTools(server, allowedScopes, profile);
   return server;

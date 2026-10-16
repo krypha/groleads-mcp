@@ -38,17 +38,22 @@ export function bearerFrom(header: string | string[] | undefined): string | unde
   return match?.[1];
 }
 
-export async function verifyAccessToken(token: string): Promise<VerifiedToken> {
+export async function verifyAccessToken(token: string, resource: string): Promise<VerifiedToken> {
   const config = oauthConfig();
   const keySet = await keys(); // Discovery failure is a service error, not a bad caller token.
   let payload: JWTPayload;
   try {
     const result = await jwtVerify(token, keySet, {
       issuer: config.issuer,
-      audience: config.mcpResource,
+      audience: resource,
+      algorithms: ["RS256"],
       clockTolerance: config.clockTolerance,
     });
     payload = result.payload;
+    const type = result.protectedHeader.typ?.toLowerCase();
+    if (type !== "jwt" && type !== "at+jwt") throw new InvalidTokenError();
+    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (audiences.length !== 1 || audiences[0] !== resource) throw new InvalidTokenError();
     // jose enforces exp and nbf only when present; this resource requires exp.
     if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) throw new InvalidTokenError();
     if (typeof payload.sub !== "string" || !payload.sub) throw new InvalidTokenError();

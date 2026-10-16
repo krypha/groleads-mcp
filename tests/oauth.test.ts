@@ -28,6 +28,11 @@ let exchangeMode: "normal" | "invalid_grant" | "unauthorized" | "reordered_scope
 let discoveryMode: "normal" | "unavailable" | "not_found" | "mismatched_issuer" | "unsafe_endpoint" | "oidc_only" = "normal";
 let jwksUnavailable = false;
 let apiMode: "normal" | "unauthorized" | "forbidden" = "normal";
+let privateResourcesMode: "normal" | "redirect" = "normal";
+const privateDiscoveryHeaders: string[] = [];
+let leakedPrivateDiscovery = 0;
+const resellerResource = "https://mcp-engage.lebonlogiciel.com/mcp";
+const otherResellerResource = "https://mcp.surleads.com/mcp";
 const exchanges: {
   subject: string; scope: string; resource: string; authorization: string;
   grant: string; subjectType: string; requestedType: string; contentType: string;
@@ -45,6 +50,17 @@ function hasExchangedScope(req: http.IncomingMessage, scope: string): boolean {
 // Authorization and business API live on DIFFERENT origins. The MCP must use
 // the discovered token_endpoint, not assume it lives at the business API base.
 const authorization = await start(async (req, res) => {
+  if (req.url === "/oauth/mcp-resources" && req.method === "GET") {
+    privateDiscoveryHeaders.push(req.headers.authorization || "");
+    if (req.headers.authorization !== basicClientAuthorization(process.env.OAUTH_INTERNAL_CLIENT_ID!, process.env.OAUTH_INTERNAL_CLIENT_SECRET!)) {
+      return respond(res, 401, { error: "invalid_client" });
+    }
+    if (privateResourcesMode === "redirect") {
+      res.writeHead(307, { Location: `${apiOrigin}/private-discovery-leak` });
+      return res.end();
+    }
+    return respond(res, 200, { state: true, resources: [process.env.OAUTH_MCP_RESOURCE, resellerResource, otherResellerResource] });
+  }
   if (req.url === "/.well-known/oauth-authorization-server/tenant" ||
       req.url === "/tenant/.well-known/openid-configuration") {
     if (discoveryMode === "not_found" || (discoveryMode === "oidc_only" &&
@@ -112,6 +128,10 @@ issuer = `${authorization.origin}/tenant`;
 
 let misplacedExchanges = 0;
 const api = await start(async (req, res) => {
+  if (req.url === "/private-discovery-leak") {
+    leakedPrivateDiscovery++;
+    return respond(res, 200, { state: true, resources: [] });
+  }
   if (req.url === "/oauth/token") {
     misplacedExchanges++;
     return respond(res, 404, {});
@@ -183,6 +203,7 @@ const { loadOAuthConfig } = await import("../src/oauth/config.js");
 const { loadHttpConfig } = await import("../src/http-config.js");
 const { runWithAuth, rawRequest } = await import("../src/magileads.js");
 const { log, redact, redactString } = await import("../src/log.js");
+const { McpResourceRegistry } = await import("../src/oauth/resources.js");
 const mcp = createHttpServer();
 await new Promise<void>((resolve) => mcp.listen(Number(resourcePort), "127.0.0.1", resolve));
 const mcpOrigin = `http://127.0.0.1:${resourcePort}`;
@@ -197,7 +218,7 @@ afterAll(async () => {
 
 async function token(scope: string, audience = process.env.OAUTH_MCP_RESOURCE!): Promise<string> {
   return new SignJWT({ scope, jti: crypto.randomUUID() })
-    .setProtectedHeader({ alg: "RS256", kid: "smoke-key" })
+    .setProtectedHeader({ alg: "RS256", typ: "JWT", kid: "smoke-key" })
     .setIssuer(issuer).setAudience(audience).setSubject("user-7")
     .setIssuedAt().setExpirationTime("1h").sign(privateKey);
 }
@@ -310,7 +331,7 @@ test("initialization and all write descriptions advertise creation without dupli
   expect(initialized.status).toBe(200);
   const initialization = await initialized.json() as { result: { instructions: string; serverInfo: { version: string } } };
   expect(initialization.result.instructions).toBe(CREATION_GUIDANCE);
-  expect(initialization.result.serverInfo.version).toBe("0.11.1");
+  expect(initialization.result.serverInfo.version).toBe("0.12.0");
   const listed = await rpc("tools/list", caller);
   const tools = (await listed.json() as { result: { tools: {
     name: string; description: string; annotations: { readOnlyHint: boolean };
@@ -531,6 +552,148 @@ test("public plugin tool annotations match private-account and open-world behavi
     expect(tool.annotations.openWorldHint).toBe(openWorld.has(tool.name));
     expect(tool.annotations.readOnlyHint).toBe(!writes.has(tool.name));
     expect(tool.annotations.destructiveHint).toBe(writes.has(tool.name));
+  }
+});
+
+test("reseller metadata and every OAuth challenge use the requested, privately authorized host", async () => {
+  for (const resource of [process.env.OAUTH_MCP_RESOURCE!, resellerResource, otherResellerResource]) {
+    const host = new URL(resource).host;
+    const metadataUrl = `${new URL(resource).origin}/.well-known/oauth-protected-resource/mcp`;
+    for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
+      const response = await fetch(`${mcpOrigin}${path}`, { headers: { Host: host, "X-Forwarded-Host": "evil.example" } });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ resource, authorization_servers: [issuer], scopes_supported: ["mcp:read", "mcp:write"], bearer_methods_supported: ["header"] });
+      expect(response.headers.get("cache-control")).toBe("no-store");
+    }
+    const missing = await keyRpc(mcpOrigin, undefined, "tools/list", undefined, { Host: host });
+    expect(missing.status).toBe(401);
+    expect(missing.headers.get("www-authenticate")).toContain(`resource_metadata="${metadataUrl}"`);
+    const insufficient = await keyRpc(mcpOrigin, undefined, "tools/call", { name: "create_email_model", arguments: {} },
+      { Host: host, Authorization: `Bearer ${await token("mcp:read", resource)}` });
+    expect(insufficient.status).toBe(403);
+    expect(insufficient.headers.get("www-authenticate")).toContain(metadataUrl);
+  }
+});
+
+test("each MCP domain accepts only its own exact audience before exchange, including cached tokens", async () => {
+  const resources = [process.env.OAUTH_MCP_RESOURCE!, resellerResource, otherResellerResource];
+  clearExchangeCache();
+  for (const resource of resources) {
+    const bearer = await token("mcp:read", resource);
+    const own = await keyRpc(mcpOrigin, undefined, "tools/call", { name: "get_account_overview", arguments: {} },
+      { Host: new URL(resource).host, Authorization: `Bearer ${bearer}` });
+    expect(own.status).toBe(200);
+    expect(JSON.parse((await toolResult(own)).content[0].text).id).toBe(7);
+    expect(exchanges.at(-1)?.resource).toBe(apiOrigin);
+    expect(exchanges.at(-1)?.subject).toBe(bearer);
+    expect(apiBearers.at(-1)).toBe("Bearer exchanged-mcp:read");
+    for (const wrong of resources.filter((entry) => entry !== resource)) {
+      const beforeExchanges = exchanges.length;
+      const beforeApi = apiBearers.length;
+      const response = await keyRpc(mcpOrigin, undefined, "tools/call", { name: "get_account_overview", arguments: {} },
+        { Host: new URL(wrong).host, Authorization: `Bearer ${bearer}` });
+      expect(response.status).toBe(401);
+      expect(response.headers.get("www-authenticate")).toContain(new URL(wrong).origin);
+      expect(exchanges.length).toBe(beforeExchanges);
+      expect(apiBearers.length).toBe(beforeApi);
+    }
+  }
+});
+
+test("unregistered hosts and forwarding spoofing never reflect metadata or reach exchange", async () => {
+  const beforeExchanges = exchanges.length;
+  const beforeApi = apiBearers.length;
+  for (const host of ["evil.example", "mcp.surleads.com:443", "mcp.surleads.com.", "mcp.surleads.com,evil.example"]) {
+    const headers = { Host: host, "X-Forwarded-Host": "mcp.surleads.com", Forwarded: "host=mcp.surleads.com;proto=https" };
+    for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
+      const response = await fetch(mcpOrigin + path, { headers });
+      expect(response.status).toBe(421);
+      expect(response.headers.get("www-authenticate")).toBeNull();
+      expect(await response.text()).not.toContain(host);
+    }
+    const response = await keyRpc(mcpOrigin, undefined, "tools/list", undefined,
+      { ...headers, Authorization: `Bearer ${await token("mcp:read", otherResellerResource)}` });
+    expect(response.status).toBe(421);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+  }
+  expect(exchanges.length).toBe(beforeExchanges);
+  expect(apiBearers.length).toBe(beforeApi);
+});
+
+test("OAuth JWT types, multiple audiences and audience URL variants are refused", async () => {
+  const beforeExchanges = exchanges.length;
+  const beforeApi = apiBearers.length;
+  for (const [typ, audience] of [
+    [undefined, resellerResource], ["id+jwt", resellerResource], ["refresh+jwt", resellerResource],
+    ["JWT", [resellerResource, otherResellerResource]], ["JWT", `${resellerResource}/`],
+    ["JWT", "https://mcp-engage.lebonlogiciel.com:443/mcp"],
+  ] as [string | undefined, string | string[]][]) {
+    const bearer = await new SignJWT({ scope: "mcp:read" }).setProtectedHeader({ alg: "RS256", kid: "smoke-key", ...(typ ? { typ } : {}) })
+      .setIssuer(issuer).setAudience(audience).setSubject("user-7").setIssuedAt().setExpirationTime("1h").sign(privateKey);
+    const response = await keyRpc(mcpOrigin, undefined, "tools/list", undefined,
+      { Host: "mcp-engage.lebonlogiciel.com", Authorization: `Bearer ${bearer}` });
+    expect(response.status).toBe(401);
+  }
+  const accepted = await new SignJWT({ scope: "mcp:read" }).setProtectedHeader({ alg: "RS256", typ: "at+jwt", kid: "smoke-key" })
+    .setIssuer(issuer).setAudience([resellerResource]).setSubject("user-7").setIssuedAt().setExpirationTime("1h").sign(privateKey);
+  expect((await keyRpc(mcpOrigin, undefined, "tools/list", undefined,
+    { Host: "mcp-engage.lebonlogiciel.com", Authorization: `Bearer ${accepted}` })).status).toBe(200);
+  expect(exchanges.length).toBe(beforeExchanges);
+  expect(apiBearers.length).toBe(beforeApi);
+});
+
+test("private discovery failure yields 503, expiry is anchored to success, and removed domains are refused", async () => {
+  let time = 0;
+  let unavailable = true;
+  let resources = [process.env.OAUTH_MCP_RESOURCE!, resellerResource];
+  const request = (async () => new Response(JSON.stringify({ state: true, resources }), { status: unavailable ? 503 : 200 })) as unknown as typeof fetch;
+  const registry = new McpResourceRegistry(loadOAuthConfig(), request, () => time);
+  const server = createHttpServer(registry);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("No test port");
+  const origin = `http://127.0.0.1:${address.port}`;
+  const beforeExchanges = exchanges.length;
+  const beforeApi = apiBearers.length;
+  const bearer = await token("mcp:read", resellerResource);
+  const headers = { Host: "mcp-engage.lebonlogiciel.com", Authorization: `Bearer ${bearer}` };
+  try {
+    const missingList = await keyRpc(origin, undefined, "tools/list", undefined, headers);
+    expect(missingList.status).toBe(503);
+    expect(missingList.headers.get("www-authenticate")).toBeNull();
+    expect((await fetch(origin + "/.well-known/oauth-protected-resource/mcp", { headers })).status).toBe(503);
+    unavailable = false;
+    await registry.refresh();
+    expect((await keyRpc(origin, undefined, "tools/list", undefined, headers)).status).toBe(200);
+    unavailable = true;
+    time = 60_000;
+    expect((await keyRpc(origin, undefined, "tools/list", undefined, headers)).status).toBe(200);
+    time = 120_000;
+    const expiredList = await keyRpc(origin, undefined, "tools/list", undefined, headers);
+    expect(expiredList.status).toBe(503);
+    expect(expiredList.headers.get("www-authenticate")).toBeNull();
+    resources = [process.env.OAUTH_MCP_RESOURCE!];
+    unavailable = false;
+    await registry.refresh();
+    expect((await keyRpc(origin, undefined, "tools/list", undefined, headers)).status).toBe(421);
+    expect((await keyRpc(origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${await token("mcp:read")}` })).status).toBe(200);
+    expect(exchanges.length).toBe(beforeExchanges);
+    expect(apiBearers.length).toBe(beforeApi);
+  } finally { await close(server); }
+});
+
+test("private discovery sends only internal Basic credentials and refuses cross-origin redirects", async () => {
+  privateResourcesMode = "redirect";
+  const registry = new McpResourceRegistry(loadOAuthConfig());
+  try {
+    await expect(registry.forRequest({ headers: { host: new URL(mcpOrigin).host }, rawHeaders: ["Host", new URL(mcpOrigin).host] }))
+      .rejects.toThrow("Authorization service unavailable");
+    expect(leakedPrivateDiscovery).toBe(0);
+    expect(privateDiscoveryHeaders.length).toBeGreaterThan(0);
+    expect(privateDiscoveryHeaders.every((header) => header === basicClientAuthorization(process.env.OAUTH_INTERNAL_CLIENT_ID!, process.env.OAUTH_INTERNAL_CLIENT_SECRET!))).toBe(true);
+  } finally {
+    registry.stop();
+    privateResourcesMode = "normal";
   }
 });
 
@@ -896,6 +1059,7 @@ async function keyRpc(origin: string, key: string | undefined, method: string, p
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      Host: new URL(process.env.OAUTH_MCP_RESOURCE!).host,
       ...(key !== undefined ? { "X-API-Key": key } : {}),
       ...extraHeaders,
     },
@@ -1025,6 +1189,46 @@ test("API-key-only mode boots without OAuth and isolates keys per request", asyn
     expect(bad.headers.get("www-authenticate")).toBeNull();
   } finally {
     await close(server);
+  }
+});
+
+test("custom reseller hosts work with API keys in api_key and both modes without OAuth exchange", async () => {
+  for (const mode of ["api_key", "both"] as const) {
+    const { server, origin } = await ephemeralMcp(mode, mode === "api_key");
+    const seenHosts: (string | undefined)[] = [];
+    server.on("request", (req) => seenHosts.push(req.headers.host));
+    try {
+      const beforeExchanges = exchanges.length;
+      const beforeKeys = apiKeys.length;
+      const hosts = ["mcp.surleads.com", "mcp.other-reseller.example"];
+      for (const host of hosts) {
+        expect((await fetch(`${origin}/health`, { headers: { Host: host } })).status).toBe(200);
+        const initialized = await keyRpc(origin, "key-alpha", "initialize", {
+          protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "reseller-test", version: "1" },
+        }, { Host: host });
+        expect(initialized.status).toBe(200);
+        expect((await initialized.json() as { result: { serverInfo: { name: string } } }).result.serverInfo.name).toBe("magileads-mcp");
+        const listed = await keyRpc(origin, "key-alpha", "tools/list", undefined, { Host: host });
+        expect(listed.status).toBe(200);
+        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(26);
+        // The hostname is an alias, not an account selector: two keys keep their identities on either host.
+        for (const [key, id] of [["key-alpha", 71], ["key-beta", 72]] as const) {
+          const result = await keyRpc(origin, key, "tools/call", { name: "get_account_overview", arguments: {} }, { Host: host });
+          expect(result.status).toBe(200);
+          expect(JSON.parse((await toolResult(result)).content[0].text).id).toBe(id);
+        }
+        const missing = await keyRpc(origin, undefined, "tools/list", undefined, { Host: host });
+        expect(missing.status).toBe(mode === "both" && host === "mcp.other-reseller.example" ? 421 : 401);
+        const bad = await keyRpc(origin, "bad-key", "tools/call", { name: "get_account_overview", arguments: {} }, { Host: host });
+        expect(bad.status).toBe(401);
+        expect(bad.headers.get("www-authenticate")).toBeNull();
+      }
+      expect(new Set(seenHosts)).toEqual(new Set(hosts));
+      expect(apiKeys.slice(beforeKeys)).toEqual(["key-alpha", "key-beta", "bad-key", "key-alpha", "key-beta", "bad-key"]);
+      expect(exchanges.length).toBe(beforeExchanges);
+    } finally {
+      await close(server);
+    }
   }
 });
 

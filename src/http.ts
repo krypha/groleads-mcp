@@ -13,6 +13,7 @@ import { exchangeToken, invalidateExchange, ReauthenticationRequired } from "./o
 import { protectedResourceMetadata, sendChallenge } from "./oauth/metadata.js";
 import type { Scope } from "./oauth/scopes.js";
 import { bearerFrom, InvalidTokenError, verifyAccessToken } from "./oauth/verify.js";
+import { InvalidResourceHost, McpResourceRegistry, type McpResource } from "./oauth/resources.js";
 
 function json(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const payload = JSON.stringify(body);
@@ -128,27 +129,46 @@ function bufferResponse(res: http.ServerResponse): { finish: (onUnauthorized?: (
   };
 }
 
-async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, config: HttpConfig): Promise<void> {
+async function resolveResource(req: http.IncomingMessage, res: http.ServerResponse, registry: McpResourceRegistry): Promise<McpResource | undefined> {
+  try { return await registry.forRequest(req); }
+  catch (error) {
+    if (error instanceof InvalidResourceHost) json(res, 421, { error: "MCP hostname is not authorized." });
+    else json(res, 503, { error: "MCP resource discovery unavailable." });
+    return undefined;
+  }
+}
+
+async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, config: HttpConfig, registry?: McpResourceRegistry): Promise<void> {
   const credential = selectCredential(req, config);
   if (credential === "query_disabled") return json(res, 400, { error: "API keys in URLs are disabled. Use X-API-Key." });
   if (credential === "ambiguous") return json(res, 400, { error: "Provide exactly one valid authentication credential." });
   if (credential === "key_disabled") return json(res, 401, { error: "API-key authentication is disabled." });
+  let resource: McpResource | undefined;
+  if (registry && (credential === "missing" || credential.kind === "oauth")) {
+    resource = await resolveResource(req, res, registry);
+    if (!resource) return;
+  }
+  const challenge = (status: 401 | 403, scope?: string) => {
+    if (!resource) return json(res, 503, { error: "MCP resource discovery unavailable." });
+    sendChallenge(res, status, resource, scope);
+  };
   if (credential === "missing") {
-    return config.authMode === "api_key" ? apiKeyUnauthorized(res) : sendChallenge(res, 401);
+    return config.authMode === "api_key" ? apiKeyUnauthorized(res) : challenge(401);
   }
 
   let caller;
   if (credential.kind === "oauth") {
+    if (!resource) return json(res, 503, { error: "MCP resource discovery unavailable." });
     try {
-      caller = await verifyAccessToken(credential.bearer);
+      caller = await verifyAccessToken(credential.bearer, resource.resource);
     } catch (error) {
-      if (error instanceof InvalidTokenError) return sendChallenge(res, 401);
+      if (error instanceof InvalidTokenError) return challenge(401);
       log("error", "Token verification unavailable", { error });
       const headers: Record<string, string> = error instanceof AuthorizationServiceUnavailable && error.retryAfter
         ? { "Retry-After": error.retryAfter } : {};
       return json(res, 503, { error: "Authorization service unavailable." }, headers);
     }
-    if (caller.scopes.length === 0) return sendChallenge(res, 403, "mcp:read");
+    if (caller.scopes.length === 0) return challenge(403, "mcp:read");
   }
   if (req.method !== "POST") return json(res, 405, { error: "Method not allowed." });
 
@@ -173,7 +193,7 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
   const requiredScopes = plan.scopes;
   const scopeValue = requiredScopes.join(" ");
   if (access && caller && !requiredScopes.every((scope) => caller.scopes.includes(scope))) {
-    return sendChallenge(res, 403, scopeValue);
+    return challenge(403, scopeValue);
   }
 
   let exchangedBearer: string | undefined;
@@ -181,7 +201,7 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
     try {
       exchangedBearer = await exchangeToken(credential.bearer, requiredScopes);
     } catch (error) {
-      if (error instanceof ReauthenticationRequired) return sendChallenge(res, 401);
+      if (error instanceof ReauthenticationRequired) return challenge(401);
       log("error", "Token exchange unavailable", { error });
       if (error instanceof AuthorizationServiceUnavailable) {
         return json(res, 503, { error: "Authorization service unavailable." },
@@ -195,7 +215,7 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   const buffered = access ? bufferResponse(res) : undefined;
   let apiUnauthorized = false;
-  const unauthorized = () => credential.kind === "oauth" ? sendChallenge(res, 401) : apiKeyUnauthorized(res);
+  const unauthorized = () => credential.kind === "oauth" ? challenge(401) : apiKeyUnauthorized(res);
   try {
     const requestAuth = credential.kind === "oauth"
       ? { kind: "oauth" as const, exchangedBearer, scopes: requiredScopes, onUnauthorized: () => { apiUnauthorized = true; } }
@@ -223,13 +243,14 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
 }
 
 /** Exported for the throwaway-server smoke test; production runs main below. */
-export function createHttpServer(): http.Server {
+export function createHttpServer(resourceRegistry?: McpResourceRegistry): http.Server {
   const config = loadHttpConfig();
   const oauthEnabled = config.authMode !== "api_key";
   if (oauthEnabled) oauthConfig(); // OAuth modes fail closed when required values are absent.
+  const registry = oauthEnabled ? resourceRegistry ?? new McpResourceRegistry() : undefined;
   toolAccessTable(); // Validate every tool's declared scope and routes at boot.
   const paths = oauthEnabled ? new Set(["/.well-known/oauth-protected-resource", oauthConfig().metadataPath]) : new Set<string>();
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     const path = new URL(req.url || "/", "http://localhost").pathname;
     if (path === "/.well-known/openai-apps-challenge" && config.openaiAppsChallengeToken) {
       if (req.method !== "GET") return json(res, 405, { error: "Method not allowed." });
@@ -244,28 +265,36 @@ export function createHttpServer(): http.Server {
       return;
     }
     if (paths.has(path)) {
-      if (req.method === "OPTIONS") {
-        res.writeHead(204, {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "Authorization, Content-Type, MCP-Protocol-Version",
-          "Access-Control-Allow-Methods": "GET, OPTIONS",
-        });
-        res.end();
-      } else if (req.method === "GET") {
-        json(res, 200, protectedResourceMetadata(), {
-          "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "public, max-age=3600",
-        });
-      } else json(res, 405, { error: "Method not allowed." });
+      void resolveResource(req, res, registry!).then((resource) => {
+        if (!resource) return;
+        if (req.method === "OPTIONS") {
+          res.writeHead(204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, MCP-Protocol-Version",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+          });
+          res.end();
+        } else if (req.method === "GET") {
+          json(res, 200, protectedResourceMetadata(resource), {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
+          });
+        } else json(res, 405, { error: "Method not allowed." });
+      }).catch(() => {
+        if (!res.headersSent) json(res, 503, { error: "MCP resource discovery unavailable." });
+      });
       return;
     }
     if (req.method === "GET" && path === "/health") return json(res, 200, { status: "ok" });
     if (path !== config.mcpPath) return json(res, 404, { error: "Not found." });
-    handleMcp(req, res, config).catch((error) => {
+    handleMcp(req, res, config, registry).catch((error) => {
       log("error", "MCP request failed", { error });
       if (!res.headersSent) json(res, 500, { error: "Internal error." });
     });
   });
+  server.on("listening", () => registry?.start());
+  server.on("close", () => registry?.stop());
+  return server;
 }
 
 if ((import.meta as ImportMeta & { main?: boolean }).main) {
