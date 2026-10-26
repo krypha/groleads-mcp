@@ -14,6 +14,10 @@ import { protectedResourceMetadata, sendChallenge } from "./oauth/metadata.js";
 import type { Scope } from "./oauth/scopes.js";
 import { bearerFrom, InvalidTokenError, verifyAccessToken } from "./oauth/verify.js";
 import { InvalidResourceHost, McpResourceRegistry, type McpResource } from "./oauth/resources.js";
+import {
+  AccountContextError, accountContextForResult, assertAccountRevision, loadAccountSession, runWithAccountSession, withAccountContext,
+  type AccountContext, type AccountSession,
+} from "./oauth/account-context.js";
 
 function json(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const payload = JSON.stringify(body);
@@ -80,7 +84,7 @@ function callName(body: unknown): string | undefined {
  * tool-call response until the handler completes lets an API 401 become the
  * HTTP 401 challenge the client actually understands, before bytes are sent.
  */
-function bufferResponse(res: http.ServerResponse): { finish: (onUnauthorized?: () => void) => void; restore: () => void } {
+function bufferResponse(res: http.ServerResponse): { finish: (onUnauthorized?: () => void, context?: AccountContext) => void; restore: () => void } {
   const write = res.write.bind(res);
   const end = res.end.bind(res);
   const writeHead = res.writeHead.bind(res);
@@ -115,15 +119,28 @@ function bufferResponse(res: http.ServerResponse): { finish: (onUnauthorized?: (
   };
   return {
     restore,
-    finish(onUnauthorized?: () => void) {
+    finish(onUnauthorized?: () => void, context?: AccountContext) {
       restore();
       if (onUnauthorized) {
         for (const name of res.getHeaderNames()) res.removeHeader(name);
         onUnauthorized();
       } else if (!res.headersSent) {
         if (!ended) throw new Error("MCP transport did not end its response.");
+        let payload = Buffer.concat(chunks);
+        if (context) {
+          // SDK input-validation failures do not enter our handler wrapper.
+          // Decorate those too; never change JSON-RPC protocol-level errors.
+          try {
+            const message = JSON.parse(payload.toString("utf8"));
+            if (Array.isArray(message?.result?.content)) {
+              message.result = withAccountContext(message.result, context);
+              payload = Buffer.from(JSON.stringify(message));
+              if (res.hasHeader("Content-Length")) res.setHeader("Content-Length", payload.byteLength);
+            }
+          } catch { /* Preserve the original transport payload if not JSON. */ }
+        }
         writeHead(res.statusCode);
-        end(Buffer.concat(chunks));
+        end(payload);
       }
     },
   };
@@ -181,27 +198,53 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
     return json(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: "Invalid JSON-RPC request." }, id: null });
   }
 
-  const access = name && isToolExposed(name, config.toolProfile) ? accessForTool(name) : undefined;
+  // Private HTTP OAuth always uses the API-owned context. No deployment flag,
+  // no implicit fallback to the original account if the control service refuses.
+  const switchingEnabled = config.toolProfile === "full" && credential.kind === "oauth";
+  const declaredAccess = name && isToolExposed(name, config.toolProfile) ? accessForTool(name) : undefined;
+  const access = declaredAccess?.accountControl && !switchingEnabled ? undefined : declaredAccess;
+  let accountSession: AccountSession | undefined;
+  const toolError = (error: unknown) => json(res, 200, {
+    jsonrpc: "2.0", id: (body as { id?: unknown }).id ?? null,
+    result: withAccountContext({ isError: true, content: [{ type: "text" as const,
+      text: error instanceof Error ? error.message : "Invalid operation." }] }, accountSession?.context),
+  });
+  if (access && switchingEnabled && credential.kind === "oauth" && resource) {
+    try { accountSession = await loadAccountSession(credential.bearer, resource.resource); }
+    catch (error) {
+      if (error instanceof ReauthenticationRequired) return challenge(401);
+      if (error instanceof AccountContextError) return toolError(error);
+      return json(res, 503, { error: "Account context service unavailable." });
+    }
+  }
   let plan: { scopes: Scope[]; exchange: boolean } = { scopes: [], exchange: false };
   try {
-    if (access && name) plan = preflightToolCall(name, (body as { params?: { arguments?: unknown } }).params?.arguments);
+    if (access && name) plan = preflightToolCall(name, (body as { params?: { arguments?: unknown } }).params?.arguments, caller?.scopes);
   } catch (error) {
     // Invalid/excluded routes are local tool errors, not authentication failures.
-    return json(res, 200, { jsonrpc: "2.0", id: (body as { id?: unknown }).id ?? null,
-      result: { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : "Invalid operation." }] } });
+    return toolError(error);
   }
   const requiredScopes = plan.scopes;
   const scopeValue = requiredScopes.join(" ");
   if (access && caller && !requiredScopes.every((scope) => caller.scopes.includes(scope))) {
     return challenge(403, scopeValue);
   }
+  if (accountSession && access?.scope === "mcp:write" && requiredScopes.includes("mcp:write")) {
+    const input = (body as { params?: { arguments?: Record<string, unknown> } }).params?.arguments;
+    if (input?.confirm === true) {
+      try { assertAccountRevision(accountSession.context, input.account_revision); }
+      catch (error) { return toolError(error); }
+    }
+  }
 
   let exchangedBearer: string | undefined;
   if (access && plan.exchange && credential.kind === "oauth") {
     try {
-      exchangedBearer = await exchangeToken(credential.bearer, requiredScopes);
+      exchangedBearer = await exchangeToken(credential.bearer, requiredScopes,
+        accountSession && resource ? { context: accountSession.context, resource: resource.resource } : undefined);
     } catch (error) {
       if (error instanceof ReauthenticationRequired) return challenge(401);
+      if (error instanceof AccountContextError) return toolError(error);
       log("error", "Token exchange unavailable", { error });
       if (error instanceof AuthorizationServiceUnavailable) {
         return json(res, 503, { error: "Authorization service unavailable." },
@@ -211,21 +254,23 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
     }
   }
 
-  const server = buildServer(caller?.scopes, config.toolProfile);
+  const server = buildServer(caller?.scopes, config.toolProfile, switchingEnabled);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   const buffered = access ? bufferResponse(res) : undefined;
   let apiUnauthorized = false;
   const unauthorized = () => credential.kind === "oauth" ? challenge(401) : apiKeyUnauthorized(res);
   try {
     const requestAuth = credential.kind === "oauth"
-      ? { kind: "oauth" as const, exchangedBearer, scopes: requiredScopes, onUnauthorized: () => { apiUnauthorized = true; } }
+      ? { kind: "oauth" as const, exchangedBearer, scopes: requiredScopes,
+          switchedAccount: accountSession?.context.is_switched, onUnauthorized: () => { apiUnauthorized = true; } }
       : { kind: "apiKey" as const, apiKey: credential.apiKey, onUnauthorized: () => { apiUnauthorized = true; } };
-    await runWithAuth(requestAuth, async () => {
+    await runWithAccountSession(accountSession, () => runWithAuth(requestAuth, async () => {
       await server.connect(transport);
       await transport.handleRequest(req, res, body);
-    });
+    }));
+    if (accountSession?.reauthenticationRequired) apiUnauthorized = true;
     if (apiUnauthorized && access && credential.kind === "oauth") invalidateExchange(credential.bearer, requiredScopes);
-    buffered?.finish(apiUnauthorized ? unauthorized : undefined);
+    buffered?.finish(apiUnauthorized ? unauthorized : undefined, accountContextForResult(accountSession));
   } catch (error) {
     buffered?.restore();
     log("error", "MCP request failed", { error });

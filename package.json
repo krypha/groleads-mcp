@@ -1,6 +1,6 @@
 {
   "name": "magileads-mcp",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Magileads MCP — targeting, contact lists, campaign audit, PRM, email templates and explicitly authorized business API operations. Runs on Bun. Stdio + HTTP transports.",
   "type": "module",
   "bin": {
@@ -25,7 +25,8 @@
     "gen:endpoints": "bun run scripts/generate-endpoints.mjs",
     "tools:table": "bun run scripts/tool-table.ts",
     "test:oauth": "bun test tests/endpoints.test.ts tests/email-model.test.ts tests/resources.test.ts tests/oauth.test.ts",
-    "check:oauth": "bun run scripts/check-oauth.ts"
+    "check:oauth": "bun run scripts/check-oauth.ts",
+    "check:switch": "bun run scripts/check-account-switching.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

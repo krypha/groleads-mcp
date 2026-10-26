@@ -7,12 +7,13 @@ const SECRET_KEYS = new Set([
   "code_verifier", "codeverifier", "code_challenge", "codechallenge", "assertion",
   "accesstoken", "refreshtoken", "idtoken", "subjecttoken", "clientsecret",
   "api_key", "apikey", "x-api-key", "x-magileads-api-key",
+  "cursor", "next_cursor",
 ]);
 const REDACTED = "[redacted]";
 const BEARER = /\bBearer\s+\S+/gi;
 const BASIC = /\bBasic\s+\S+/gi;
 const JWT = /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
-const CREDENTIAL_QUERY = /([?&](?:code|access_token|refresh_token|token|id_token|code_verifier|code_challenge|client_secret|api_key)=)[^&\s"']+/gi;
+const CREDENTIAL_QUERY = /([?&](?:code|access_token|refresh_token|token|id_token|code_verifier|code_challenge|client_secret|api_key|cursor|next_cursor)=)[^&\s"']+/gi;
 
 export function redactString(value: string): string {
   const secret = process.env.OAUTH_INTERNAL_CLIENT_SECRET;

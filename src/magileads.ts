@@ -41,7 +41,7 @@ export function authMode(): AuthMode {
  */
 export type RequestAuth =
   | { kind: "apiKey"; apiKey: string; onUnauthorized?: () => void }
-  | { kind: "oauth"; exchangedBearer?: string; scopes: readonly Scope[]; onUnauthorized?: () => void };
+  | { kind: "oauth"; exchangedBearer?: string; scopes: readonly Scope[]; switchedAccount?: boolean; onUnauthorized?: () => void };
 const authStore = new AsyncLocalStorage<RequestAuth>();
 
 /** Run `fn` with `auth` as the active per-request credential. */
@@ -211,8 +211,15 @@ async function api<T>(path: string, init: RequestInit = {}, retryOn401 = true): 
 
   // A mid-flight token expiry (env password mode only) → re-auth once and retry.
   // Never for a per-request client key: a 401 there means the client's key is bad.
-  if (res.status === 401 && authStore.getStore()) {
-    authStore.getStore()?.onUnauthorized?.();
+  if (res.status === 401 && auth) {
+    if (auth.kind === "oauth" && auth.switchedAccount) {
+      await res.body?.cancel();
+      throw new MagileadsError(
+        "The switched account refused this request (401). Keep the original OAuth connection. Check this account's permissions or return to the original account. Nothing was retried or switched automatically.",
+        401, "switched_account_unauthorized",
+      );
+    }
+    auth.onUnauthorized?.();
   }
   if (res.status === 401 && !authStore.getStore() && authMode() === "password" && retryOn401) {
     accessToken = "";

@@ -21,6 +21,7 @@ transport uses Magileads environment credentials.
 - [Tools](#tools)
 - [How targeting works](#how-targeting-works)
 - [Transports](#transports)
+- [Private OAuth account switching](#oauth-account-switching-private-integrations)
 - [Configuration](#configuration)
 - [Run locally](#run-locally)
 - [Deploy with Docker / Dokploy](#deploy-with-docker--dokploy)
@@ -351,6 +352,66 @@ or `api_key` mode without participating in OAuth.
 
 The local stdio transport still uses its separate environment credentials.
 
+### OAuth account switching (private integrations)
+
+Version 0.13.0 adds four private HTTP OAuth tools: `get_active_account`,
+`list_switchable_accounts`, `switch_account`, and `return_to_original_account`.
+They require **new backend support**, not just the legacy browser switch route.
+The [backend handoff contract](docs/account-switching-api-contract.md) specifies
+the private control endpoints, persistent context, delegated token exchange,
+permission checks, error codes, and acceptance tests. It follows the backend's
+26 October 2026 handoff; local fake-API tests do not prove production compatibility.
+
+Account switching is **automatic** for HTTP OAuth (`oauth` or `both`) with
+`MCP_TOOL_PROFILE=full`. There is no activation variable and no new secret.
+OAuth clients get up to 30 tools, filtered by their scopes; API-key clients and
+stdio retain 26, and the public profile retains 23. No switch capability is added
+to those other modes. Existing OAuth authorizations remain usable without a
+new consent page or a forced reconnection. `get_active_account` accepts
+`mcp:read` **or** `mcp:write`; listing accounts requires read, while selection and
+return require write. A write-only client need not list accounts to select a known
+authorized ID or return. Write never implies access to read-only business routes.
+
+Before deploying the MCP, the API team must apply the switching migration, pass
+`oauth:check-readiness`, and grant the existing confidential internal client access
+to **each exact MCP resource** using `oauth:authorize-mcp-account-switching`.
+Domain discovery alone does not grant this permission. A private context refusal
+blocks the call, even on the original account; it never falls back to legacy exchange.
+
+The API stores the selection by original OAuth authorization/grant and exact MCP
+domain, preserving it across token refresh, restart and replicas. All chats using
+that same connection/domain share the selection; separate grants and reseller
+domains must stay isolated. The MCP has no global selected user and never replaces
+the original OAuth bearer with a browser-session token.
+
+Every dispatched tool result includes `account_context` with the original and
+active first name, last name, ID, switch state and revision. SDK validation errors
+also include it; failures before context loading may not. The agent is instructed
+to announce a switched identity, but the MCP cannot force an indicator on host
+replies that make no tool call. A failed switch may already have committed:
+`selection_status:"unknown_after_change"` marks the last known snapshot; re-read
+with `get_active_account` instead of repeating the switch automatically.
+
+Switch/return and **all confirmed business writes** require `confirm:true` and
+`account_revision` from a current preview or `get_active_account`. A missing or
+stale revision is refused before exchange or mutation. The API must independently
+enforce atomic revision/permission checks. No uncertain write is retried, no account
+is switched automatically, and no failure falls back to the original account.
+
+Only exchanged, account-bound tokens reach business routes; the exchange cache is
+disabled in this mode. A switched-account business `401` becomes a normal tool
+error (`switched_account_unauthorized`) without an OAuth challenge. The assistant
+should explain it, not reconnect the original account. Returning to the original
+uses the private control plane and must work even after target delegation expires.
+Real expiry/revocation of the original OAuth authorization still requires reconnecting.
+
+Delegation lasts **60 minutes after each successful selection**. Selecting the same
+account explicitly renews it and changes its revision. The API owns this deadline;
+the MCP does not invent a local expiry or automatically renew/select/return after
+`delegation_expired`. Exchanged API tokens last at most 300 seconds and are never
+cached in this path. `invalid_request` and `invalid_target` are integration/resource
+errors, not reasons to reconnect the original user.
+
 ## Configuration
 
 All via environment variables (see [`.env.example`](.env.example)). OAuth modes
@@ -360,7 +421,7 @@ refuse to start unless all five required OAuth settings are present.
 | --- | --- |
 | `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
-| `MCP_TOOL_PROFILE` | `full` (default, 26 tools) or `public` (23 dedicated tools, including email template creation; generic passthrough hidden). Applies to every HTTP client on this deployment. |
+| `MCP_TOOL_PROFILE` | `full` (default: 30 tools for OAuth, 26 for API keys) or `public` (23 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
 | `OAUTH_MCP_RESOURCE` | Required for OAuth modes; primary resource URL, e.g. `https://mcp.magileads.io/mcp`. Actual OAuth host authorization comes from private resource discovery, with no local fallback. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
@@ -609,7 +670,7 @@ DNS, TLS, proxy routing or production token-format compatibility. See the
 
 ### Validate email models after deployment
 
-This release needs **no new MCP environment variable** and does not change the
+Email-model support alone needs **no new MCP environment variable** and does not change the
 OAuth issuer, audience or confidential-client exchange. Deploy the backend route
 scope changes as well as this MCP release; public discovery alone does not prove
 that those business middleware changes are live. The backend team can run its
@@ -622,6 +683,8 @@ Using an authorized demonstration account with both scopes, validate:
 2. `create_email_model` with a name, subject and text body, without confirmation:
    expect a preview and no model created (works in full and public profiles).
 3. Re-call with `confirm:true`: expect a successful API response and model id.
+   For private HTTP OAuth, also supply the current `account_revision`
+   from the preview's `account_context.revision`.
 4. Re-read that id, then test a confirmed update through `magileads_request`
    with `method:PUT` and `/models/email/{id}` in the full profile (`mcp:write`).
 5. Verify a read-only authorization cannot create a model. Do not send any emails.
@@ -634,6 +697,38 @@ the actual exchanged-token scope/audience without logging tokens. An internal-cl
 failure is a deployment error; an excluded route or permission refusal should not
 be addressed by repeatedly reconnecting.
 
+### Authenticated account-switching acceptance test
+
+`bun run check:switch` starts **this checkout's MCP** on loopback and tests it
+against the real API using an existing demonstration-account OAuth bearer. It
+does not mistake the currently deployed MCP for the code under test. Supply the
+five `OAUTH_*` settings in a secure local environment and `MCP_TEST_SUBJECT_TOKEN`
+(an MCP-audience OAuth token, **not** a browser login JWT or API key).
+Do not pass secrets on the command line or paste them into logs/chat.
+
+By default it only checks initialization, scope-filtered discovery, the real
+private account context, token exchange and active business identity. To authorize
+the full test, also set positive, distinct `MCP_TEST_EXPECTED_USER_ID` and
+`MCP_TEST_TARGET_USER_ID`, using a **dedicated OAuth connection** for test accounts:
+
+```bash
+bun run check:switch --allow-switch --allow-create-model
+```
+
+This explicitly authorizes the harness to switch to that target, save **one**
+labeled email model without sending, read it by ID and return to the original
+account as test teardown. It also checks preview/missing-revision/stale-confirmation
+guards and that the target appears in the API-authorized account list. No listing
+of existing models is required. The created model remains as clearly labeled test
+data; the MCP does not expose deletion. No uncertain mutation is retried. An
+uncertain switch or a concurrent selection is reported rather than overwritten.
+
+Each check prints only `PASS`, `FAIL` or `BLOCKED` plus safe identifiers, never
+tokens, credentials, cursors or response bodies. Exit code `0` means all requested
+checks passed, `1` a failure, and `2` missing prerequisites or unexecuted checks.
+A read-only run intentionally returns `2` because it cannot prove switch/write/return.
+`compteTest.txt`, `.env.local` and `.env.test` are excluded from Git and Docker.
+
 ## ChatGPT cloud and public plugin
 
 The same public HTTPS MCP endpoint can be connected privately in ChatGPT
@@ -642,8 +737,9 @@ directory. See the [ChatGPT deployment and submission guide](docs/chatgpt-public
 for the OAuth smoke test, public-domain verification (`OPENAI_APPS_CHALLENGE_TOKEN`),
 review materials, and test cases. Set `MCP_TOOL_PROFILE=public` for submission:
 it exposes the 23 dedicated business tools while hiding the three generic API
-passthrough tools. The default `full` profile exposes all 26 tools for private
-integrations. Connecting privately does not publish the plugin.
+passthrough and four account-control tools. The default `full` profile exposes
+up to 30 tools for private HTTP OAuth integrations, or 26 for API-key/stdio clients.
+Connecting privately does not publish the plugin.
 
 ## Connect to a Hermes Agent
 
@@ -661,12 +757,12 @@ explicit `MCP_ALLOW_API_KEY_QUERY=true` opt-in described above.
 ```
 src/
 ├── magileads.ts             Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts                 The 26 MCP tool definitions + handlers (input validation, error wrapping)
+├── tools.ts                 26 business tools + 4 private HTTP OAuth account tools
 ├── endpoints.ts             Exact route resolution and explicit scopes
 ├── endpoints.generated.ts   Authorized OAuth business operations (generated)
 ├── server.ts                buildServer() — creates an McpServer with all tools registered
 ├── index.ts                 stdio entry point
-├── oauth/                  OAuth config, JWT verification, metadata, token exchange
+├── oauth/                  OAuth config, JWT verification, metadata, exchange, account context
 ├── http-config.ts          HTTP authentication mode and key-in-URL opt-in
 ├── log.ts                  Credential-redacting stderr logger
 └── http.ts                  OAuth/API-key Streamable HTTP + /health

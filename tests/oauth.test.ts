@@ -1,9 +1,10 @@
 import { afterAll, expect, test } from "bun:test";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { decodeJwt, exportJWK, generateKeyPair, SignJWT } from "jose";
+import type { AccountContext } from "../src/oauth/account-context.js";
 import { CALLABLE_ENDPOINTS, matchEndpoint } from "../src/endpoints.js";
-import { CREATION_GUIDANCE } from "../src/instructions.js";
+import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE } from "../src/instructions.js";
 
 async function start(handler: http.RequestListener): Promise<{ server: http.Server; origin: string }> {
   const server = http.createServer(handler);
@@ -24,8 +25,8 @@ let issuer = "";
 let apiOrigin = "";
 let exchangeMode: "normal" | "invalid_grant" | "unauthorized" | "reordered_scopes" | "broader_scopes" |
   "unavailable" | "rate_limited" | "invalid_type" | "invalid_issued_type" | "missing_expires" |
-  "expired" | "invalid_scope_type" | "omitted_optional" | "redirect" = "normal";
-let discoveryMode: "normal" | "unavailable" | "not_found" | "mismatched_issuer" | "unsafe_endpoint" | "oidc_only" = "normal";
+  "expired" | "invalid_scope_type" | "omitted_optional" | "redirect" | "excessive_lifetime" | "invalid_target" | "invalid_request" = "normal";
+let discoveryMode: "normal" | "unavailable" | "not_found" | "mismatched_issuer" | "unsafe_endpoint" | "oidc_only" | "other_token_origin" = "normal";
 let jwksUnavailable = false;
 let apiMode: "normal" | "unauthorized" | "forbidden" = "normal";
 let privateResourcesMode: "normal" | "redirect" = "normal";
@@ -40,9 +41,37 @@ const exchanges: {
 const apiBearers: string[] = [];
 const apiKeys: string[] = [];
 const businessCalls: { method: string; path: string; bearer: string; body?: unknown }[] = [];
+const accountContexts = new Map<string, AccountContext>();
+const delegationDeadlines = new Map<string, number>();
+let accountClock = 0; // Fake API time only; never alters HTTP/JWT timers.
+let accountResourceAllowed = true;
+let accountTargetState: "available" | "unavailable" | "denied" = "available";
+const delegatedTokens = new Map<string, { context: AccountContext; key: string; scopes: string }>();
+const accountControlCalls: { path: string; method: string; authorization: string; body: Record<string, unknown> }[] = [];
+const accountCursors = new Map<string, { key: string; search: string }>();
+let accountControlMode: "normal" | "unavailable" | "invalid_client" | "invalid_subject_token" | "malformed" | "redirect" = "normal";
+let accountExchangeMode: "normal" | "missing_binding" | "wrong_actor" | "wrong_target" | "wrong_revision" | "race" | "expired" = "normal";
+let accountMutationFailure: "none" | "lost_response" | "invalid_subject_token" = "none";
+function accountKey(subjectToken: string, resource: string): string {
+  const claims = decodeJwt(subjectToken);
+  return JSON.stringify([claims.iss, claims.sub, claims.grant_id ?? claims.jti, resource]);
+}
+function fixtureContext(subjectToken: string, resource: string): AccountContext {
+  const key = accountKey(subjectToken, resource);
+  let context = accountContexts.get(key);
+  if (!context) {
+    const id = decodeJwt(subjectToken).sub === "user-8" ? 8 : 7;
+    const original = { id, first_name: "Original", last_name: `User${id}` };
+    context = { revision: crypto.randomUUID(), original_account: original, active_account: original, is_switched: false };
+    accountContexts.set(key, context);
+  }
+  return context;
+}
 
 function hasExchangedScope(req: http.IncomingMessage, scope: string): boolean {
   const bearer = req.headers.authorization;
+  const delegated = delegatedTokens.get(bearer || "");
+  if (delegated) return delegated.scopes.split(" ").includes(scope);
   if (typeof bearer !== "string" || !bearer.startsWith("Bearer exchanged-")) return false;
   return bearer.slice("Bearer exchanged-".length).replaceAll("+", " ").split(" ").includes(scope);
 }
@@ -50,6 +79,60 @@ function hasExchangedScope(req: http.IncomingMessage, scope: string): boolean {
 // Authorization and business API live on DIFFERENT origins. The MCP must use
 // the discovered token_endpoint, not assume it lives at the business API base.
 const authorization = await start(async (req, res) => {
+  if (["/oauth/mcp/account-context", "/oauth/mcp/switchable-accounts"].includes(req.url || "")) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    accountControlCalls.push({ path: req.url!, method: req.method!, authorization: req.headers.authorization || "", body });
+    const permittedFields = new Set(["subject_token", "resource", ...(req.url === "/oauth/mcp/switchable-accounts" ? ["search", "limit", "cursor"] : req.method === "PUT" ? ["expected_revision", "target_user_id"] : [])]);
+    if (Object.keys(body).some((field) => !permittedFields.has(field))) return respond(res, 400, { error: "invalid_request" });
+    if (req.headers.authorization !== basicClientAuthorization(process.env.OAUTH_INTERNAL_CLIENT_ID!, process.env.OAUTH_INTERNAL_CLIENT_SECRET!) || accountControlMode === "invalid_client") {
+      return respond(res, 401, { error: "invalid_client", error_description: `must not leak ${body.subject_token}` });
+    }
+    if (accountControlMode === "unavailable") return respond(res, 503, {});
+    if (accountControlMode === "invalid_subject_token") return respond(res, 400, { error: "invalid_subject_token" });
+    if (accountControlMode === "malformed") return respond(res, 200, { state: true, context: {} });
+    if (accountControlMode === "redirect") {
+      res.writeHead(307, { Location: `${apiOrigin}/private-discovery-leak` });
+      return res.end();
+    }
+    if (!accountResourceAllowed) return respond(res, 403, { error: "delegation_denied" });
+    const claims = decodeJwt(String(body.subject_token));
+    if (claims.aud !== body.resource) return respond(res, 400, { error: "invalid_target" });
+    const scopes = String(claims.scope).split(" ");
+    const needed = req.url === "/oauth/mcp/switchable-accounts" ? "mcp:read" : req.method === "PUT" ? "mcp:write" : undefined;
+    if (needed && !scopes.includes(needed)) return respond(res, 403, { error: "insufficient_scope" });
+    const context = fixtureContext(String(body.subject_token), String(body.resource));
+    if (req.url === "/oauth/mcp/switchable-accounts") {
+      const key = accountKey(String(body.subject_token), String(body.resource));
+      const search = typeof body.search === "string" ? body.search : "";
+      let offset = 0;
+      if (body.cursor) {
+        const saved = accountCursors.get(String(body.cursor));
+        if (!saved || saved.key !== key || saved.search !== search) return respond(res, 400, { error: "invalid_request" });
+        offset = 1;
+      }
+      const choices = [{ id: 42, first_name: "Target", last_name: "User" }, { id: 43, first_name: "Target", last_name: "Second" }]
+        .filter((item) => `${item.first_name} ${item.last_name}`.toLowerCase().includes(search.toLowerCase()));
+      const limit = typeof body.limit === "number" ? body.limit : 25;
+      const nextCursor = choices.length > offset + limit ? crypto.randomUUID() : null;
+      if (nextCursor) accountCursors.set(nextCursor, { key, search });
+      return respond(res, 200, { state: true, accounts: choices.slice(offset, offset + limit), next_cursor: nextCursor });
+    }
+    if (req.method === "PUT") {
+      if (accountMutationFailure === "invalid_subject_token") return respond(res, 400, { error: "invalid_subject_token" });
+      if (body.expected_revision !== context.revision) return respond(res, 409, { error: "account_context_changed" });
+      if (body.target_user_id !== null && body.target_user_id !== 42) return respond(res, 403, { error: "delegation_denied" });
+      if (body.target_user_id !== null && accountTargetState !== "available") return respond(res, 403, { error: accountTargetState === "unavailable" ? "target_unavailable" : "delegation_denied" });
+      const next = { ...context, revision: crypto.randomUUID(), is_switched: body.target_user_id !== null,
+        active_account: body.target_user_id === null ? context.original_account : { id: 42, first_name: "Target", last_name: "User" } };
+      accountContexts.set(accountKey(String(body.subject_token), String(body.resource)), next);
+      delegationDeadlines.set(accountKey(String(body.subject_token), String(body.resource)), accountClock + 60 * 60_000);
+      if (accountMutationFailure === "lost_response") return respond(res, 503, {});
+      return respond(res, 200, { state: true, context: next });
+    }
+    return respond(res, 200, { state: true, context });
+  }
   if (req.url === "/oauth/mcp-resources" && req.method === "GET") {
     privateDiscoveryHeaders.push(req.headers.authorization || "");
     if (req.headers.authorization !== basicClientAuthorization(process.env.OAUTH_INTERNAL_CLIENT_ID!, process.env.OAUTH_INTERNAL_CLIENT_SECRET!)) {
@@ -72,7 +155,7 @@ const authorization = await start(async (req, res) => {
     return respond(res, 200, {
       issuer: discoveryMode === "mismatched_issuer" ? `${issuer}/wrong` : issuer,
       jwks_uri: `${new URL(issuer).origin}/oauth/jwks.json`,
-      token_endpoint: discoveryMode === "unsafe_endpoint" ? "http://untrusted.example/oauth/token" : `${new URL(issuer).origin}/oauth/token`,
+      token_endpoint: discoveryMode === "unsafe_endpoint" ? "http://untrusted.example/oauth/token" : `${discoveryMode === "other_token_origin" ? apiOrigin : new URL(issuer).origin}/oauth/token`,
       token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
     });
   }
@@ -94,6 +177,7 @@ const authorization = await start(async (req, res) => {
       contentType: req.headers["content-type"] || "",
     });
     if (exchangeMode === "invalid_grant") return respond(res, 400, { error: "invalid_grant" });
+    if (exchangeMode === "invalid_target" || exchangeMode === "invalid_request") return respond(res, 400, { error: exchangeMode });
     if (exchangeMode === "unauthorized") return respond(res, 401, { error: "invalid_client" });
     if (exchangeMode === "unavailable" || exchangeMode === "rate_limited") {
       res.setHeader("Retry-After", "10");
@@ -112,9 +196,37 @@ const authorization = await start(async (req, res) => {
       token_type: exchangeMode === "invalid_type" ? "N_A" : "Bearer",
       issued_token_type: exchangeMode === "invalid_issued_type"
         ? "urn:ietf:params:oauth:token-type:refresh_token" : "urn:ietf:params:oauth:token-type:access_token",
-      expires_in: exchangeMode === "expired" ? 0 : 300,
+      expires_in: exchangeMode === "expired" ? 0 : exchangeMode === "excessive_lifetime" ? 301 : 300,
       scope: exchangeMode === "invalid_scope_type" ? [requestedScope] : responseScope,
     };
+    if (body.has("account_context_revision")) {
+      const subject = body.get("subject_token")!;
+      const resource = body.get("mcp_resource")!;
+      const context = fixtureContext(subject, resource);
+      if (!accountResourceAllowed) return respond(res, 403, { error: "delegation_denied" });
+      if (accountExchangeMode === "race" || context.revision !== body.get("account_context_revision")) {
+        return respond(res, 409, { error: "account_context_changed" });
+      }
+      if (accountExchangeMode === "expired") return respond(res, 403, { error: "delegation_expired" });
+      if (context.is_switched) {
+        if (accountTargetState !== "available") return respond(res, 403, { error: accountTargetState === "unavailable" ? "target_unavailable" : "delegation_denied" });
+        const remaining = (delegationDeadlines.get(accountKey(subject, resource)) ?? 0) - accountClock;
+        if (remaining <= 0) return respond(res, 403, { error: "delegation_expired" });
+        payload.expires_in = Math.min(300, Math.ceil(remaining / 1000));
+      }
+      if (accountExchangeMode !== "missing_binding") {
+        payload.account_context_revision = accountExchangeMode === "wrong_revision" ? "wrong" : context.revision;
+        payload.actor_user_id = accountExchangeMode === "wrong_actor" ? 999 : context.original_account.id;
+        payload.effective_user_id = accountExchangeMode === "wrong_target" ? 999 : context.active_account.id;
+      }
+      // Stable original-account fixture strings keep legacy route-scope assertions
+      // readable. The switch scenarios use grant_id and unique account-bound tokens.
+      if (decodeJwt(subject).grant_id) {
+        const accessToken = `delegated-${crypto.randomUUID()}`;
+        payload.access_token = accessToken;
+        delegatedTokens.set(`Bearer ${accessToken}`, { context, key: accountKey(subject, resource), scopes: requestedScope });
+      }
+    }
     if (exchangeMode === "missing_expires") delete payload.expires_in;
     if (exchangeMode === "omitted_optional") {
       delete payload.issued_token_type;
@@ -128,6 +240,10 @@ issuer = `${authorization.origin}/tenant`;
 
 let misplacedExchanges = 0;
 const api = await start(async (req, res) => {
+  const delegated = delegatedTokens.get(req.headers.authorization || "");
+  if (delegated && accountContexts.get(delegated.key)?.revision !== delegated.context.revision) {
+    return respond(res, 409, { error: "account_context_changed" });
+  }
   if (req.url === "/private-discovery-leak") {
     leakedPrivateDiscovery++;
     return respond(res, 200, { state: true, resources: [] });
@@ -156,6 +272,7 @@ const api = await start(async (req, res) => {
       return respond(res, 200, { user_profile: { id: apiKey === "key-alpha" ? 71 : 72, first_name: "Key", last_name: "User", subscriptions: {} } });
     }
     if (apiMode === "unauthorized") return respond(res, 401, { state_message: "token_expired" });
+    if (delegated) return respond(res, 200, { user_profile: { ...delegated.context.active_account, subscriptions: {} } });
     if (req.headers.authorization !== "Bearer exchanged-mcp:read") return respond(res, 401, {});
     return respond(res, 200, { user_profile: { id: 7, first_name: "Test", last_name: "User", subscriptions: {} } });
   }
@@ -165,6 +282,7 @@ const api = await start(async (req, res) => {
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
     businessCalls.push({ method: req.method || "", path: req.url || "", bearer: req.headers.authorization || "", body });
+    if (apiMode === "unauthorized") return respond(res, 401, { state_message: "token_expired" });
     if (apiMode === "forbidden") return respond(res, 403, { state_message: "unauthorized_model" });
     if (!hasExchangedScope(req, endpoint.scope)) return respond(res, 401, { state_message: "insufficient_scope" });
     if (req.url === "/models/email" && req.method === "POST") {
@@ -224,6 +342,13 @@ async function token(scope: string, audience = process.env.OAUTH_MCP_RESOURCE!):
 }
 
 async function rpc(method: string, bearer?: string, params?: unknown): Promise<Response> {
+  // Older route tests confirm writes on the original account. Supply their
+  // explicit fixture revision; accountRpc intentionally does NOT do this, so
+  // missing/stale-revision security tests exercise the actual HTTP boundary.
+  const call = params as { name?: string; arguments?: Record<string, unknown> } | undefined;
+  if (method === "tools/call" && bearer && call?.arguments?.confirm === true && call.arguments.account_revision === undefined) {
+    params = { ...call, arguments: { ...call.arguments, account_revision: fixtureContext(bearer, process.env.OAUTH_MCP_RESOURCE!).revision } };
+  }
   return fetch(`${mcpOrigin}/mcp`, {
     method: "POST",
     headers: {
@@ -239,6 +364,512 @@ async function toolResult(response: Response): Promise<{ isError?: boolean; cont
   const payload = await response.json() as { result: { isError?: boolean; content: { text: string }[] } };
   return payload.result;
 }
+
+async function switchingInstance(): Promise<{ server: http.Server; origin: string }> {
+  return ephemeralMcp("both");
+}
+
+async function closeTestServer(server: http.Server): Promise<void> {
+  server.closeAllConnections();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function grantToken(grant = crypto.randomUUID(), resource = process.env.OAUTH_MCP_RESOURCE!, subject = "user-7", scope = "mcp:read mcp:write"): Promise<string> {
+  return new SignJWT({ scope, grant_id: grant, jti: crypto.randomUUID() })
+    .setProtectedHeader({ alg: "RS256", typ: "JWT", kid: "smoke-key" })
+    .setIssuer(issuer).setAudience(resource).setSubject(subject)
+    .setIssuedAt().setExpirationTime("1h").sign(privateKey);
+}
+
+function accountRpc(origin: string, bearer: string, name: string, args: Record<string, unknown> = {}, resource = process.env.OAUTH_MCP_RESOURCE!): Promise<Response> {
+  return keyRpc(origin, undefined, "tools/call", { name, arguments: args }, { Authorization: `Bearer ${bearer}`, Host: new URL(resource).host });
+}
+
+async function activeContext(origin: string, bearer: string, resource = process.env.OAUTH_MCP_RESOURCE!): Promise<AccountContext> {
+  const response = await accountRpc(origin, bearer, "get_active_account", {}, resource);
+  expect(response.status).toBe(200);
+  const result = await toolResult(response);
+  expect(result.isError).not.toBe(true);
+  return JSON.parse(result.content[0].text).account_context as AccountContext;
+}
+
+test("switching is automatic only for private HTTP OAuth; API keys and public profile stay unchanged", async () => {
+  expect("accountSwitchingEnabled" in loadHttpConfig({})).toBe(false);
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const before = accountControlCalls.length;
+    const listed = await keyRpc(instance.origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
+    const tools = (await listed.json() as { result: { tools: { name: string; inputSchema: { properties: Record<string, unknown> } }[] } }).result.tools;
+    expect(tools).toHaveLength(30);
+    expect(tools.find((tool) => tool.name === "create_email_model")?.inputSchema.properties.account_revision).toBeDefined();
+    expect(accountControlCalls.length).toBe(before);
+    const standard = await rpc("tools/list", bearer);
+    expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(30);
+    for (const response of [await keyRpc(instance.origin, "key-alpha", "tools/list")]) {
+      const data = await response.json() as { result: { tools: { name: string }[] } };
+      expect(data.result.tools).toHaveLength(26);
+      expect(data.result.tools.some((tool) => tool.name === "switch_account")).toBe(false);
+    }
+    const hidden = await keyRpc(instance.origin, "key-alpha", "tools/call", { name: "switch_account", arguments: { user_id: 42, confirm: true } });
+    expect((await toolResult(hidden)).isError).toBe(true);
+    expect(accountControlCalls.length).toBe(before);
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("account discovery and switch previews use only the private Basic-auth control plane", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const beforeBusiness = businessCalls.length + apiBearers.length;
+    const beforeExchanges = exchanges.length;
+    const context = await activeContext(instance.origin, bearer);
+    expect(context.active_account).toEqual(context.original_account);
+    const listed = await accountRpc(instance.origin, bearer, "list_switchable_accounts", { limit: 10, search: "Target" });
+    const data = JSON.parse((await toolResult(listed)).content[0].text);
+    expect(data.accounts[0].id).toBe(42);
+    expect(data.account_context.active_account.id).toBe(7);
+    const preview = await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42 });
+    expect(JSON.parse((await toolResult(preview)).content[0].text).dry_run).toBe(true);
+    expect((await activeContext(instance.origin, bearer)).revision).toBe(context.revision);
+    expect(businessCalls.length + apiBearers.length).toBe(beforeBusiness);
+    expect(exchanges.length).toBe(beforeExchanges);
+    const call = accountControlCalls.at(-1)!;
+    expect(call.authorization).toBe(basicClientAuthorization(process.env.OAUTH_INTERNAL_CLIENT_ID!, process.env.OAUTH_INTERNAL_CLIENT_SECRET!));
+    expect(call.body).toEqual({ subject_token: bearer, resource: process.env.OAUTH_MCP_RESOURCE });
+    expect(call.path).toBe("/oauth/mcp/account-context");
+    expect(call.method).toBe("POST");
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("account selection survives token refresh and MCP replica replacement, but isolates grants, users and reseller domains", async () => {
+  const first = await switchingInstance();
+  const second = await switchingInstance();
+  try {
+    const grant = crypto.randomUUID();
+    const bearer = await grantToken(grant);
+    const context = await activeContext(first.origin, bearer);
+    const switched = await accountRpc(first.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: context.revision });
+    expect((await toolResult(switched)).isError).not.toBe(true);
+    const refreshed = await grantToken(grant);
+    expect(refreshed).not.toBe(bearer);
+    await closeTestServer(first.server);
+    const continued = await activeContext(second.origin, refreshed);
+    expect(continued.is_switched).toBe(true);
+    expect(continued.active_account).toEqual({ id: 42, first_name: "Target", last_name: "User" });
+    expect(continued.original_account.id).toBe(7);
+    const isolated = await Promise.all([
+      activeContext(second.origin, await grantToken()),
+      activeContext(second.origin, await grantToken(grant, process.env.OAUTH_MCP_RESOURCE!, "user-8")),
+      activeContext(second.origin, await grantToken(grant, resellerResource), resellerResource),
+    ]);
+    expect(isolated.map((value) => value.is_switched)).toEqual([false, false, false]);
+    expect(isolated.map((value) => value.active_account.id)).toEqual([7, 8, 7]);
+    const result = await toolResult(await accountRpc(second.origin, refreshed, "get_account_overview"));
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.account_context.active_account.id).toBe(42);
+    expect(payload.account_context.original_account.id).toBe(7);
+    const lastBearer = apiBearers.at(-1)!;
+    expect(lastBearer).not.toContain(refreshed);
+    expect(delegatedTokens.get(lastBearer)?.context.active_account.id).toBe(42);
+    // Another private HTTP OAuth instance sees exactly the same shared selection.
+    const shared = await toolResult(await rpc("tools/call", refreshed, { name: "get_account_overview", arguments: {} }));
+    expect(JSON.parse(shared.content[0].text).account_context.active_account.id).toBe(42);
+  } finally { await closeTestServer(first.server); await closeTestServer(second.server); }
+});
+
+test("confirmed writes and account changes require a fresh revision before any exchange or mutation", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const original = await activeContext(instance.origin, bearer);
+    const before = exchanges.length;
+    for (const name of ["switch_account", "create_email_model"] as const) {
+      const args = name === "switch_account" ? { user_id: 42 } : { name: "Test", subject: "Hello", text: "Hello" };
+      const refused = await accountRpc(instance.origin, bearer, name, { ...args, confirm: true });
+      expect((await toolResult(refused)).isError).toBe(true);
+      expect(refused.headers.get("www-authenticate")).toBeNull();
+    }
+    expect(exchanges.length).toBe(before);
+    await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: original.revision });
+    const beforeWrites = businessCalls.length;
+    const stale = await accountRpc(instance.origin, bearer, "magileads_request", { method: "POST", path: "/models/email", body: { html: "<p>Test</p>" }, confirm: true, account_revision: original.revision });
+    expect((await toolResult(stale)).isError).toBe(true);
+    expect(exchanges.length).toBe(before);
+    expect(businessCalls.length).toBe(beforeWrites);
+    const preview = await accountRpc(instance.origin, bearer, "create_email_model", { name: "Test", subject: "Hello", text: "Hello" });
+    const active = JSON.parse((await toolResult(preview)).content[0].text).account_context as AccountContext;
+    expect(active.active_account.id).toBe(42);
+    const executed = await accountRpc(instance.origin, bearer, "create_email_model", { name: "Test", subject: "Hello", text: "Hello", confirm: true, account_revision: active.revision });
+    expect((await toolResult(executed)).isError).not.toBe(true);
+    expect(businessCalls.length).toBe(beforeWrites + 1);
+    expect(exchanges.length).toBe(before + 1);
+    expect(delegatedTokens.get(businessCalls.at(-1)!.bearer)?.context.active_account.id).toBe(42);
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("a switched business 401 is a normal tool error without reconnect, retry or fallback; return still works", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const context = await activeContext(instance.origin, bearer);
+    await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: context.revision });
+    apiMode = "unauthorized";
+    const before = apiBearers.length;
+    const failed = await accountRpc(instance.origin, bearer, "get_account_overview");
+    expect(failed.status).toBe(200);
+    expect(failed.headers.get("www-authenticate")).toBeNull();
+    const result = await toolResult(failed);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("switched_account_unauthorized");
+    expect(JSON.parse(result.content[1].text).account_context.active_account.id).toBe(42);
+    expect(apiBearers.length).toBe(before + 1);
+    const active = await activeContext(instance.origin, bearer);
+    expect(active.is_switched).toBe(true);
+    const writesBefore = businessCalls.length;
+    const writeFailed = await accountRpc(instance.origin, bearer, "create_email_model", {
+      name: "Refused", subject: "Hello", text: "Hello", confirm: true, account_revision: active.revision,
+    });
+    expect(writeFailed.status).toBe(200);
+    expect(writeFailed.headers.get("www-authenticate")).toBeNull();
+    expect((await toolResult(writeFailed)).isError).toBe(true);
+    expect(businessCalls.length).toBe(writesBefore + 1); // Exactly one attempt; no original-account fallback.
+    accountExchangeMode = "expired";
+    const beforeExchange = exchanges.length;
+    const returned = await accountRpc(instance.origin, bearer, "return_to_original_account", { confirm: true, account_revision: active.revision });
+    expect((await toolResult(returned)).isError).not.toBe(true);
+    expect(exchanges.length).toBe(beforeExchange);
+    expect((await activeContext(instance.origin, bearer)).is_switched).toBe(false);
+    // A business 401 on the ORIGINAL account retains the existing OAuth challenge.
+    accountExchangeMode = "normal";
+    const rootFailed = await accountRpc(instance.origin, bearer, "get_account_overview");
+    expect(rootFailed.status).toBe(401);
+    expect(rootFailed.headers.get("www-authenticate")).toContain("resource_metadata=");
+  } finally { apiMode = "normal"; accountExchangeMode = "normal"; await closeTestServer(instance.server); }
+});
+
+test("delegation denial, expiry, context races and exchange binding mismatches never reach business APIs", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const context = await activeContext(instance.origin, bearer);
+    const denied = await accountRpc(instance.origin, bearer, "switch_account", { user_id: 999, confirm: true, account_revision: context.revision });
+    expect((await toolResult(denied)).content[0].text).toContain("delegation_denied");
+    expect(denied.headers.get("www-authenticate")).toBeNull();
+    expect((await activeContext(instance.origin, bearer)).revision).toBe(context.revision);
+    const before = apiBearers.length;
+    for (const mode of ["missing_binding", "wrong_actor", "wrong_target", "wrong_revision", "race", "expired"] as const) {
+      accountExchangeMode = mode;
+      const response = await accountRpc(instance.origin, bearer, "get_account_overview");
+      expect(response.status).toBe(200);
+      expect(response.headers.get("www-authenticate")).toBeNull();
+      expect((await toolResult(response)).isError).toBe(true);
+    }
+    expect(apiBearers.length).toBe(before);
+  } finally { accountExchangeMode = "normal"; await closeTestServer(instance.server); }
+});
+
+test("parallel switches use compare-and-set; each successful business read exchanges again", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const context = await activeContext(instance.origin, bearer);
+    const attempts = await Promise.all([1, 2].map(() => accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: context.revision })));
+    const results = await Promise.all(attempts.map(toolResult));
+    expect(results.filter((value) => !value.isError)).toHaveLength(1);
+    expect(results.filter((value) => value.isError)).toHaveLength(1);
+    const before = exchanges.length;
+    await Promise.all([1, 2].map(() => accountRpc(instance.origin, bearer, "get_account_overview")));
+    expect(exchanges.length).toBe(before + 2);
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("switched composite tools retain the read/write union and SDK validation errors identify the active account", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const context = await activeContext(instance.origin, bearer);
+    await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: context.revision });
+    const active = await activeContext(instance.origin, bearer);
+    const before = businessCalls.length;
+    const imported = await accountRpc(instance.origin, bearer, "add_contact_to_list", {
+      contact_list_id: 42, properties: [{ field: "email", value: "example@example.com" }],
+      confirm: true, account_revision: active.revision,
+    });
+    expect((await toolResult(imported)).isError).not.toBe(true);
+    expect(exchanges.at(-1)?.scope).toBe("mcp:read mcp:write");
+    for (const call of businessCalls.slice(before)) expect(delegatedTokens.get(call.bearer)?.context.active_account.id).toBe(42);
+    const invalid = await accountRpc(instance.origin, bearer, "switch_account", { user_id: "not-an-id" });
+    const result = await toolResult(invalid);
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain('account_context');
+    expect(JSON.parse(result.content.at(-1)!.text).account_context.active_account.id).toBe(42);
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("an uncertain switch is not repeated or presented as a known active identity", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const original = await activeContext(instance.origin, bearer);
+    const before = accountControlCalls.filter((call) => call.method === "PUT").length;
+    accountMutationFailure = "lost_response";
+    const failed = await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: original.revision });
+    expect(failed.status).toBe(200);
+    expect(failed.headers.get("www-authenticate")).toBeNull();
+    const result = await toolResult(failed);
+    expect(result.isError).toBe(true);
+    const snapshot = JSON.parse(result.content.at(-1)!.text).account_context;
+    expect(snapshot.selection_status).toBe("unknown_after_change");
+    expect(snapshot.active_account.id).toBe(7); // Explicitly marked as the old snapshot, not the actual selection.
+    expect(accountControlCalls.filter((call) => call.method === "PUT").length).toBe(before + 1);
+    accountMutationFailure = "none";
+    const actual = await activeContext(instance.origin, bearer);
+    expect(actual.active_account.id).toBe(42);
+    expect(actual.revision).not.toBe(original.revision);
+    accountMutationFailure = "invalid_subject_token";
+    const revoked = await accountRpc(instance.origin, bearer, "return_to_original_account", { confirm: true, account_revision: actual.revision });
+    expect(revoked.status).toBe(401); // True root revocation during control dispatch must still challenge.
+    expect(revoked.headers.get("www-authenticate")).toContain("resource_metadata=");
+  } finally { accountMutationFailure = "none"; await closeTestServer(instance.server); }
+});
+
+test("private context outages, redirects and internal authentication errors never cause false reconnects or leaks", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const before = apiBearers.length;
+    const leaks = leakedPrivateDiscovery;
+    for (const mode of ["unavailable", "redirect", "invalid_client", "malformed"] as const) {
+      accountControlMode = mode;
+      const response = await accountRpc(instance.origin, bearer, "get_account_overview");
+      expect(response.status).toBe(["unavailable", "redirect"].includes(mode) ? 503 : 200);
+      expect(response.headers.get("www-authenticate")).toBeNull();
+      const text = await response.text();
+      expect(text).not.toContain(bearer);
+      expect(text).not.toContain(process.env.OAUTH_INTERNAL_CLIENT_SECRET!);
+    }
+    expect(leakedPrivateDiscovery).toBe(leaks);
+    expect(apiBearers.length).toBe(before);
+    accountControlMode = "invalid_subject_token";
+    const expired = await accountRpc(instance.origin, bearer, "get_active_account");
+    expect(expired.status).toBe(401);
+    expect(expired.headers.get("www-authenticate")).toContain("resource_metadata=");
+  } finally { accountControlMode = "normal"; await closeTestServer(instance.server); }
+});
+
+test("write-only OAuth can inspect context, select, create a model and return without list/read access", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken(crypto.randomUUID(), process.env.OAUTH_MCP_RESOURCE!, "user-7", "mcp:write");
+    const list = await keyRpc(instance.origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
+    const names = (await list.json() as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
+    expect(names).toContain("get_active_account");
+    expect(names).toContain("switch_account");
+    expect(names).not.toContain("list_switchable_accounts");
+    expect(names).not.toContain("get_account_overview");
+    const original = await activeContext(instance.origin, bearer);
+    const beforeListCalls = accountControlCalls.filter((call) => call.path.endsWith("switchable-accounts")).length;
+    const denied = await accountRpc(instance.origin, bearer, "list_switchable_accounts");
+    expect(denied.status).toBe(403);
+    expect(accountControlCalls.filter((call) => call.path.endsWith("switchable-accounts")).length).toBe(beforeListCalls);
+    const switched = await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: original.revision });
+    expect((await toolResult(switched)).isError).not.toBe(true);
+    const active = await activeContext(instance.origin, bearer);
+    expect(active.active_account.id).toBe(42);
+    const created = await accountRpc(instance.origin, bearer, "create_email_model", { name: "Write-only test", subject: "Test", text: "Hello", confirm: true, account_revision: active.revision });
+    expect((await toolResult(created)).isError).not.toBe(true);
+    expect(exchanges.at(-1)?.scope).toBe("mcp:write");
+    const returned = await accountRpc(instance.origin, bearer, "return_to_original_account", { confirm: true, account_revision: active.revision });
+    expect((await toolResult(returned)).isError).not.toBe(true);
+    expect((await activeContext(instance.origin, bearer)).is_switched).toBe(false);
+    expect(accountControlCalls.filter((call) => call.path.endsWith("switchable-accounts")).length).toBe(beforeListCalls);
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("read-only OAuth inspects context but cannot switch, return or write", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken(crypto.randomUUID(), process.env.OAUTH_MCP_RESOURCE!, "user-7", "mcp:read");
+    const context = await activeContext(instance.origin, bearer);
+    const before = accountControlCalls.filter((call) => call.method === "PUT").length;
+    for (const name of ["switch_account", "return_to_original_account", "create_email_model"]) {
+      const response = await accountRpc(instance.origin, bearer, name, { user_id: 42, confirm: true, account_revision: context.revision });
+      expect(response.status).toBe(403);
+    }
+    expect(accountControlCalls.filter((call) => call.method === "PUT").length).toBe(before);
+    expect((await activeContext(instance.origin, bearer)).revision).toBe(context.revision);
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("delegation expires at 60 minutes without automatic renewal; explicit reselection changes revision", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const original = await activeContext(instance.origin, bearer);
+    await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: original.revision });
+    const selected = await activeContext(instance.origin, bearer);
+    accountClock = 60 * 60_000 - 1_000;
+    const lastSecond = await accountRpc(instance.origin, bearer, "get_account_overview");
+    expect((await toolResult(lastSecond)).isError).not.toBe(true);
+    accountClock += 1_000;
+    const puts = accountControlCalls.filter((call) => call.method === "PUT").length;
+    const expired = await accountRpc(instance.origin, bearer, "get_account_overview");
+    expect(expired.status).toBe(200);
+    expect(expired.headers.get("www-authenticate")).toBeNull();
+    const error = await toolResult(expired);
+    expect(error.isError).toBe(true);
+    expect(error.content[0].text).toContain("delegation_expired");
+    expect(error.content[0].text).toContain("60 minutes");
+    expect(accountControlCalls.filter((call) => call.method === "PUT").length).toBe(puts);
+    expect((await activeContext(instance.origin, bearer)).revision).toBe(selected.revision);
+    const renewed = await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: selected.revision });
+    expect((await toolResult(renewed)).isError).not.toBe(true);
+    const next = await activeContext(instance.origin, bearer);
+    expect(next.revision).not.toBe(selected.revision);
+    expect(next.active_account.id).toBe(42);
+    expect((await toolResult(await accountRpc(instance.origin, bearer, "get_account_overview"))).isError).not.toBe(true);
+    accountClock += 60 * 60_000;
+    const returned = await accountRpc(instance.origin, bearer, "return_to_original_account", { confirm: true, account_revision: next.revision });
+    expect((await toolResult(returned)).isError).not.toBe(true);
+  } finally { accountClock = 0; await closeTestServer(instance.server); }
+});
+
+test("target removal or lost delegation permissions cannot block an explicit return", async () => {
+  const instance = await switchingInstance();
+  try {
+    for (const state of ["unavailable", "denied"] as const) {
+      const bearer = await grantToken();
+      const original = await activeContext(instance.origin, bearer);
+      await accountRpc(instance.origin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: original.revision });
+      accountTargetState = state;
+      const active = await activeContext(instance.origin, bearer);
+      expect(active.active_account.id).toBe(42);
+      const refused = await accountRpc(instance.origin, bearer, "get_account_overview");
+      expect(refused.status).toBe(200);
+      expect(refused.headers.get("www-authenticate")).toBeNull();
+      expect((await toolResult(refused)).isError).toBe(true);
+      const returned = await accountRpc(instance.origin, bearer, "return_to_original_account", { confirm: true, account_revision: active.revision });
+      expect((await toolResult(returned)).isError).not.toBe(true);
+      expect((await activeContext(instance.origin, bearer)).active_account.id).toBe(7);
+      accountTargetState = "available";
+    }
+  } finally { accountTargetState = "available"; await closeTestServer(instance.server); }
+});
+
+test("account list pagination forwards only the contract fields and preserves opaque cursors", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const first = await accountRpc(instance.origin, bearer, "list_switchable_accounts", { search: "Target", limit: 1 });
+    const page1 = JSON.parse((await toolResult(first)).content[0].text);
+    expect(page1.accounts.map((item: { id: number }) => item.id)).toEqual([42]);
+    expect(typeof page1.next_cursor).toBe("string");
+    const second = await accountRpc(instance.origin, bearer, "list_switchable_accounts", { search: "Target", limit: 1, cursor: page1.next_cursor });
+    const page2 = JSON.parse((await toolResult(second)).content[0].text);
+    expect(page2.accounts.map((item: { id: number }) => item.id)).toEqual([43]);
+    expect(page2.next_cursor).toBeNull();
+    for (const invalid of [await accountRpc(instance.origin, bearer, "list_switchable_accounts", { search: "Other", cursor: page1.next_cursor }),
+      await accountRpc(instance.origin, await grantToken(), "list_switchable_accounts", { search: "Target", cursor: page1.next_cursor })]) {
+      expect(invalid.status).toBe(200);
+      expect(invalid.headers.get("www-authenticate")).toBeNull();
+      expect((await toolResult(invalid)).content[0].text).toContain("invalid_request");
+    }
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("resource authorization refusals fail closed before exchange, including on the original account", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    accountResourceAllowed = false;
+    const before = exchanges.length;
+    const businessBefore = apiBearers.length;
+    const result = await accountRpc(instance.origin, bearer, "get_account_overview");
+    expect(result.status).toBe(200);
+    expect(result.headers.get("www-authenticate")).toBeNull();
+    expect((await toolResult(result)).content[0].text).toContain("delegation_denied");
+    expect(exchanges.length).toBe(before);
+    expect(apiBearers.length).toBe(businessBefore);
+  } finally { accountResourceAllowed = true; await closeTestServer(instance.server); }
+});
+
+test("contextual exchange refuses incomplete resources, excessive lifetime and another token origin", async () => {
+  const instance = await switchingInstance();
+  try {
+    const bearer = await grantToken();
+    const before = apiBearers.length;
+    for (const mode of ["invalid_target", "invalid_request", "excessive_lifetime"] as const) {
+      exchangeMode = mode;
+      const response = await accountRpc(instance.origin, bearer, "get_account_overview");
+      expect(response.headers.get("www-authenticate")).toBeNull();
+      expect(response.status).toBe(mode === "excessive_lifetime" ? 502 : 200);
+      if (mode !== "excessive_lifetime") expect((await toolResult(response)).content[0].text).toContain(mode);
+    }
+    exchangeMode = "normal";
+    discoveryMode = "other_token_origin";
+    resetDiscovery();
+    const misplaced = misplacedExchanges;
+    const refused = await accountRpc(instance.origin, bearer, "get_account_overview");
+    expect((await toolResult(refused)).content[0].text).toContain("invalid_target");
+    expect(misplacedExchanges).toBe(misplaced);
+    expect(apiBearers.length).toBe(before);
+  } finally { exchangeMode = "normal"; discoveryMode = "normal"; resetDiscovery(); await closeTestServer(instance.server); }
+});
+
+test("logger redacts account pagination cursors in nested values and query strings", () => {
+  expect(JSON.stringify(redact({ cursor: "secret-cursor", nested: { next_cursor: "next-secret" } }))).not.toContain("secret");
+  expect(redactString("https://example.test/list?cursor=secret-cursor&next_cursor=next-secret")).not.toContain("secret");
+});
+
+async function runLiveHarness(bearer: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, ["run", "scripts/check-account-switching.ts", ...args], {
+    cwd: process.cwd(),
+    env: { ...process.env, MCP_TEST_SUBJECT_TOKEN: bearer, MCP_TEST_EXPECTED_USER_ID: "7", MCP_TEST_TARGET_USER_ID: "42" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  const code = await new Promise<number | null>((resolve, reject) => { child.on("close", resolve); child.on("error", reject); });
+  return { code, stdout, stderr };
+}
+
+test("the live harness exercises the actual local MCP, switched model creation and explicit restoration", async () => {
+  const bearer = await grantToken();
+  const output = await runLiveHarness(bearer, ["--allow-switch", "--allow-create-model"]);
+  expect(output.code).toBe(0);
+  const rows = output.stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  expect(rows.every((row) => row.status === "PASS")).toBe(true);
+  expect(rows.some((row) => row.check.includes("model creation and ID re-read"))).toBe(true);
+  expect(rows.at(-1).check).toContain("original business identity restored");
+  expect(fixtureContext(bearer, process.env.OAUTH_MCP_RESOURCE!).active_account.id).toBe(7);
+  for (const secret of [bearer, process.env.OAUTH_INTERNAL_CLIENT_SECRET!]) {
+    expect(output.stdout).not.toContain(secret);
+    expect(output.stderr).not.toContain(secret);
+  }
+}, 15_000);
+
+test("the live harness defaults to read-only and accurately reports blocked mutation checks", async () => {
+  const bearer = await grantToken();
+  const puts = accountControlCalls.filter((call) => call.method === "PUT").length;
+  const writes = businessCalls.filter((call) => call.method === "POST").length;
+  const output = await runLiveHarness(bearer, []);
+  expect(output.code).toBe(2);
+  expect(output.stdout).toContain('"status":"BLOCKED"');
+  expect(accountControlCalls.filter((call) => call.method === "PUT").length).toBe(puts);
+  expect(businessCalls.filter((call) => call.method === "POST").length).toBe(writes);
+}, 15_000);
+
+test("the live harness never reports success with a mismatched original account", async () => {
+  const bearer = await grantToken(crypto.randomUUID(), process.env.OAUTH_MCP_RESOURCE!, "user-8");
+  const puts = accountControlCalls.filter((call) => call.method === "PUT").length;
+  const output = await runLiveHarness(bearer, ["--allow-switch", "--allow-create-model"]);
+  expect(output.code).toBe(1);
+  expect(output.stdout).toContain("unexpected_original_account");
+  expect(accountControlCalls.filter((call) => call.method === "PUT").length).toBe(puts);
+}, 15_000);
 
 test("generic preflight derives all endpoint scopes and leaves write previews local", () => {
   for (const row of CALLABLE_ENDPOINTS) {
@@ -330,8 +961,9 @@ test("initialization and all write descriptions advertise creation without dupli
   });
   expect(initialized.status).toBe(200);
   const initialization = await initialized.json() as { result: { instructions: string; serverInfo: { version: string } } };
-  expect(initialization.result.instructions).toBe(CREATION_GUIDANCE);
-  expect(initialization.result.serverInfo.version).toBe("0.12.0");
+  expect(initialization.result.instructions).toContain(CREATION_GUIDANCE);
+  expect(initialization.result.instructions).toContain(ACCOUNT_SWITCHING_GUIDANCE);
+  expect(initialization.result.serverInfo.version).toBe("0.13.0");
   const listed = await rpc("tools/list", caller);
   const tools = (await listed.json() as { result: { tools: {
     name: string; description: string; annotations: { readOnlyHint: boolean };
@@ -510,7 +1142,7 @@ test("dedicated and generic contact search both request the read scope", async (
 });
 
 test("metadata is available at both RFC and bare paths with CORS", async () => {
-  expect(toolAccessTable().size).toBe(26);
+  expect(toolAccessTable().size).toBe(30); // Four private HTTP OAuth account-control tools.
   for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
     const response = await fetch(`${mcpOrigin}${path}`);
     expect(response.status).toBe(200);
@@ -543,11 +1175,12 @@ test("public plugin tool annotations match private-account and open-world behavi
     } }[] };
   };
   const tools = payload.result.tools;
-  expect(tools).toHaveLength(26);
+  expect(tools).toHaveLength(30);
   const openWorld = new Set([
     "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting", "magileads_request",
+    "get_active_account", "list_switchable_accounts", "switch_account", "return_to_original_account",
   ]);
-  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model"]);
+  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model", "switch_account", "return_to_original_account"]);
   for (const tool of tools) {
     expect(tool.annotations.openWorldHint).toBe(openWorld.has(tool.name));
     expect(tool.annotations.readOnlyHint).toBe(!writes.has(tool.name));

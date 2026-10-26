@@ -34,7 +34,10 @@ import {
 import { CALLABLE_ENDPOINTS, matchEndpoint, resolveEndpoint } from "./endpoints.js";
 import { MAX_EMAIL_HTML_LENGTH, normalizeEmailCreation } from "./email-model.js";
 import { SCOPES, type Scope } from "./oauth/scopes.js";
-import { CREATION_GUIDANCE } from "./instructions.js";
+import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE } from "./instructions.js";
+import {
+  accountContextForResult, assertAccountRevision, requireAccountSession, revisionSchema, withAccountContext,
+} from "./oauth/account-context.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -531,6 +534,10 @@ type ToolAccess = {
   scope: Scope;
   routes: readonly string[];
   dynamic?: boolean;
+  /** Private OAuth control plane, never a business API passthrough. */
+  accountControl?: boolean;
+  /** One alternative is sufficient; private context reads accept read OR write. */
+  scopeAlternatives?: readonly Scope[];
   /** Optional assertion against the backend contract (never a method-based override). */
   routeScopes?: Readonly<Record<string, Scope>>;
 };
@@ -584,9 +591,13 @@ export function accessForTool(name: string): ToolAccess | undefined {
 }
 
 /** Resolve concrete generic operations before exchange, including non-mutating previews. */
-export function preflightToolCall(name: string, args: unknown): { scopes: Scope[]; exchange: boolean } {
+export function preflightToolCall(name: string, args: unknown, allowedScopes?: readonly Scope[]): { scopes: Scope[]; exchange: boolean } {
   const access = accessForTool(name);
   if (!access) return { scopes: [], exchange: false };
+  if (access.scopeAlternatives) {
+    const scope = access.scopeAlternatives.find((item) => allowedScopes?.includes(item)) ?? access.scope;
+    return { scopes: [scope], exchange: false };
+  }
   const input = args && typeof args === "object" && !Array.isArray(args) ? args as Raw : {};
   if (access.dynamic) {
     if (typeof input.path !== "string" || (name === "magileads_request" && typeof input.method !== "string")) {
@@ -600,16 +611,20 @@ export function preflightToolCall(name: string, args: unknown): { scopes: Scope[
     return { scopes: [endpoint.scope], exchange: !endpoint.write || input.confirm === true };
   }
   const scopes = scopesForTool(access);
-  return { scopes, exchange: name !== "list_api_endpoints" &&
+  return { scopes, exchange: !access.accountControl && name !== "list_api_endpoints" &&
     !(scopes.includes("mcp:write") && input.confirm !== true) };
 }
 
 /** Each access declaration sits immediately beside its tool definition. */
-export function registerTools(target: McpServer, allowedScopes?: readonly Scope[], profile: ToolProfile = "full"): void {
+export function registerTools(target: McpServer, allowedScopes?: readonly Scope[], profile: ToolProfile = "full", accountSwitchingEnabled = false): void {
   const seen = new Set<string>();
   const register = (access: ToolAccess): McpServer["registerTool"] =>
     ((name: string, ...args: unknown[]) => {
       if (access.routes.length === 0) throw new Error(`Missing API routes for tool: ${name}`);
+      if (access.scopeAlternatives && (!access.accountControl || !access.scopeAlternatives.includes(access.scope) ||
+          access.scopeAlternatives.some((scope) => !SCOPES.includes(scope)))) {
+        throw new Error(`Invalid private scope alternatives: ${name}`);
+      }
       if (access.routeScopes && Object.keys(access.routeScopes).some((route) => !access.routes.includes(route))) {
         throw new Error(`Scope override references an undeclared route: ${name}`);
       }
@@ -621,16 +636,83 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         throw new Error(`Conflicting tool access declaration: ${name}`);
       }
       catalog.set(name, access);
-      if (allowedScopes && !(access.dynamic && name === "magileads_request"
-        ? allowedScopes.length > 0 : scopesForTool(access).every((scope) => allowedScopes.includes(scope)))) return {};
+      if (access.accountControl && (!accountSwitchingEnabled || profile !== "full")) return {};
+      if (allowedScopes && !(access.scopeAlternatives
+        ? access.scopeAlternatives.some((scope) => allowedScopes.includes(scope))
+        : access.dynamic && name === "magileads_request"
+          ? allowedScopes.length > 0 : scopesForTool(access).every((scope) => allowedScopes.includes(scope)))) return {};
       if (!isToolExposed(name, profile)) return {};
       // Repeat creation guidance in tool discovery for hosts that ignore initialize.instructions.
       if (access.scope === "mcp:write") {
         const config = args[0] as { description?: string };
         args[0] = { ...config, description: `${config.description ?? ""} ${CREATION_GUIDANCE}`.trim() };
       }
+      if (accountSwitchingEnabled) {
+        const config = args[0] as { description?: string; inputSchema?: z.ZodRawShape };
+        args[0] = { ...config, description: `${config.description ?? ""} ${ACCOUNT_SWITCHING_GUIDANCE}`,
+          ...(access.scope === "mcp:write" ? { inputSchema: { ...config.inputSchema,
+            account_revision: revisionSchema.optional().describe("Required with confirm:true: revision from the current account_context. A stale revision is refused without executing."),
+          } } : {}),
+        };
+        const handler = args[args.length - 1] as (...values: unknown[]) => Promise<TextResult>;
+        args[args.length - 1] = async (...values: unknown[]): Promise<TextResult> => {
+          let result: TextResult;
+          try {
+            const input = values[0] && typeof values[0] === "object" ? values[0] as Record<string, unknown> : {};
+            const session = requireAccountSession();
+            if (access.scope === "mcp:write" && input.confirm === true && preflightToolCall(name, input).scopes.includes("mcp:write")) {
+              assertAccountRevision(session.context, input.account_revision);
+            }
+            result = await handler(...values);
+          } catch (error) { result = fail(error); }
+          return withAccountContext(result, accountContextForResult());
+        };
+      }
       return (target.registerTool as (...values: unknown[]) => unknown).call(target, name, ...args);
     }) as McpServer["registerTool"];
+
+  register({ scope: "mcp:read", scopeAlternatives: ["mcp:read", "mcp:write"], routes: ["(private OAuth account context)"], accountControl: true })(
+    "get_active_account",
+    { title: "Get active Magileads account", description: "Read the original and active account identities and current revision. Available with mcp:read OR mcp:write. No business API call or account change.",
+      inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true } },
+    async (): Promise<TextResult> => {
+      try { return ok({ account_context: requireAccountSession().context }); } catch (error) { return fail(error); }
+    },
+  );
+  register({ scope: "mcp:read", routes: ["(private OAuth switchable accounts)"], accountControl: true })(
+    "list_switchable_accounts",
+    { title: "List authorized accounts for switching", description: "List only accounts the original user is authorized to act as. This does not change the active account; permissions are enforced by the API.",
+      inputSchema: { search: z.string().trim().max(200).optional(), cursor: z.string().min(1).max(512).optional(), limit: z.number().int().min(1).max(100).optional() },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true } },
+    async (input): Promise<TextResult> => {
+      try { return ok(await requireAccountSession().listAccounts(input)); } catch (error) { return fail(error); }
+    },
+  );
+  register({ scope: "mcp:write", routes: ["(private OAuth switch account)"], accountControl: true })(
+    "switch_account",
+    { title: "Switch active Magileads account", description: "Act as an explicitly authorized target account for subsequent tools on this OAuth connection and domain, including other chats sharing it. Dry run unless confirm:true; obtain the current account_revision before confirmation. The original login remains intact.",
+      inputSchema: { user_id: z.number().int().positive().safe(), confirm: z.boolean().optional() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true } },
+    async ({ user_id, confirm }): Promise<TextResult> => {
+      try {
+        const session = requireAccountSession();
+        if (confirm !== true) return ok({ dry_run: true, target_user_id: user_id, note: "No switch performed. Confirm the target account and re-call with confirm:true and account_revision." });
+        return ok({ switched: true, account_context: await session.changeAccount(user_id, session.context.revision) });
+      } catch (error) { return fail(error); }
+    },
+  );
+  register({ scope: "mcp:write", routes: ["(private OAuth return to original)"], accountControl: true })(
+    "return_to_original_account",
+    { title: "Return to original Magileads account", description: "Restore the original account without using the switched account's business token. Available even if the target account's delegation has expired. Dry run unless confirm:true with the current account_revision.",
+      inputSchema: { confirm: z.boolean().optional() }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true } },
+    async ({ confirm }): Promise<TextResult> => {
+      try {
+        const session = requireAccountSession();
+        if (confirm !== true) return ok({ dry_run: true, target_user_id: session.context.original_account.id, note: "No account change performed. Re-call with confirm:true and account_revision to return." });
+        return ok({ returned_to_original: true, account_context: await session.changeAccount(null, session.context.revision) });
+      } catch (error) { return fail(error); }
+    },
+  );
 
   register({ scope: "mcp:read", routes: ["POST /targeting/google/generate-maps-search-urls"] })(
     "generate_maps_search_urls",
