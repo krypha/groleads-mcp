@@ -19,6 +19,7 @@ transport uses Magileads environment credentials.
 ## Contents
 
 - [Tools](#tools)
+- [Copying and sharing](#copying-sharing-and-account-wide-contact-filters)
 - [How targeting works](#how-targeting-works)
 - [Transports](#transports)
 - [Private OAuth account switching](#oauth-account-switching-private-integrations)
@@ -45,6 +46,12 @@ transport uses Magileads environment credentials.
 | `list_contact_fields` | `contact_list_id` | `{ fields[] }` — each `{ data_field_id, identifier, label, type }` |
 | `add_contact_to_list` | `contact_list_id`, `properties:[{field,value}]`, `confirm?` | imports one contact — **dry-run until `confirm:true`** |
 | `create_email_model` | `name`, `subject`, `text?`, `html?`, `folder_id?`, `tags_ids?`, `confirm?` | saves a template without sending — **local dry-run until `confirm:true`** |
+| `list_copyable_resources` | `resource_type`, `search?`, `page?`, `per_page?` | compact IDs/names, complete-list filtering and paging |
+| `copy_resources_to_user` | `resource_type`, `resource_ids` (1–50), `target_user_id`, `with_models?`, `confirm?` | sequential copies; reports accepted, uncertain and unattempted IDs |
+| `share_resource` | `resource_type`, `resource_id`, `target_type`, `target_ids`, `action?`, `allow_write?`, `allow_delete?`, `confirm?` | grants/revokes explicit access while preserving other sharing rules |
+| `share_prm_contacts` | `contact_ids`, `target_type`, `target_ids`, `allow_write?`, `allow_delete?`, `confirm?` | creates a PRM sharing; read-only rights by default |
+| `query_all_contacts` | `criteria?`, `match?`, `target?`, `page?`, `per_page?` | filters across all account lists; counts, sample and selection fingerprint |
+| `copy_contacts_across_lists` | same criteria, `destination_list_id`, `confirm_count`, `selection_fingerprint`, `copy_entire_account?`, `confirm?` | recounts then copies the global selection once into an existing list |
 | `preview_contact_selection` | `contact_list_id`, `criteria[]`, `match?`, `target?` | `{ list_name, matched_count, total_count, selected, not_selected }` — **read-only** |
 | `list_campaigns` | `name?` (filter), `limit?` (1–100, default 50) | `{ campaigns[] }` — each `{ id, name, status, start_date, scenario_id }` |
 | `get_campaign` | `campaign_id` | `{ id, name, status, channels[], scenario_id, target_lists:[{id,name,count}], total_contacts }` |
@@ -63,6 +70,63 @@ transport uses Magileads environment credentials.
 | `list_api_endpoints` | `search?`, `method?`, `reads_only?`, `writes_only?`, `limit?` | `{ endpoints[] }` — authorized business endpoints and explicit scopes |
 | `magileads_get` | `path`, `query?` | raw JSON — GET any indexed endpoint (read-only) |
 | `magileads_request` | `method`, `path`, `query?`, `body?`, `confirm?` | authorized GET/POST/PUT — reads execute; **all writes dry-run until `confirm:true`**, including GET writes |
+
+## Copying, sharing and account-wide contact filters
+
+Version 0.14.0 adds six dedicated tools, available in both `full` and `public` profiles.
+All use the existing **249-route OAuth contract**; no administrative routes or new
+permissions have been opened. Mutations return a local preview until `confirm:true`.
+Private HTTP OAuth additionally requires the current `account_revision`, as for other writes.
+
+Use `list_copyable_resources` to choose IDs, then `copy_resources_to_user` to copy
+contact lists, email/LinkedIn invitation/LinkedIn message/SMS/SMV models or workflows.
+For "all models", iterate resource types and every `next_page`; submit explicit
+batches of at most 50 distinct IDs. Workflow copies include their models by default.
+A workflow is a scenario template: copying it does not clone or schedule a campaign
+programmation. Copies stop on the first error and retain completed IDs, including
+when a later item returns 401. Never replay completed or uncertain copies blindly.
+Creation still does not require a duplicate search.
+
+`share_resource` supports these resource types plus `data_field`. Destinations are
+`user`, `team` or `organization`, using explicit IDs. `get_account_overview` now
+includes own team/organization IDs; it is not a global user directory. In private
+OAuth, `list_switchable_accounts` can help identify authorized users.
+Default grants are read-only. Existing stronger permissions and other destinations
+are preserved; hidden/incomplete ACLs are refused. `action:"revoke"` removes only the
+selected explicit grants, so inherited group access may remain. `share_prm_contacts`
+creates a sharing for explicit PRM contact IDs. SMV sharing changes metadata only;
+audio upload/replacement is outside this tool.
+
+For a global contact copy, first call `query_all_contacts` with readable criteria,
+e.g. `[{"field":"company","op":"contains","value":"Example"}]`. It searches
+**all lists of the active account**, returns complete counts and a capped sample.
+Then call `copy_contacts_across_lists` with the same criteria and its `selected` as
+`confirm_count`, plus its `selection_fingerprint`. On confirmation the server checks
+the account, resolved filter and live counts before one copy request. Empty criteria
+also require `copy_entire_account:true`. With `target:"all_except_matching"`, the
+count/copy concern the complement, but the displayed sample still shows filter matches.
+No contacts are deleted.
+
+The API does not yet provide atomic ACL updates or a frozen selection token: concurrent
+ACL/contact edits can still race with execution. Additional resource families and the
+backend work needed are documented in [the integration contract](docs/resource-copy-sharing-contract.md).
+
+The opt-in live recipe uses the **local stdio MCP** and real API, not hosted OAuth:
+
+```bash
+# Set MAGILEADS_API_KEY or MAGILEADS_EMAIL + MAGILEADS_PASSWORD securely first.
+MAGILEADS_TEST_ACCOUNT_ID=777 bun run scripts/check-resource-operations.ts
+# On authorized demo accounts only, additionally set:
+# MAGILEADS_TEST_TARGET_USER_ID=4192 MAGILEADS_TEST_ALLOW_WRITES=true
+```
+
+Write mode creates labelled QA models/lists and synthetic contacts, shares/revokes and
+copies them, without sending messages or scheduling campaigns. Fixtures remain labelled
+because DELETE is intentionally outside the MCP contract. Re-running creates new fixtures.
+Global copying is asynchronous: use the returned `next_check` to poll the destination
+Copy job until `Completed`. The recipe reports pending work with exit code 2 and does
+not repeat the copy. Set `MAGILEADS_TEST_VERIFY_DESTINATION_ID` to an existing QA
+destination to verify it later in read-only mode.
 
 ## How targeting works
 
@@ -364,8 +428,8 @@ permission checks, error codes, and acceptance tests. It follows the backend's
 
 Account switching is **automatic** for HTTP OAuth (`oauth` or `both`) with
 `MCP_TOOL_PROFILE=full`. There is no activation variable and no new secret.
-OAuth clients get up to 30 tools, filtered by their scopes; API-key clients and
-stdio retain 26, and the public profile retains 23. No switch capability is added
+OAuth clients get up to 36 tools, filtered by their scopes; API-key clients and
+stdio retain 32, and the public profile retains 29. No switch capability is added
 to those other modes. Existing OAuth authorizations remain usable without a
 new consent page or a forced reconnection. `get_active_account` accepts
 `mcp:read` **or** `mcp:write`; listing accounts requires read, while selection and
@@ -421,7 +485,7 @@ refuse to start unless all five required OAuth settings are present.
 | --- | --- |
 | `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
-| `MCP_TOOL_PROFILE` | `full` (default: 30 tools for OAuth, 26 for API keys) or `public` (23 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
+| `MCP_TOOL_PROFILE` | `full` (default: 36 tools for OAuth, 32 for API keys) or `public` (29 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
 | `OAUTH_MCP_RESOURCE` | Required for OAuth modes; primary resource URL, e.g. `https://mcp.magileads.io/mcp`. Actual OAuth host authorization comes from private resource discovery, with no local fallback. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
@@ -736,9 +800,9 @@ developer mode, then submitted as a remote MCP-only plugin to the public
 directory. See the [ChatGPT deployment and submission guide](docs/chatgpt-publication.md)
 for the OAuth smoke test, public-domain verification (`OPENAI_APPS_CHALLENGE_TOKEN`),
 review materials, and test cases. Set `MCP_TOOL_PROFILE=public` for submission:
-it exposes the 23 dedicated business tools while hiding the three generic API
+it exposes the 29 dedicated business tools while hiding the three generic API
 passthrough and four account-control tools. The default `full` profile exposes
-up to 30 tools for private HTTP OAuth integrations, or 26 for API-key/stdio clients.
+up to 36 tools for private HTTP OAuth integrations, or 32 for API-key/stdio clients.
 Connecting privately does not publish the plugin.
 
 ## Connect to a Hermes Agent
@@ -757,7 +821,9 @@ explicit `MCP_ALLOW_API_KEY_QUERY=true` opt-in described above.
 ```
 src/
 ├── magileads.ts             Self-contained Magileads client (dual auth + JWT refresh + API calls)
-├── tools.ts                 26 business tools + 4 private HTTP OAuth account tools
+├── tools.ts                 Central registration, scopes, account context and core tools
+├── resource-tools.ts        6 copy/sharing/global contact tools (32 business tools in total)
+├── resource-operations.ts   Pure resource definitions, ACL merging and preview fingerprints
 ├── endpoints.ts             Exact route resolution and explicit scopes
 ├── endpoints.generated.ts   Authorized OAuth business operations (generated)
 ├── server.ts                buildServer() — creates an McpServer with all tools registered

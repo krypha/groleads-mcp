@@ -40,7 +40,15 @@ const exchanges: {
 }[] = [];
 const apiBearers: string[] = [];
 const apiKeys: string[] = [];
-const businessCalls: { method: string; path: string; bearer: string; body?: unknown }[] = [];
+const businessCalls: { method: string; path: string; bearer: string; body?: unknown; contentType?: string }[] = [];
+let resourceCopyFailureId: number | undefined;
+let resourceCopyFailureStatus = 403;
+let globalTotal = 8;
+let globalMatched = 3;
+let globalCursorMode: "normal" | "missing" | "wrong_path" = "normal";
+const resourceAcl = [{ sharing_type_to: "User", read_permission: true, write_permission: true, delete_permission: false, ids_list: [8, 9], name: "Existing users" },
+  { sharing_type_to: "Team", read_permission: true, write_permission: false, delete_permission: false, ids_list: [3], name: "Existing team" }];
+let resourceProfileSharing: unknown = resourceAcl;
 const accountContexts = new Map<string, AccountContext>();
 const delegationDeadlines = new Map<string, number>();
 let accountClock = 0; // Fake API time only; never alters HTTP/JWT timers.
@@ -253,12 +261,12 @@ const api = await start(async (req, res) => {
     return respond(res, 404, {});
   }
   if (["/contact-lists/42", "/data-fields", "/contact-lists/42/contact",
-    "/targeting/google/generate-maps-search-urls", "/targeting/google/extract-maps-search"].includes(req.url || "")) {
+    "/targeting/google/generate-maps-search-urls", "/targeting/google/extract-maps-search"].includes(req.url || "") && !(req.url === "/contact-lists/42" && req.method !== "GET")) {
     businessCalls.push({ method: req.method || "", path: req.url || "", bearer: req.headers.authorization || "" });
     const needed = req.url === "/contact-lists/42/contact" || req.url === "/targeting/google/extract-maps-search"
       ? "mcp:write" : "mcp:read";
     if (!hasExchangedScope(req, needed)) return respond(res, 401, { state_message: "insufficient_scope" });
-    if (req.url === "/contact-lists/42") return respond(res, 200, { contact_list_profile: { id: 42, name: "Test list" } });
+    if (req.url === "/contact-lists/42") return respond(res, 200, { contact_list_profile: { id: 42, name: "Test list", sharing: resourceProfileSharing, permission: { is_admin: true } } });
     if (req.url === "/data-fields") return respond(res, 200, { data_fields_list: [{ id: 1, identifier: "email", name: "Email" }] });
     if (req.url === "/contact-lists/42/contact") return respond(res, 200, { state: true, contacts_added: 1 });
     if (req.url === "/targeting/google/generate-maps-search-urls") return respond(res, 200, { google_maps_search_urls: ["https://maps.google.com/search?q=plumber"] });
@@ -273,18 +281,48 @@ const api = await start(async (req, res) => {
     }
     if (apiMode === "unauthorized") return respond(res, 401, { state_message: "token_expired" });
     if (delegated) return respond(res, 200, { user_profile: { ...delegated.context.active_account, subscriptions: {} } });
-    if (req.headers.authorization !== "Bearer exchanged-mcp:read") return respond(res, 401, {});
+    if (!hasExchangedScope(req, "mcp:read")) return respond(res, 401, {});
     return respond(res, 200, { user_profile: { id: 7, first_name: "Test", last_name: "User", subscriptions: {} } });
   }
   const endpoint = matchEndpoint(req.method || "GET", new URL(req.url || "/", "http://localhost").pathname);
   if (endpoint) {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
-    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
-    businessCalls.push({ method: req.method || "", path: req.url || "", bearer: req.headers.authorization || "", body });
+    let body;
+    const contentType = req.headers["content-type"] || "";
+    if (contentType.startsWith("multipart/form-data")) {
+      const form = await new Request("http://fixture.invalid", { method: "POST", headers: { "Content-Type": contentType }, body: Buffer.concat(chunks) }).formData();
+      const wireSharing = form.get("sharing");
+      expect([...form.keys()]).toEqual(["sharing"]); // No audio, names or other metadata may be overwritten.
+      body = { sharing: wireSharing === "" ? [] : JSON.parse(`[${wireSharing}]`) };
+    } else body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+    businessCalls.push({ method: req.method || "", path: req.url || "", bearer: req.headers.authorization || "", body, contentType });
     if (apiMode === "unauthorized") return respond(res, 401, { state_message: "token_expired" });
     if (apiMode === "forbidden") return respond(res, 403, { state_message: "unauthorized_model" });
     if (!hasExchangedScope(req, endpoint.scope)) return respond(res, 401, { state_message: "insufficient_scope" });
+    const url = new URL(req.url || "/", "http://localhost");
+    if (url.pathname === "/contact-lists/contacts/search" || /^\/contact-lists\/contacts\/search\/[^/]+\/page\/\d+$/.test(url.pathname)) {
+      const options = body?.options ?? JSON.parse(url.searchParams.get("options") || "null");
+      if (options) {
+        const filtered = Array.isArray(options.filter?.values) && options.filter.values.length > 0;
+        const count = filtered ? globalMatched : globalTotal;
+        const perPage = options.per_page ?? 20;
+        const page = Number(url.pathname.match(/\/page\/(\d+)$/)?.[1] ?? 1);
+        return respond(res, 200, { state: true, number_of_results: count, number_of_pages: Math.ceil(count / perPage),
+          current_page: globalCursorMode === "missing" ? null : `http://must-not-be-contacted.invalid/${globalCursorMode === "wrong_path" ? "prm/contacts" : "contact-lists/contacts/search"}/fixture-cursor/page/${page}`,
+          results: Array.from({ length: Math.min(count, perPage) }, (_, index) => ({ id: page * 10 + index, properties: [{ data_field_id: 1, value: "fixture@example.invalid" }] })) });
+      }
+    }
+    if (req.method === "GET" && ["/models/email", "/models/linkedin/invitation", "/models/linkedin/message", "/models/sms", "/models/smv", "/workflows", "/contact-lists/names"].includes(url.pathname)) {
+      const listKey = url.pathname === "/workflows" ? "workflows" : url.pathname === "/contact-lists/names" ? "contact_lists" : "models_list";
+      return respond(res, 200, { state: true, results: [], operation: endpoint.path, [listKey]: [{ id: 83, name: "Beta", created_by: 7 }, { id: 81, name: "Alpha", created_by: 7 }, { id: 82, name: "Alpha two", created_by: 7 }] });
+    }
+    const resourceCopyId = url.pathname.match(/\/(\d+)\/copy\/to\/\d+$/)?.[1];
+    if (resourceCopyId && Number(resourceCopyId) === resourceCopyFailureId) return respond(res, resourceCopyFailureStatus, { state_message: "unauthorized_model" });
+    if (req.method === "GET" && /^\/(?:models\/(?:email|sms|smv|linkedin\/(?:message|invitation))|workflows|data-fields)\/\d+$/.test(url.pathname)) {
+      const profileKey = url.pathname.startsWith("/workflows") ? "workflow_profile" : url.pathname.startsWith("/data-fields") ? "data_field_profile" : "model_profile";
+      return respond(res, 200, { state: true, [profileKey]: { id: Number(url.pathname.split("/").at(-1)), name: "Fixture", sharing: resourceProfileSharing, permission: { is_admin: true } } });
+    }
     if (req.url === "/models/email" && req.method === "POST") {
       // Measured on the deployed API: text alone is refused with empty_html.
       if (typeof body?.html !== "string" || !body.html.trim()) return respond(res, 400, { state_message: "empty_html" });
@@ -401,14 +439,14 @@ test("switching is automatic only for private HTTP OAuth; API keys and public pr
     const before = accountControlCalls.length;
     const listed = await keyRpc(instance.origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
     const tools = (await listed.json() as { result: { tools: { name: string; inputSchema: { properties: Record<string, unknown> } }[] } }).result.tools;
-    expect(tools).toHaveLength(30);
+    expect(tools).toHaveLength(36);
     expect(tools.find((tool) => tool.name === "create_email_model")?.inputSchema.properties.account_revision).toBeDefined();
     expect(accountControlCalls.length).toBe(before);
     const standard = await rpc("tools/list", bearer);
-    expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(30);
+    expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(36);
     for (const response of [await keyRpc(instance.origin, "key-alpha", "tools/list")]) {
       const data = await response.json() as { result: { tools: { name: string }[] } };
-      expect(data.result.tools).toHaveLength(26);
+      expect(data.result.tools).toHaveLength(32);
       expect(data.result.tools.some((tool) => tool.name === "switch_account")).toBe(false);
     }
     const hidden = await keyRpc(instance.origin, "key-alpha", "tools/call", { name: "switch_account", arguments: { user_id: 42, confirm: true } });
@@ -963,7 +1001,7 @@ test("initialization and all write descriptions advertise creation without dupli
   const initialization = await initialized.json() as { result: { instructions: string; serverInfo: { version: string } } };
   expect(initialization.result.instructions).toContain(CREATION_GUIDANCE);
   expect(initialization.result.instructions).toContain(ACCOUNT_SWITCHING_GUIDANCE);
-  expect(initialization.result.serverInfo.version).toBe("0.13.0");
+  expect(initialization.result.serverInfo.version).toBe("0.14.0");
   const listed = await rpc("tools/list", caller);
   const tools = (await listed.json() as { result: { tools: {
     name: string; description: string; annotations: { readOnlyHint: boolean };
@@ -1142,7 +1180,7 @@ test("dedicated and generic contact search both request the read scope", async (
 });
 
 test("metadata is available at both RFC and bare paths with CORS", async () => {
-  expect(toolAccessTable().size).toBe(30); // Four private HTTP OAuth account-control tools.
+  expect(toolAccessTable().size).toBe(36); // Six resource tools plus four private account-control tools.
   for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
     const response = await fetch(`${mcpOrigin}${path}`);
     expect(response.status).toBe(200);
@@ -1157,12 +1195,179 @@ test("metadata is available at both RFC and bare paths with CORS", async () => {
   }
 });
 
+async function resourceCall(bearer: string, name: string, args: Record<string, unknown> = {}) {
+  const response = await rpc("tools/call", bearer, { name, arguments: args });
+  expect(response.status).toBe(200);
+  const result = await toolResult(response);
+  let data;
+  try { data = JSON.parse(result.content[0].text); } catch { data = { error: result.content[0].text }; }
+  return { result, data };
+}
+
+test("resource mutation previews are local and never exchange or read the account", async () => {
+  const bearer = await token("mcp:read mcp:write");
+  const before = [businessCalls.length, exchanges.length, apiBearers.length];
+  for (const [name, args] of [
+    ["copy_resources_to_user", { resource_type: "workflow", resource_ids: [81, 82], target_user_id: 42 }],
+    ["share_resource", { resource_type: "email_model", resource_id: 81, target_type: "user", target_ids: [42] }],
+    ["share_prm_contacts", { contact_ids: [11], target_type: "team", target_ids: [3] }],
+    ["copy_contacts_across_lists", { destination_list_id: 42 }],
+  ] as const) expect((await resourceCall(bearer, name, args)).data.dry_run).toBe(true);
+  expect([businessCalls.length, exchanges.length, apiBearers.length]).toEqual(before);
+});
+
+test("resource discovery filters the complete list then pages by stable IDs", async () => {
+  const bearer = await token("mcp:read");
+  for (const resource_type of ["email_model", "linkedin_invitation_model", "linkedin_message_model", "sms_model", "smv_model", "workflow", "contact_list"]) {
+    const first = await resourceCall(bearer, "list_copyable_resources", { resource_type, search: "ALPHA", per_page: 1 });
+    expect(first.result.isError).not.toBe(true);
+    expect(first.data).toMatchObject({ total: 2, next_page: 2, resources: [{ id: 81, name: "Alpha" }] });
+    const second = await resourceCall(bearer, "list_copyable_resources", { resource_type, search: "alpha", per_page: 1, page: 2 });
+    expect(second.data).toMatchObject({ total: 2, next_page: null, resources: [{ id: 82, name: "Alpha two" }] });
+  }
+});
+
+test("batch copies use the seven exact routes and include workflow models by default", async () => {
+  const bearer = await token("mcp:write");
+  for (const [resource_type, base] of Object.entries({ contact_list: "/contact-lists", email_model: "/models/email", linkedin_invitation_model: "/models/linkedin/invitation", linkedin_message_model: "/models/linkedin/message", sms_model: "/models/sms", smv_model: "/models/smv", workflow: "/workflows" })) {
+    const before = businessCalls.length;
+    const { result, data } = await resourceCall(bearer, "copy_resources_to_user", { resource_type, resource_ids: [81, 82], target_user_id: 42, confirm: true });
+    expect(result.isError).not.toBe(true);
+    expect(data.accepted).toBe(2);
+    expect(businessCalls.slice(before).map((call) => call.path)).toEqual([`${base}/81/copy/to/42`, `${base}/82/copy/to/42`]);
+    expect(businessCalls.at(-1)?.body).toEqual(resource_type === "workflow" ? { with_models: true } : undefined);
+    expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:write");
+  }
+  const before = businessCalls.length;
+  for (const resource_ids of [[81, 81], Array.from({ length: 51 }, (_, i) => i + 1)]) {
+    expect((await resourceCall(bearer, "copy_resources_to_user", { resource_type: "email_model", resource_ids, target_user_id: 42, confirm: true })).result.isError).toBe(true);
+  }
+  expect(businessCalls.length).toBe(before);
+});
+
+test("later copy failures preserve completed IDs even on 401 and never replay or continue", async () => {
+  const bearer = await token("mcp:write");
+  resourceCopyFailureId = 82;
+  try {
+    for (const status of [403, 401]) {
+      resourceCopyFailureStatus = status;
+      const before = businessCalls.length;
+      const { result, data } = await resourceCall(bearer, "copy_resources_to_user", { resource_type: "email_model", resource_ids: [81, 82, 83], target_user_id: 42, confirm: true });
+      expect(result.isError).toBe(true);
+      expect(data).toMatchObject({ partial: true, results: [{ source_id: 81, status: "accepted" }, { source_id: 82, status: "failed_or_uncertain" }], unattempted_ids: [83] });
+      expect(businessCalls.slice(before).map((call) => call.path)).toEqual(["/models/email/81/copy/to/42", "/models/email/82/copy/to/42"]);
+    }
+    // A first-write 401 still uses the normal original-account challenge.
+    const response = await rpc("tools/call", bearer, { name: "copy_resources_to_user", arguments: { resource_type: "email_model", resource_ids: [82], target_user_id: 42, confirm: true } });
+    expect(response.status).toBe(401);
+  } finally { resourceCopyFailureId = undefined; resourceCopyFailureStatus = 403; }
+});
+
+test("resource sharing preserves complete ACLs and uses read/write scope union for every family", async () => {
+  const bearer = await token("mcp:read mcp:write");
+  for (const [resource_type, base] of Object.entries({ contact_list: "/contact-lists", email_model: "/models/email", linkedin_invitation_model: "/models/linkedin/invitation", linkedin_message_model: "/models/linkedin/message", sms_model: "/models/sms", smv_model: "/models/smv", workflow: "/workflows", data_field: "/data-fields" })) {
+    const resource_id = resource_type === "contact_list" ? 42 : 81;
+    const before = businessCalls.length;
+    const { result } = await resourceCall(bearer, "share_resource", { resource_type, resource_id, target_type: "organization", target_ids: [5], confirm: true });
+    expect(result.isError).not.toBe(true);
+    expect(businessCalls.slice(before).map((call) => `${call.method} ${call.path}`)).toEqual([`GET ${base}/${resource_id}`, `${resource_type === "smv_model" ? "POST" : "PUT"} ${base}/${resource_id}`]);
+    expect(businessCalls.at(-1)?.body).toEqual({ sharing: [...resourceAcl, { sharing_type_to: "Organization", ids_list: [5], name: "Shared via Magileads assistant", read_permission: true, write_permission: false, delete_permission: false }] });
+    expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:read+mcp:write");
+    expect(businessCalls.at(-1)?.contentType?.startsWith("multipart/form-data")).toBe(resource_type === "smv_model");
+  }
+});
+
+test("sharing refuses hidden ACLs, preserves stronger grants and revokes only explicit destinations", async () => {
+  const bearer = await token("mcp:read mcp:write");
+  const args = { resource_type: "email_model", resource_id: 81, target_type: "user", target_ids: [8], confirm: true };
+  let before = businessCalls.length;
+  expect((await resourceCall(bearer, "share_resource", args)).data.unchanged).toBe(true);
+  expect(businessCalls.length).toBe(before + 1); // GET only, existing write permission is retained.
+  const revoked = await resourceCall(bearer, "share_resource", { ...args, action: "revoke" });
+  expect(revoked.result.isError).not.toBe(true);
+  expect(businessCalls.at(-1)?.body).toEqual({ sharing: [{ ...resourceAcl[0], ids_list: [9] }, resourceAcl[1]] });
+  try {
+    resourceProfileSharing = null;
+    before = businessCalls.length;
+    expect((await resourceCall(bearer, "share_resource", args)).result.isError).toBe(true);
+    expect(businessCalls.length).toBe(before + 1);
+  } finally { resourceProfileSharing = resourceAcl; }
+});
+
+test("SMV can revoke the last grant with an empty sharing form and no audio replacement", async () => {
+  try {
+    resourceProfileSharing = [resourceAcl[0]];
+    const { result } = await resourceCall(await token("mcp:read mcp:write"), "share_resource", { resource_type: "smv_model", resource_id: 81,
+      action: "revoke", target_type: "user", target_ids: [8, 9], confirm: true });
+    expect(result.isError).not.toBe(true);
+    expect(businessCalls.at(-1)?.body).toEqual({ sharing: [] });
+    expect(businessCalls.at(-1)?.contentType).toContain("multipart/form-data; boundary=");
+  } finally { resourceProfileSharing = resourceAcl; }
+});
+
+test("PRM sharing writes the documented explicit-contact payload without listing recipients", async () => {
+  const { result } = await resourceCall(await token("mcp:write"), "share_prm_contacts", { contact_ids: [11, 12], target_type: "team", target_ids: [3], allow_write: true, confirm: true });
+  expect(result.isError).not.toBe(true);
+  expect(businessCalls.at(-1)).toMatchObject({ method: "POST", path: "/prm/sharings", bearer: "Bearer exchanged-mcp:write", body: { sharing: { contact_ids: [11, 12], sharing_type_to: "Team", ids_list: [3], read_permission: true, write_permission: true, delete_permission: false, name: "Shared via Magileads assistant" } } });
+});
+
+const globalCriteria = [{ field: "email", op: "contains", value: "fixture" }];
+test("global queries resolve fields, count complements and follow only safe API cursor paths", async () => {
+  const bearer = await token("mcp:read");
+  const { result, data } = await resourceCall(bearer, "query_all_contacts", { criteria: globalCriteria, target: "all_except_matching", per_page: 1, page: 2 });
+  expect(result.isError).not.toBe(true);
+  expect(data).toMatchObject({ account_id: 7, total_on_account: 8, matched: 3, selected: 5, sample_matches_filter: true, sample: { page: 2 } });
+  expect(data.selection_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  expect(businessCalls.some((call) => call.path.includes("/contact-lists/contacts/search/fixture-cursor/page/2"))).toBe(true);
+  const query = businessCalls.findLast((call) => call.method === "POST" && call.path === "/contact-lists/contacts/search");
+  expect(query?.body).toMatchObject({ options: { filter: { mode: "and", values: [{ field_name: "1", type: "contains", value: "fixture" }] } } });
+  try {
+    for (const mode of ["missing", "wrong_path"] as const) {
+      globalCursorMode = mode;
+      const before = businessCalls.length;
+      expect((await resourceCall(bearer, "query_all_contacts", { criteria: globalCriteria, page: 2 })).result.isError).toBe(true);
+      expect(businessCalls.slice(before).some((call) => call.method === "GET" && call.path.includes("/page/2"))).toBe(false);
+    }
+  } finally { globalCursorMode = "normal"; }
+});
+
+test("global copy verifies account/filter/count before one exact selection request", async () => {
+  const bearer = await token("mcp:read mcp:write");
+  const preview = (await resourceCall(bearer, "query_all_contacts", { criteria: globalCriteria })).data;
+  const args = { criteria: globalCriteria, destination_list_id: 42, confirm_count: preview.selected, selection_fingerprint: preview.selection_fingerprint, confirm: true };
+  const before = businessCalls.length;
+  const copied = await resourceCall(bearer, "copy_contacts_across_lists", args);
+  expect(copied.result.isError).not.toBe(true);
+  expect(copied.data.next_check).toEqual({ tool: "get_contact_list_status", arguments: { contact_list_id: 42 } });
+  const copies = businessCalls.slice(before).filter((call) => call.path === "/contact-lists/contacts/copy/42");
+  expect(copies).toHaveLength(1);
+  expect(copies[0]).toMatchObject({ method: "POST", bearer: "Bearer exchanged-mcp:read+mcp:write", body: { contacts_selection: { filter: { mode: "and", values: [{ field_name: "1", type: "contains", value: "fixture" }] }, contact_ids: [], excluded_contact_ids: [], reverse_selection: false } } });
+  const guardedBefore = businessCalls.length;
+  for (const changed of [{ ...args, confirm_count: 99 }, { ...args, criteria: [{ field: "email", op: "contains", value: "other" }] }, { ...args, selection_fingerprint: undefined }, { ...args, criteria: [] }]) {
+    expect((await resourceCall(bearer, "copy_contacts_across_lists", changed)).result.isError).toBe(true);
+  }
+  // Same count/filter on another active account is still rejected.
+  const other = await grantToken(crypto.randomUUID(), process.env.OAUTH_MCP_RESOURCE!, "user-8");
+  expect((await resourceCall(other, "copy_contacts_across_lists", args)).result.isError).toBe(true);
+  try {
+    globalMatched = 4;
+    expect((await resourceCall(bearer, "copy_contacts_across_lists", args)).result.isError).toBe(true);
+    globalMatched = 0;
+    const empty = (await resourceCall(bearer, "query_all_contacts", { criteria: globalCriteria })).data;
+    expect((await resourceCall(bearer, "copy_contacts_across_lists", { ...args, confirm_count: 0, selection_fingerprint: empty.selection_fingerprint })).data.executed).toBe(false);
+  } finally { globalMatched = 3; }
+  expect(businessCalls.slice(guardedBefore).some((call) => call.path === "/contact-lists/contacts/copy/42")).toBe(false);
+});
+
 test("tool declarations compute route-scope unions for composite tools", () => {
   const table = toolAccessTable();
   expect(scopesForTool(table.get("add_contact_to_list")!)).toEqual(["mcp:read", "mcp:write"]);
   expect(scopesForTool(table.get("run_google_maps_targeting")!)).toEqual(["mcp:read", "mcp:write"]);
   expect(scopesForTool(table.get("extract_maps_search")!)).toEqual(["mcp:write"]);
   expect(scopesForTool(table.get("search_contacts")!)).toEqual(["mcp:read"]);
+  for (const name of ["share_resource", "copy_contacts_across_lists"]) expect(scopesForTool(table.get(name)!)).toEqual(["mcp:read", "mcp:write"]);
+  for (const name of ["copy_resources_to_user", "share_prm_contacts"]) expect(scopesForTool(table.get(name)!)).toEqual(["mcp:write"]);
+  for (const name of ["list_copyable_resources", "query_all_contacts"]) expect(scopesForTool(table.get(name)!)).toEqual(["mcp:read"]);
   expect(scopeForRoute(table.get("run_google_maps_targeting")!, "POST /targeting/google/generate-maps-search-urls")).toBe("mcp:read");
 });
 
@@ -1175,12 +1380,13 @@ test("public plugin tool annotations match private-account and open-world behavi
     } }[] };
   };
   const tools = payload.result.tools;
-  expect(tools).toHaveLength(30);
+  expect(tools).toHaveLength(36);
   const openWorld = new Set([
     "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting", "magileads_request",
     "get_active_account", "list_switchable_accounts", "switch_account", "return_to_original_account",
+    "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists",
   ]);
-  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model", "switch_account", "return_to_original_account"]);
+  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model", "switch_account", "return_to_original_account", "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists"]);
   for (const tool of tools) {
     expect(tool.annotations.openWorldHint).toBe(openWorld.has(tool.name));
     expect(tool.annotations.readOnlyHint).toBe(!writes.has(tool.name));
@@ -1748,10 +1954,11 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     for (const name of ["create_email_model", "add_contact_to_list", "extract_maps_search", "run_google_maps_targeting"]) {
       expect(tools.find((tool) => tool.name === name)?.description).toContain(CREATION_GUIDANCE);
     }
-    expect(names).toHaveLength(23);
+    expect(names).toHaveLength(29);
     expect(names).toContain("run_google_maps_targeting");
     expect(names).toContain("add_contact_to_list");
     expect(names).toContain("create_email_model");
+    for (const name of ["list_copyable_resources", "copy_resources_to_user", "share_resource", "share_prm_contacts", "query_all_contacts", "copy_contacts_across_lists"]) expect(names).toContain(name);
     const beforeModelPreview = businessCalls.length;
     const preview = await keyRpc(origin, undefined, "tools/call", { name: "create_email_model",
       arguments: { name: "Public template", subject: "Hello", text: "Hello %first_name%" } },
@@ -1775,7 +1982,7 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     expect(hiddenResult.error !== undefined || hiddenResult.result?.isError === true).toBe(true);
     expect(exchanges.length).toBe(beforeExchanges);
     const keyListed = await keyRpc(origin, "key-alpha", "tools/list");
-    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(23);
+    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(29);
   } finally {
     await close(server);
   }
@@ -1843,7 +2050,7 @@ test("custom reseller hosts work with API keys in api_key and both modes without
         expect((await initialized.json() as { result: { serverInfo: { name: string } } }).result.serverInfo.name).toBe("magileads-mcp");
         const listed = await keyRpc(origin, "key-alpha", "tools/list", undefined, { Host: host });
         expect(listed.status).toBe(200);
-        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(26);
+        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(32);
         // The hostname is an alias, not an account selector: two keys keep their identities on either host.
         for (const [key, id] of [["key-alpha", 71], ["key-beta", 72]] as const) {
           const result = await keyRpc(origin, key, "tools/call", { name: "get_account_overview", arguments: {} }, { Host: host });

@@ -49,6 +49,15 @@ export function runWithAuth<T>(auth: RequestAuth, fn: () => T): T {
   return authStore.run(auth, fn);
 }
 
+/** After a batch already wrote data, keep a later 401 in its checkpoint result.
+ * A transport challenge would discard completed IDs and invite a blind replay.
+ * The next independent request still verifies the original credential normally.
+ */
+export function runWithPartialWriteResult<T>(fn: () => T): T {
+  const auth = authStore.getStore();
+  return auth ? authStore.run({ ...auth, onUnauthorized: undefined }, fn) : fn();
+}
+
 /** The per-request client API key for the current async context, if any. */
 function currentApiKey(): string | undefined {
   const auth = authStore.getStore();
@@ -202,7 +211,7 @@ async function api<T>(path: string, init: RequestInit = {}, retryOn401 = true): 
   const res = await fetch(`${base}${path}`, {
     ...init,
     headers: {
-      "Content-Type": "application/json",
+      ...(!(init.body instanceof FormData) ? { "Content-Type": "application/json" } : {}),
       Accept: "application/json",
       ...headers,
       ...(init.headers as Record<string, string> | undefined),
@@ -616,6 +625,30 @@ export async function searchContacts(
   return api<ContactsPage>(`${path}${q}`, { method: "GET" });
 }
 
+/** Structured account-wide contact search. POST takes options in its JSON body. */
+export async function queryAllContacts(options: Raw, page = 1): Promise<ContactsPage> {
+  const first = await api<ContactsPage>("/contact-lists/contacts/search", {
+    method: "POST", body: JSON.stringify({ options }),
+  });
+  if (page <= 1) return first;
+  const path = cursorPagePath(first.current_page, page);
+  if (!path || !/^\/contact-lists\/contacts\/search\/[^/]+\/page\/[1-9]\d*$/.test(path)) {
+    throw new Error("The API did not return a usable global search cursor; refusing to repeat the first page.");
+  }
+  resolveEndpoint("GET", path);
+  return api<ContactsPage>(`${path}?options=${encodeURIComponent(JSON.stringify(options))}`, { method: "GET" });
+}
+
+/** Metadata-only SMV update, matching the existing Magileads frontend form.
+ * The browser serializes an array of JSON rule strings as a comma-joined field;
+ * an empty array becomes an empty field. Never attach or replace voice_file.
+ */
+export function updateSmvSharing(id: number, sharing: readonly Raw[]): Promise<unknown> {
+  const form = new FormData();
+  form.append("sharing", sharing.map((rule) => JSON.stringify(rule)).join(","));
+  return api<unknown>(`/models/smv/${id}`, { method: "POST", body: form }, false);
+}
+
 /* -------------------------------------------------------------------------- */
 /* PRM — the CRM / prospection pipeline (READ-ONLY)                            */
 /* -------------------------------------------------------------------------- */
@@ -673,12 +706,13 @@ export async function rawRequest(
   method: string,
   pathWithQuery: string,
   body?: unknown,
+  retryOn401 = true,
 ): Promise<unknown> {
   const init: RequestInit = { method: method.toUpperCase() };
   if (body !== undefined && body !== null) {
     init.body = typeof body === "string" ? body : JSON.stringify(body);
   }
-  return api<unknown>(pathWithQuery, init);
+  return api<unknown>(pathWithQuery, init, retryOn401);
 }
 
 export { API_BASE };

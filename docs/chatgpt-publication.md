@@ -12,11 +12,11 @@ décrivent la soumission « With MCP ».
 1. Déployer la version à tester sur l'URL canonique
    `https://mcp.magileads.io/mcp`, avec `MCP_HTTP_AUTH=oauth` (ou `both` si les
    clients existants ont encore besoin des clés API). Définir
-   `MCP_TOOL_PROFILE=public` pour le catalogue public : 23 outils métier
+   `MCP_TOOL_PROFILE=public` pour le catalogue public : 29 outils métier
    dédiés restent accessibles, les trois outils génériques
    (`list_api_endpoints`, `magileads_get`, `magileads_request`) sont masqués.
-   Le profil par défaut `full` conserve les 26 outils pour les intégrations
-   privées. Sur une même URL, ce profil s'applique à tous les clients HTTP.
+   Le profil par défaut `full` expose 32 outils métier, plus 4 outils de compte
+   en HTTP OAuth privé (36 au total). Sur une même URL, ce profil s'applique à tous les clients HTTP.
    Garder
    `MCP_ALLOW_API_KEY_QUERY=false` pour éviter les clés dans les URL et les logs.
 2. Vérifier `https://mcp.magileads.io/health` puis lancer le préflight public :
@@ -67,8 +67,12 @@ distincte par client.
   Il produit automatiquement le HTML requis par l'API pour les contenus en texte
   seul, en conservant les variables de personnalisation et les retours à la ligne.
   Ce choix réduit le risque de revue, mais **ne garantit pas**
-  l'approbation. Les 23 outils doivent encore être testés avec un compte
+  l'approbation. Les 29 outils doivent encore être testés avec un compte
   de démonstration et leurs réponses auditées pour les données personnelles.
+  Les six outils de copie, partage et filtrage global utilisent le même contrat
+  métier de 249 routes. Les copies/partages exigent `confirm:true` et des destinataires
+  explicites ; les copies globales exigent aussi le compteur et l'empreinte de l'aperçu.
+  Ajouter ces cas à la démo de revue, sans envoyer de messages ni modifier les comptes réels.
 
 Texte de fiche proposé, à faire approuver par Magileads :
 

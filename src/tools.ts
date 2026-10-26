@@ -38,6 +38,7 @@ import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE } from "./instructions.js
 import {
   accountContextForResult, assertAccountRevision, requireAccountSession, revisionSchema, withAccountContext,
 } from "./oauth/account-context.js";
+import { registerResourceTools } from "./resource-tools.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -530,7 +531,7 @@ function contactsView(
   };
 }
 
-type ToolAccess = {
+export type ToolAccess = {
   scope: Scope;
   routes: readonly string[];
   dynamic?: boolean;
@@ -554,6 +555,8 @@ const PUBLIC_TOOLS = new Set([
   "get_account_overview", "list_linkedin_accounts", "search_contact_lists",
   "get_contact_list", "query_contacts", "search_contacts",
   "list_prm_statuses", "query_prm_contacts", "get_prm_contact", "list_prm_nurturings",
+  "list_copyable_resources", "copy_resources_to_user", "share_resource", "share_prm_contacts",
+  "query_all_contacts", "copy_contacts_across_lists",
 ]);
 
 export function isToolExposed(name: string, profile: ToolProfile): boolean {
@@ -670,6 +673,8 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       }
       return (target.registerTool as (...values: unknown[]) => unknown).call(target, name, ...args);
     }) as McpServer["registerTool"];
+
+  registerResourceTools(register, { criterionSchema, buildFilter, contactsView });
 
   register({ scope: "mcp:read", scopeAlternatives: ["mcp:read", "mcp:write"], routes: ["(private OAuth account context)"], accountControl: true })(
     "get_active_account",
@@ -1504,8 +1509,8 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
             is_canceled: subs.is_canceled ?? null,
             payment_method_valid: subs.payment_method_valid ?? null,
           },
-          teams: { count: teams.length, names: teams.map((t) => t.name).filter(Boolean) },
-          organizations: { count: orgs.length, names: orgs.map((o) => o.name).filter(Boolean) },
+          teams: { count: teams.length, names: teams.map((t) => t.name).filter(Boolean), items: teams.map((t) => ({ id: num(t.id), name: t.name ?? null })) },
+          organizations: { count: orgs.length, names: orgs.map((o) => o.name).filter(Boolean), items: orgs.map((o) => ({ id: num(o.id), name: o.name ?? null })) },
           permissions_count: Array.isArray(me.permissions) ? me.permissions.length : null,
           summary:
             `${name ?? me.email ?? "account"} — plan ${subs.active ? "active" : "inactive"}` +
