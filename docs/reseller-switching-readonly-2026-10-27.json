@@ -1,0 +1,104 @@
+{
+  "at": "2026-10-27T14:33:15.291Z",
+  "transport": "deployed_http_oauth",
+  "records": [
+    {
+      "check": "demo_login_identity",
+      "passed": true,
+      "account_id": 777,
+      "level": "user",
+      "reseller_id": null
+    },
+    {
+      "check": "public_qa_client_registered",
+      "passed": true,
+      "shared_client_for_both_domains": true
+    },
+    {
+      "check": "fresh_oauth_grant",
+      "passed": true,
+      "resource": "https://mcp.magileads.io/mcp"
+    },
+    {
+      "check": "default_authorized_account_list",
+      "passed": true,
+      "resource": "https://mcp.magileads.io/mcp",
+      "account_ids": [
+        11,
+        777,
+        4192
+      ],
+      "count": 3,
+      "has_next_page": false
+    },
+    {
+      "check": "authorized_account_list",
+      "passed": true,
+      "resource": "https://mcp.magileads.io/mcp",
+      "version": "0.14.0",
+      "original_account_id": 777,
+      "count": 3,
+      "account_ids": [
+        11,
+        777,
+        4192
+      ],
+      "pages": 1,
+      "complete": true,
+      "target_user_id": 4192,
+      "target_found": true
+    },
+    {
+      "check": "switch",
+      "resource": "https://mcp.magileads.io/mcp",
+      "status": "not_attempted",
+      "reason": "read_only_run"
+    },
+    {
+      "check": "fresh_oauth_grant",
+      "passed": true,
+      "resource": "https://mcp.surleads.com/mcp"
+    },
+    {
+      "check": "default_authorized_account_list",
+      "passed": true,
+      "resource": "https://mcp.surleads.com/mcp",
+      "account_ids": [
+        777
+      ],
+      "count": 1,
+      "has_next_page": false
+    },
+    {
+      "check": "authorized_account_list",
+      "passed": true,
+      "resource": "https://mcp.surleads.com/mcp",
+      "version": "0.14.0",
+      "original_account_id": 777,
+      "count": 1,
+      "account_ids": [
+        777
+      ],
+      "pages": 1,
+      "complete": true,
+      "target_user_id": 4192,
+      "target_found": false
+    },
+    {
+      "check": "switch",
+      "resource": "https://mcp.surleads.com/mcp",
+      "status": "not_attempted",
+      "reason": "target_absent_from_authorized_list"
+    },
+    {
+      "check": "qa_grant_cleanup",
+      "resource": "https://mcp.magileads.io/mcp",
+      "revoked": true
+    },
+    {
+      "check": "qa_grant_cleanup",
+      "resource": "https://mcp.surleads.com/mcp",
+      "revoked": true
+    }
+  ]
+}

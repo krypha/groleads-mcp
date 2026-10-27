@@ -130,7 +130,7 @@ async function login(): Promise<void> {
   if (!res.ok) {
     const { key, detail } = errorInfo(data);
     throw new MagileadsError(
-      `Magileads login failed (${res.status})`,
+      `API sign-in failed (${res.status})`,
       res.status,
       key,
       detail,
@@ -138,7 +138,7 @@ async function login(): Promise<void> {
   }
   const tokens = data as { access_token?: string; refresh_token?: string };
   if (!tokens.access_token) {
-    throw new MagileadsError("Magileads login returned no access token", res.status);
+    throw new MagileadsError("API sign-in returned no access token", res.status);
   }
   accessToken = tokens.access_token;
   refreshToken = tokens.refresh_token || "";
@@ -181,7 +181,7 @@ async function authHeaders(): Promise<Record<string, string>> {
   if (mode === "apiKey") return { "X-API-Key": API_KEY };
   if (mode === "none") {
     throw new MagileadsError(
-      "No Magileads credentials for stdio. Configure MAGILEADS_API_KEY or MAGILEADS_EMAIL+PASSWORD.",
+      "No credentials for stdio. Configure MAGILEADS_API_KEY or MAGILEADS_EMAIL+PASSWORD.",
       401,
       "no_credentials",
     );
@@ -240,7 +240,7 @@ async function api<T>(path: string, init: RequestInit = {}, retryOn401 = true): 
   if (!res.ok) {
     const { key, detail } = errorInfo(data);
     throw new MagileadsError(
-      `Magileads request failed: ${init.method || "GET"} ${path} (${res.status})`,
+      `API request failed: ${init.method || "GET"} ${path} (${res.status})`,
       res.status,
       key,
       detail,

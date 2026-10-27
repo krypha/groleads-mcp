@@ -26,7 +26,7 @@ function json(res: http.ServerResponse, status: number, body: unknown, headers: 
 }
 
 function apiKeyUnauthorized(res: http.ServerResponse): void {
-  json(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Invalid or missing Magileads API key." }, id: null });
+  json(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Invalid or missing API key." }, id: null });
 }
 
 type Credential = { kind: "oauth"; bearer: string } | { kind: "apiKey"; apiKey: string };

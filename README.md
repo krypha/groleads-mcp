@@ -36,6 +36,15 @@ transport uses Magileads environment credentials.
 
 ## Tools
 
+Tool display titles are brand-neutral, including account switching, so reseller
+domains do not announce a Magileads-branded account action. After deploying a title
+change, refresh the client's tool catalogue to replace cached labels.
+Initialization and every tool description also instruct the assistant to use
+neutral wording ("your account", "the platform administrator"), or an explicitly
+known reseller brand. Technical server/tool names must not be used to infer a
+vendor name in replies. Empty/self-only switch lists are reported as no other
+authorized target, without asserting that missing delegation is the sole cause.
+
 | Tool | Input | Output |
 | --- | --- | --- |
 | `generate_maps_search_urls` | `search` (string), `locations?` (string[]), `max_links?` (1–40, default 20) | `{ count, urls[] }` — Google Maps search URLs |

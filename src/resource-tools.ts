@@ -96,7 +96,7 @@ export function registerResourceTools(register: Register, helpers: Helpers): voi
 
   const grantInputs = {
     target_type: targetTypeSchema, target_ids: distinctIdsSchema,
-    name: z.string().trim().min(1).max(200).default("Shared via Magileads assistant"),
+    name: z.string().trim().min(1).max(200).default("Shared via assistant"),
     allow_write: z.boolean().default(false), allow_delete: z.boolean().default(false), confirm: z.boolean().optional(),
   };
   register({ scope: "mcp:write", routes: shareRoutes })("share_resource", {

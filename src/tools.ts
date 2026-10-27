@@ -34,7 +34,7 @@ import {
 import { CALLABLE_ENDPOINTS, matchEndpoint, resolveEndpoint } from "./endpoints.js";
 import { MAX_EMAIL_HTML_LENGTH, normalizeEmailCreation } from "./email-model.js";
 import { SCOPES, type Scope } from "./oauth/scopes.js";
-import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE } from "./instructions.js";
+import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE, USER_FACING_GUIDANCE } from "./instructions.js";
 import {
   accountContextForResult, assertAccountRevision, requireAccountSession, revisionSchema, withAccountContext,
 } from "./oauth/account-context.js";
@@ -645,6 +645,9 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         : access.dynamic && name === "magileads_request"
           ? allowedScopes.length > 0 : scopesForTool(access).every((scope) => allowedScopes.includes(scope)))) return {};
       if (!isToolExposed(name, profile)) return {};
+      // Clients may ignore initialize.instructions and read only tool discovery.
+      const presentation = args[0] as { description?: string };
+      args[0] = { ...presentation, description: `${presentation.description ?? ""} ${USER_FACING_GUIDANCE}`.trim() };
       // Repeat creation guidance in tool discovery for hosts that ignore initialize.instructions.
       if (access.scope === "mcp:write") {
         const config = args[0] as { description?: string };
@@ -678,7 +681,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
 
   register({ scope: "mcp:read", scopeAlternatives: ["mcp:read", "mcp:write"], routes: ["(private OAuth account context)"], accountControl: true })(
     "get_active_account",
-    { title: "Get active Magileads account", description: "Read the original and active account identities and current revision. Available with mcp:read OR mcp:write. No business API call or account change.",
+    { title: "Get active account", description: "Read the original and active account identities and current revision. Available with mcp:read OR mcp:write. No business API call or account change.",
       inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true } },
     async (): Promise<TextResult> => {
       try { return ok({ account_context: requireAccountSession().context }); } catch (error) { return fail(error); }
@@ -695,7 +698,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   );
   register({ scope: "mcp:write", routes: ["(private OAuth switch account)"], accountControl: true })(
     "switch_account",
-    { title: "Switch active Magileads account", description: "Act as an explicitly authorized target account for subsequent tools on this OAuth connection and domain, including other chats sharing it. Dry run unless confirm:true; obtain the current account_revision before confirmation. The original login remains intact.",
+    { title: "Switch active account", description: "Act as an explicitly authorized target account for subsequent tools on this OAuth connection and domain, including other chats sharing it. Dry run unless confirm:true; obtain the current account_revision before confirmation. The original login remains intact.",
       inputSchema: { user_id: z.number().int().positive().safe(), confirm: z.boolean().optional() },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true } },
     async ({ user_id, confirm }): Promise<TextResult> => {
@@ -708,7 +711,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   );
   register({ scope: "mcp:write", routes: ["(private OAuth return to original)"], accountControl: true })(
     "return_to_original_account",
-    { title: "Return to original Magileads account", description: "Restore the original account without using the switched account's business token. Available even if the target account's delegation has expired. Dry run unless confirm:true with the current account_revision.",
+    { title: "Return to original account", description: "Restore the original account without using the switched account's business token. Available even if the target account's delegation has expired. Dry run unless confirm:true with the current account_revision.",
       inputSchema: { confirm: z.boolean().optional() }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true } },
     async ({ confirm }): Promise<TextResult> => {
       try {
@@ -768,7 +771,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       title: "Extract contacts from Google Maps URLs",
       description:
         "Extract businesses (name, address, phone, website, etc.) from Google Maps search URLs into " +
-        "a Magileads contact list. Accepts up to 10 URLs per call. Provide either `contact_list_name` " +
+        "a contact list. Accepts up to 10 URLs per call. Provide either `contact_list_name` " +
         "(creates a new list) or `contact_list_id` (appends to an existing one). Extraction runs " +
         "asynchronously: this returns the target list id immediately, then poll " +
         "`get_contact_list_status` until its extraction job reaches 'completed'. " +
@@ -1029,8 +1032,8 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "Import one contact with POST /contact-lists/{contact_list_id}/contact. Name each " +
         "property with a readable data-field identifier such as `email`, `first_name`, " +
         "`last_name`, `company`, or pass its numeric data_field_id; the tool resolves identifiers " +
-        "to the exact Magileads shape `{properties:[{data_field_id,value}]}`. This write is a dry " +
-        "run until `confirm:true`. Magileads may report an update instead of an addition when the " +
+        "to the exact API shape `{properties:[{data_field_id,value}]}`. This write is a dry " +
+        "run until `confirm:true`. The API may report an update instead of an addition when the " +
         "contact already exists.",
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("Destination contact list id."),
@@ -1147,7 +1150,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
     {
       title: "List prospecting campaigns",
       description:
-        "List the account's prospecting campaigns (Magileads 'programmations'). Each entry: " +
+        "List the account's prospecting campaigns (API 'programmations'). Each entry: " +
         "`id`, `name` (the scenario/workflow name), `status` (running/stopped/archived, derived " +
         "from the raw stopped/archived flags), `start_date`, and `scenario_id` (the workflow to " +
         "pass to get_scenario). Use `name` to filter (case-insensitive substring on the campaign " +
@@ -1206,7 +1209,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         if (!prog) {
           return fail(
             new Error(
-              `Campaign ${campaign_id} was not found on this Magileads account ` +
+              `Campaign ${campaign_id} was not found on this account ` +
                 `(it may belong to a different account, or not exist).`,
             ),
           );
@@ -1469,9 +1472,9 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   register({ scope: "mcp:read", routes: ["GET /users/me"] })(
     "get_account_overview",
     {
-      title: "Get the Magileads account overview",
+      title: "Get the account overview",
       description:
-        "Summarize the connected Magileads account: identity (name, email, id), company/" +
+        "Summarize the connected account: identity (name, email, id), company/" +
         "role, and plan/subscription status (active, trial, end_date, billing). Note: the API " +
         "exposes subscription STATUS but no numeric credit balance, so credit counts are not " +
         "reported. Takes no parameters.",
@@ -1702,7 +1705,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
     {
       title: "Query contacts in a list (filter + sort, paged)",
       description:
-        "List a contact list's contacts with an optional Magileads `filter` and `sort`. Field names " +
+        "List a contact list's contacts with an optional API `filter` and `sort`. Field names " +
         "may be human identifiers (email, company, first_name, …) — they're resolved to data-field " +
         "ids automatically. Contacts are returned with RESOLVED, readable property names, capped at " +
         "50 rows per call. `filter` = { mode:'and'|'or', values:[{ field/field_name, type, value }] } " +
@@ -1716,7 +1719,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
             values: z.array(z.any()),
           })
           .optional()
-          .describe("Magileads Filter object. Leaf: { field (identifier or id), type, value }; nesting allowed."),
+          .describe("API Filter object. Leaf: { field (identifier or id), type, value }; nesting allowed."),
         sort: z
           .object({
             field: z.string().describe("Field identifier or data_field_id to sort on."),
@@ -1852,7 +1855,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
     {
       title: "Query PRM (pipeline) contacts",
       description:
-        "List the account's PRM (CRM) contacts with convenience filters or a raw Magileads " +
+        "List the account's PRM (CRM) contacts with convenience filters or a raw API " +
         "`options` object. `status` accepts a default-status key (opener/answerer/…), a custom-" +
         "status name, or a custom-status id. `only_positive:true` keeps contacts marked positive. " +
         "`search` matches across all data fields. Contacts are returned with RESOLVED, readable " +
@@ -1862,7 +1865,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         options: z
           .object({ filter: z.any().optional(), sort: z.any().optional() })
           .optional()
-          .describe("Advanced: a raw Magileads PaginationOptions ({filter, sort}); AND-combined with the convenience filters."),
+          .describe("Advanced: raw API PaginationOptions ({filter, sort}); AND-combined with the convenience filters."),
         status: z.string().optional().describe("Filter by status: default key, custom-status name, or custom-status id."),
         only_positive: z.boolean().optional().describe("Keep only contacts marked positive (is_positive=true)."),
         search: z.string().optional().describe("Free-text match across all data fields (any_datafield contains)."),
@@ -2080,7 +2083,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       title: "Create an email model (template)",
       description: "Save an email template, without sending emails or generating paid AI content. " +
         "Provide a name, subject and text and/or HTML body. Text-only content is safely converted to the HTML " +
-        "required by Magileads, preserving line breaks and placeholders such as %first_name%; explicit HTML is unchanged. " +
+        "required by the API, preserving line breaks and placeholders such as %first_name%; explicit HTML is unchanged. " +
         "Returns a local dry run until confirm:true. Prefer this tool over the generic API for template creation.",
       inputSchema: {
         name: z.string().trim().min(1).max(200).describe("Template name."),
@@ -2113,9 +2116,9 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   register({ scope: "mcp:read", routes: ["(local endpoint index)"] })(
     "list_api_endpoints",
     {
-      title: "Discover callable Magileads API endpoints",
+      title: "Discover callable API endpoints",
       description:
-        "List the Magileads API endpoints the generic tools (magileads_get / magileads_request) " +
+        "List the API endpoints the generic tools (magileads_get / magileads_request) " +
         "can call — only operations in the backend OAuth business contract, with explicit scopes. " +
         "Administrative/secret endpoints, DELETE and PATCH are excluded. Filter by `search` (substring on path/summary/" +
         "tag), `method`, or `writes_only`/" +
@@ -2159,9 +2162,9 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   register({ scope: "mcp:read", routes: ["(resolved GET read endpoint)"], dynamic: true })(
     "magileads_get",
     {
-      title: "Call any Magileads API GET endpoint",
+      title: "Call an API GET endpoint",
       description:
-        "Read-only escape hatch: GET any indexed Magileads endpoint that no dedicated " +
+        "Read-only escape hatch: GET any indexed API endpoint that no dedicated " +
         "tool covers. Provide `path` (e.g. '/models/email' or '/contact-lists/123') with {params} filled " +
         "in, and optional `query` params (object; object values are JSON-encoded, e.g. " +
         "{ options: { per_page: 10 } }). Discover paths with list_api_endpoints. Only GET is allowed " +
@@ -2188,9 +2191,9 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
   register({ scope: "mcp:write", routes: ["(resolved endpoint scope)"], dynamic: true })(
     "magileads_request",
     {
-      title: "Call an authorized Magileads business endpoint (guarded writes)",
+      title: "Call an authorized business endpoint (guarded writes)",
       description:
-        "Escape hatch for GET/POST/PUT operations on an explicitly authorized Magileads business " +
+        "Escape hatch for GET/POST/PUT operations on an explicitly authorized business " +
         "endpoint not covered by a dedicated tool — creating lists/models, sending LinkedIn " +
         "messages, imports, PRM exclusions, status changes, etc. The endpoint's explicit scope controls " +
         "execution: mcp:read operations (including POST searches/statistics) execute without confirmation. " +

@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { decodeJwt, exportJWK, generateKeyPair, SignJWT } from "jose";
 import type { AccountContext } from "../src/oauth/account-context.js";
 import { CALLABLE_ENDPOINTS, matchEndpoint } from "../src/endpoints.js";
-import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE } from "../src/instructions.js";
+import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE, USER_FACING_GUIDANCE } from "../src/instructions.js";
 
 async function start(handler: http.RequestListener): Promise<{ server: http.Server; origin: string }> {
   const server = http.createServer(handler);
@@ -57,6 +57,7 @@ let accountTargetState: "available" | "unavailable" | "denied" = "available";
 const delegatedTokens = new Map<string, { context: AccountContext; key: string; scopes: string }>();
 const accountControlCalls: { path: string; method: string; authorization: string; body: Record<string, unknown> }[] = [];
 const accountCursors = new Map<string, { key: string; search: string }>();
+const switchableAccountsByResource = new Map<string, { id: number; first_name: string; last_name: string }[]>();
 let accountControlMode: "normal" | "unavailable" | "invalid_client" | "invalid_subject_token" | "malformed" | "redirect" = "normal";
 let accountExchangeMode: "normal" | "missing_binding" | "wrong_actor" | "wrong_target" | "wrong_revision" | "race" | "expired" = "normal";
 let accountMutationFailure: "none" | "lost_response" | "invalid_subject_token" = "none";
@@ -120,7 +121,7 @@ const authorization = await start(async (req, res) => {
         if (!saved || saved.key !== key || saved.search !== search) return respond(res, 400, { error: "invalid_request" });
         offset = 1;
       }
-      const choices = [{ id: 42, first_name: "Target", last_name: "User" }, { id: 43, first_name: "Target", last_name: "Second" }]
+      const choices = (switchableAccountsByResource.get(String(body.resource)) ?? [{ id: 42, first_name: "Target", last_name: "User" }, { id: 43, first_name: "Target", last_name: "Second" }])
         .filter((item) => `${item.first_name} ${item.last_name}`.toLowerCase().includes(search.toLowerCase()));
       const limit = typeof body.limit === "number" ? body.limit : 25;
       const nextCursor = choices.length > offset + limit ? crypto.randomUUID() : null;
@@ -478,6 +479,28 @@ test("account discovery and switch previews use only the private Basic-auth cont
     expect(call.path).toBe("/oauth/mcp/account-context");
     expect(call.method).toBe("POST");
   } finally { await closeTestServer(instance.server); }
+});
+
+test("Surleads account discovery forwards the exact domain and preserves API lists, including self-only and empty results", async () => {
+  const bearer = await grantToken(crypto.randomUUID(), otherResellerResource);
+  const original = { id: 7, first_name: "Original", last_name: "User7" };
+  try {
+    switchableAccountsByResource.set(otherResellerResource, [original]);
+    for (const args of [{}, { limit: 100 }]) {
+      const result = await toolResult(await accountRpc(mcpOrigin, bearer, "list_switchable_accounts", args, otherResellerResource));
+      expect(result.isError).not.toBe(true);
+      const data = JSON.parse(result.content[0].text);
+      expect(data.accounts).toEqual([original]);
+      expect(data.next_cursor).toBe(null);
+      expect(accountControlCalls.at(-1)?.body).toEqual({ subject_token: bearer, resource: otherResellerResource, ...args });
+    }
+    const canonical = await toolResult(await rpc("tools/call", await grantToken(), { name: "list_switchable_accounts", arguments: {} }));
+    expect(JSON.parse(canonical.content[0].text).accounts.map((item: { id: number }) => item.id)).toEqual([42, 43]);
+    switchableAccountsByResource.set(otherResellerResource, []);
+    const empty = await toolResult(await accountRpc(mcpOrigin, bearer, "list_switchable_accounts", {}, otherResellerResource));
+    expect(empty.isError).not.toBe(true);
+    expect(JSON.parse(empty.content[0].text).accounts).toEqual([]);
+  } finally { switchableAccountsByResource.delete(otherResellerResource); }
 });
 
 test("account selection survives token refresh and MCP replica replacement, but isolates grants, users and reseller domains", async () => {
@@ -1001,6 +1024,7 @@ test("initialization and all write descriptions advertise creation without dupli
   const initialization = await initialized.json() as { result: { instructions: string; serverInfo: { version: string } } };
   expect(initialization.result.instructions).toContain(CREATION_GUIDANCE);
   expect(initialization.result.instructions).toContain(ACCOUNT_SWITCHING_GUIDANCE);
+  expect(initialization.result.instructions).toContain(USER_FACING_GUIDANCE);
   expect(initialization.result.serverInfo.version).toBe("0.14.0");
   const listed = await rpc("tools/list", caller);
   const tools = (await listed.json() as { result: { tools: {
@@ -1008,6 +1032,7 @@ test("initialization and all write descriptions advertise creation without dupli
   }[] } }).result.tools;
   for (const tool of tools) {
     expect(tool.description.includes(CREATION_GUIDANCE)).toBe(!tool.annotations.readOnlyHint);
+    expect(tool.description).toContain(USER_FACING_GUIDANCE);
   }
   expect(businessCalls.length).toBe(before);
 });
@@ -1271,7 +1296,7 @@ test("resource sharing preserves complete ACLs and uses read/write scope union f
     const { result } = await resourceCall(bearer, "share_resource", { resource_type, resource_id, target_type: "organization", target_ids: [5], confirm: true });
     expect(result.isError).not.toBe(true);
     expect(businessCalls.slice(before).map((call) => `${call.method} ${call.path}`)).toEqual([`GET ${base}/${resource_id}`, `${resource_type === "smv_model" ? "POST" : "PUT"} ${base}/${resource_id}`]);
-    expect(businessCalls.at(-1)?.body).toEqual({ sharing: [...resourceAcl, { sharing_type_to: "Organization", ids_list: [5], name: "Shared via Magileads assistant", read_permission: true, write_permission: false, delete_permission: false }] });
+    expect(businessCalls.at(-1)?.body).toEqual({ sharing: [...resourceAcl, { sharing_type_to: "Organization", ids_list: [5], name: "Shared via assistant", read_permission: true, write_permission: false, delete_permission: false }] });
     expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:read+mcp:write");
     expect(businessCalls.at(-1)?.contentType?.startsWith("multipart/form-data")).toBe(resource_type === "smv_model");
   }
@@ -1308,7 +1333,7 @@ test("SMV can revoke the last grant with an empty sharing form and no audio repl
 test("PRM sharing writes the documented explicit-contact payload without listing recipients", async () => {
   const { result } = await resourceCall(await token("mcp:write"), "share_prm_contacts", { contact_ids: [11, 12], target_type: "team", target_ids: [3], allow_write: true, confirm: true });
   expect(result.isError).not.toBe(true);
-  expect(businessCalls.at(-1)).toMatchObject({ method: "POST", path: "/prm/sharings", bearer: "Bearer exchanged-mcp:write", body: { sharing: { contact_ids: [11, 12], sharing_type_to: "Team", ids_list: [3], read_permission: true, write_permission: true, delete_permission: false, name: "Shared via Magileads assistant" } } });
+  expect(businessCalls.at(-1)).toMatchObject({ method: "POST", path: "/prm/sharings", bearer: "Bearer exchanged-mcp:write", body: { sharing: { contact_ids: [11, 12], sharing_type_to: "Team", ids_list: [3], read_permission: true, write_permission: true, delete_permission: false, name: "Shared via assistant" } } });
 });
 
 const globalCriteria = [{ field: "email", op: "contains", value: "fixture" }];
@@ -1955,6 +1980,7 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
       expect(tools.find((tool) => tool.name === name)?.description).toContain(CREATION_GUIDANCE);
     }
     expect(names).toHaveLength(29);
+    for (const tool of tools) expect(tool.description).toContain(USER_FACING_GUIDANCE);
     expect(names).toContain("run_google_maps_targeting");
     expect(names).toContain("add_contact_to_list");
     expect(names).toContain("create_email_model");

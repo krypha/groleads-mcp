@@ -1,4 +1,12 @@
-/** Shared by initialization and write-tool descriptions: clients may use either. */
+/** Repeated in initialization and tool descriptions: hosts may read either. */
+export const USER_FACING_GUIDANCE =
+  "Use neutral, reseller-compatible wording in user-facing replies. Refer to 'your account', " +
+  "'the platform' and 'the platform administrator'. Use a service/reseller brand only when explicitly " +
+  "identified by the user or the connected client's context. Never infer or introduce the underlying " +
+  "API vendor's brand from technical server names, tool identifiers, API URLs or errors, and never " +
+  "combine vendor and reseller brands. This wording rule does not alter actual account/contact data " +
+  "or a user's explicit request to discuss a named service.";
+
 export const CREATION_GUIDANCE =
   "For a user-requested creation, duplicate names/resources are acceptable for all resource types " +
   "unless the user explicitly requests uniqueness, deduplication or reuse. Do not list/search existing " +
@@ -15,6 +23,9 @@ export const ACCOUNT_SWITCHING_GUIDANCE =
   "Use list_switchable_accounts to discover authorized targets, switch_account to change account and return_to_original_account to restore it. " +
   "The account list requires mcp:read; get_active_account also works with mcp:write alone, so do not block a known authorized selection or return merely because listing is unavailable. " +
   "Use only accounts returned by the authorized list when proposing a new target. Pagination cursors are opaque internal values: preserve the search when following them and never quote cursors in user-facing replies or diagnostics. " +
+  "If the list is empty or contains only the current account, say no other authorized target was returned. " +
+  "This alone does not prove a missing delegation: domain-specific access rules or backend configuration may also limit the list. " +
+  "If help is needed, suggest asking the platform administrator to check access on the connected domain; do not promise a delegation grant will necessarily make more accounts appear. " +
   "Delegation lasts 60 minutes after each successful selection, including reselecting the same account. On delegation_expired explain the expiry and offer an explicitly confirmed reselection or return; never renew it automatically. " +
   "Switching requires explicit user authorization and confirm:true. Never switch or fall back automatically after an error. " +
   "If account_context.selection_status is unknown_after_change, the change may have committed: call get_active_account to resolve it, without repeating the switch automatically. " +
