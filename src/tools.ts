@@ -39,6 +39,8 @@ import {
   accountContextForResult, assertAccountRevision, requireAccountSession, revisionSchema, withAccountContext,
 } from "./oauth/account-context.js";
 import { registerResourceTools } from "./resource-tools.js";
+import { registerVariableTools } from "./variable-tools.js";
+import { validateReplacementProfileUpdate } from "./variable-replacements.js";
 
 const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
@@ -557,6 +559,7 @@ const PUBLIC_TOOLS = new Set([
   "list_prm_statuses", "query_prm_contacts", "get_prm_contact", "list_prm_nurturings",
   "list_copyable_resources", "copy_resources_to_user", "share_resource", "share_prm_contacts",
   "query_all_contacts", "copy_contacts_across_lists",
+  "get_variable_replacements", "set_variable_replacements",
 ]);
 
 export function isToolExposed(name: string, profile: ToolProfile): boolean {
@@ -607,7 +610,8 @@ export function preflightToolCall(name: string, args: unknown, allowedScopes?: r
       throw new Error("A concrete API path and HTTP method are required.");
     }
     const method = name === "magileads_get" ? "GET" : String(input.method);
-    const { endpoint } = resolveEndpoint(method, input.path);
+    const { endpoint, full } = resolveEndpoint(method, input.path, input.query as Raw | undefined);
+    if (endpoint.method === "PUT" && endpoint.path === "/users/me") validateReplacementProfileUpdate(full, input.body);
     if (name === "magileads_get" && endpoint.write) {
       throw new Error("This GET generates content and requires mcp:write. Use magileads_request with method:GET and confirm:true.");
     }
@@ -678,6 +682,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
     }) as McpServer["registerTool"];
 
   registerResourceTools(register, { criterionSchema, buildFilter, contactsView });
+  registerVariableTools(register);
 
   register({ scope: "mcp:read", scopeAlternatives: ["mcp:read", "mcp:write"], routes: ["(private OAuth account context)"], accountControl: true })(
     "get_active_account",
@@ -2199,6 +2204,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "execution: mcp:read operations (including POST searches/statistics) execute without confirmation. " +
         "mcp:write operations (including personalized GET generation) are DRY RUN until confirm:true. " +
         "For POST /models/email, text-only non-AI/non-editor creations get escaped HTML; explicit HTML is preserved. " +
+        "PUT /users/me accepts only datafields_replacement and no query parameters; prefer set_variable_replacements to preserve unrelated fallbacks. " +
         "DELETE, PATCH and undocumented/admin endpoints are unavailable. Discover paths with list_api_endpoints.",
       inputSchema: {
         method: z.enum(["GET", "POST", "PUT"]).describe("Actual HTTP method. Required scope is determined by the endpoint, not this method."),
@@ -2213,7 +2219,9 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       try {
         const { endpoint: ep, full } = resolveEndpoint(method, path, query as Raw | undefined);
         if (method === "GET" && body !== undefined) throw new Error("GET operations accept query parameters, not a body.");
-        const requestBody = ep.method === "POST" && ep.path === "/models/email" ? normalizeEmailCreation(body) : body;
+        const profileUpdate = ep.method === "PUT" && ep.path === "/users/me";
+        const requestBody = profileUpdate ? validateReplacementProfileUpdate(full, body)
+          : ep.method === "POST" && ep.path === "/models/email" ? normalizeEmailCreation(body) : body;
         if (ep.write && confirm !== true) {
           return ok({
             dry_run: true,
@@ -2222,7 +2230,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
             note: "Nothing was sent. Re-call with confirm:true to execute this write.",
           });
         }
-        const data = await rawRequest(method, full, requestBody);
+        const data = await rawRequest(method, full, requestBody, !profileUpdate);
         return ok({ executed: true, method, path: full, tag: ep.tag, scope: ep.scope, ...capResult(data) });
       } catch (err) {
         return fail(err);

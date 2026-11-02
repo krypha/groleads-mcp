@@ -7,7 +7,7 @@ import { ACCOUNT_SWITCHING_GUIDANCE, CREATION_GUIDANCE, USER_FACING_GUIDANCE } f
 export function buildServer(allowedScopes?: readonly Scope[], profile: ToolProfile = "full", accountSwitchingEnabled = false): McpServer {
   const server = new McpServer({
     name: "magileads-mcp",
-    version: "0.14.0",
+    version: "0.15.0",
   }, { instructions: [USER_FACING_GUIDANCE, CREATION_GUIDANCE, ...(accountSwitchingEnabled ? [ACCOUNT_SWITCHING_GUIDANCE] : [])].join(" ") });
   registerTools(server, allowedScopes, profile, accountSwitchingEnabled);
   return server;

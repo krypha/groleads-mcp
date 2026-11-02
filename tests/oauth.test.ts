@@ -49,6 +49,8 @@ let globalCursorMode: "normal" | "missing" | "wrong_path" = "normal";
 const resourceAcl = [{ sharing_type_to: "User", read_permission: true, write_permission: true, delete_permission: false, ids_list: [8, 9], name: "Existing users" },
   { sharing_type_to: "Team", read_permission: true, write_permission: false, delete_permission: false, ids_list: [3], name: "Existing team" }];
 let resourceProfileSharing: unknown = resourceAcl;
+const variablePreferences = new Map<number, unknown>();
+let variableFields: { id: number; identifier: string; name: string; identifier_placeholder?: string }[] | undefined;
 const accountContexts = new Map<string, AccountContext>();
 const delegationDeadlines = new Map<string, number>();
 let accountClock = 0; // Fake API time only; never alters HTTP/JWT timers.
@@ -268,22 +270,23 @@ const api = await start(async (req, res) => {
       ? "mcp:write" : "mcp:read";
     if (!hasExchangedScope(req, needed)) return respond(res, 401, { state_message: "insufficient_scope" });
     if (req.url === "/contact-lists/42") return respond(res, 200, { contact_list_profile: { id: 42, name: "Test list", sharing: resourceProfileSharing, permission: { is_admin: true } } });
-    if (req.url === "/data-fields") return respond(res, 200, { data_fields_list: [{ id: 1, identifier: "email", name: "Email" }] });
+    if (req.url === "/data-fields") return respond(res, 200, { data_fields_list: variableFields ?? [{ id: 1, identifier: "email", name: "Email" }] });
     if (req.url === "/contact-lists/42/contact") return respond(res, 200, { state: true, contacts_added: 1 });
     if (req.url === "/targeting/google/generate-maps-search-urls") return respond(res, 200, { google_maps_search_urls: ["https://maps.google.com/search?q=plumber"] });
     return respond(res, 200, { contact_list_id: 42 });
   }
-  if (req.url === "/users/me") {
+  if (req.url === "/users/me" && req.method === "GET") {
     apiBearers.push(req.headers.authorization || "");
     const apiKey = typeof req.headers["x-api-key"] === "string" ? req.headers["x-api-key"] : "";
     apiKeys.push(apiKey);
     if (apiKey === "key-alpha" || apiKey === "key-beta") {
-      return respond(res, 200, { user_profile: { id: apiKey === "key-alpha" ? 71 : 72, first_name: "Key", last_name: "User", subscriptions: {} } });
+      const id = apiKey === "key-alpha" ? 71 : 72;
+      return respond(res, 200, { user_profile: { id, first_name: "Key", last_name: "User", subscriptions: {}, datafields_replacement: variablePreferences.get(id) ?? null } });
     }
     if (apiMode === "unauthorized") return respond(res, 401, { state_message: "token_expired" });
-    if (delegated) return respond(res, 200, { user_profile: { ...delegated.context.active_account, subscriptions: {} } });
+    if (delegated) return respond(res, 200, { user_profile: { ...delegated.context.active_account, subscriptions: {}, datafields_replacement: variablePreferences.get(delegated.context.active_account.id) ?? null } });
     if (!hasExchangedScope(req, "mcp:read")) return respond(res, 401, {});
-    return respond(res, 200, { user_profile: { id: 7, first_name: "Test", last_name: "User", subscriptions: {} } });
+    return respond(res, 200, { user_profile: { id: 7, first_name: "Test", last_name: "User", subscriptions: {}, datafields_replacement: variablePreferences.get(7) ?? null } });
   }
   const endpoint = matchEndpoint(req.method || "GET", new URL(req.url || "/", "http://localhost").pathname);
   if (endpoint) {
@@ -302,6 +305,11 @@ const api = await start(async (req, res) => {
     if (apiMode === "forbidden") return respond(res, 403, { state_message: "unauthorized_model" });
     if (!hasExchangedScope(req, endpoint.scope)) return respond(res, 401, { state_message: "insufficient_scope" });
     const url = new URL(req.url || "/", "http://localhost");
+    if (req.method === "PUT" && url.pathname === "/users/me") {
+      if (!Array.isArray(body?.datafields_replacement) || Object.keys(body).some((key) => key !== "datafields_replacement")) return respond(res, 403, { state_message: "unauthorized_profile" });
+      variablePreferences.set(delegated?.context.active_account.id ?? 7, body.datafields_replacement);
+      return respond(res, 200, { state: true });
+    }
     if (url.pathname === "/contact-lists/contacts/search" || /^\/contact-lists\/contacts\/search\/[^/]+\/page\/\d+$/.test(url.pathname)) {
       const options = body?.options ?? JSON.parse(url.searchParams.get("options") || "null");
       if (options) {
@@ -440,14 +448,14 @@ test("switching is automatic only for private HTTP OAuth; API keys and public pr
     const before = accountControlCalls.length;
     const listed = await keyRpc(instance.origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
     const tools = (await listed.json() as { result: { tools: { name: string; inputSchema: { properties: Record<string, unknown> } }[] } }).result.tools;
-    expect(tools).toHaveLength(36);
+    expect(tools).toHaveLength(38);
     expect(tools.find((tool) => tool.name === "create_email_model")?.inputSchema.properties.account_revision).toBeDefined();
     expect(accountControlCalls.length).toBe(before);
     const standard = await rpc("tools/list", bearer);
-    expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(36);
+    expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(38);
     for (const response of [await keyRpc(instance.origin, "key-alpha", "tools/list")]) {
       const data = await response.json() as { result: { tools: { name: string }[] } };
-      expect(data.result.tools).toHaveLength(32);
+      expect(data.result.tools).toHaveLength(34);
       expect(data.result.tools.some((tool) => tool.name === "switch_account")).toBe(false);
     }
     const hidden = await keyRpc(instance.origin, "key-alpha", "tools/call", { name: "switch_account", arguments: { user_id: 42, confirm: true } });
@@ -935,9 +943,10 @@ test("the live harness never reports success with a mismatched original account"
 test("generic preflight derives all endpoint scopes and leaves write previews local", () => {
   for (const row of CALLABLE_ENDPOINTS) {
     const path = row.path.replace(/\{[^}]+\}/g, "7");
-    expect(preflightToolCall("magileads_request", { method: row.method, path }))
+    const body = row.method === "PUT" && row.path === "/users/me" ? { datafields_replacement: [] } : undefined;
+    expect(preflightToolCall("magileads_request", { method: row.method, path, body }))
       .toEqual({ scopes: [row.scope], exchange: !row.write });
-    expect(preflightToolCall("magileads_request", { method: row.method, path, confirm: true }))
+    expect(preflightToolCall("magileads_request", { method: row.method, path, body, confirm: true }))
       .toEqual({ scopes: [row.scope], exchange: true });
   }
 });
@@ -1025,7 +1034,7 @@ test("initialization and all write descriptions advertise creation without dupli
   expect(initialization.result.instructions).toContain(CREATION_GUIDANCE);
   expect(initialization.result.instructions).toContain(ACCOUNT_SWITCHING_GUIDANCE);
   expect(initialization.result.instructions).toContain(USER_FACING_GUIDANCE);
-  expect(initialization.result.serverInfo.version).toBe("0.14.0");
+  expect(initialization.result.serverInfo.version).toBe("0.15.0");
   const listed = await rpc("tools/list", caller);
   const tools = (await listed.json() as { result: { tools: {
     name: string; description: string; annotations: { readOnlyHint: boolean };
@@ -1138,7 +1147,8 @@ test("all generic write dry runs and discovery avoid exchange and business calls
   const beforeExchanges = exchanges.length;
   for (const row of CALLABLE_ENDPOINTS.filter((row) => row.write)) {
     const path = row.path.replace(/\{[^}]+\}/g, "7");
-    const response = await rpc("tools/call", caller, { name: "magileads_request", arguments: { method: row.method, path, confirm: false } });
+    const body = row.method === "PUT" && row.path === "/users/me" ? { datafields_replacement: [] } : undefined;
+    const response = await rpc("tools/call", caller, { name: "magileads_request", arguments: { method: row.method, path, body, confirm: false } });
     expect(response.status).toBe(200);
     const data = JSON.parse((await toolResult(response)).content[0].text);
     expect(data.dry_run).toBe(true);
@@ -1205,7 +1215,7 @@ test("dedicated and generic contact search both request the read scope", async (
 });
 
 test("metadata is available at both RFC and bare paths with CORS", async () => {
-  expect(toolAccessTable().size).toBe(36); // Six resource tools plus four private account-control tools.
+  expect(toolAccessTable().size).toBe(38); // Eight preference/resource tools plus four private account-control tools.
   for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
     const response = await fetch(`${mcpOrigin}${path}`);
     expect(response.status).toBe(200);
@@ -1384,12 +1394,127 @@ test("global copy verifies account/filter/count before one exact selection reque
   expect(businessCalls.slice(guardedBefore).some((call) => call.path === "/contact-lists/contacts/copy/42")).toBe(false);
 });
 
+const preferenceFields = [{ id: 1, identifier: "email", name: "Email" }, { id: 2, identifier: "civility", name: "Civilité", identifier_placeholder: "%civility%" }, { id: 3, identifier: "company", name: "Entreprise" }];
+test("variable fallback preview is local and reading works without a contact list ID", async () => {
+  variableFields = preferenceFields;
+  variablePreferences.set(7, [{ datafield_id: 3, replacement: "votre entreprise" }]);
+  try {
+    const bearer = await token("mcp:read mcp:write");
+    const before = [businessCalls.length, apiBearers.length, exchanges.length];
+    const preview = await resourceCall(bearer, "set_variable_replacements", { replacements: [{ field: "Civilité", replacement: "Mr/Mme" }] });
+    expect(preview.data.dry_run).toBe(true);
+    expect([businessCalls.length, apiBearers.length, exchanges.length]).toEqual(before);
+    const read = await resourceCall(await token("mcp:read"), "get_variable_replacements", { search: "civilite" });
+    expect(read.result.isError).not.toBe(true);
+    expect(read.data).toMatchObject({ account_id: 7, configured_replacements: 1, total_fields: 1,
+      fields: [{ datafield_id: 2, identifier: "civility", placeholder: "%civility%", replacement: null }] });
+    variablePreferences.set(7, [{ datafield_id: 2, replacement: "long".repeat(1000) }]);
+    const large = await resourceCall(bearer, "get_variable_replacements", { search: "Civilité" });
+    expect(large.data.fields[0].replacement_truncated).toBe(true);
+    expect(large.data.fields[0].replacement).toBeUndefined();
+    expect(large.data.fields[0].replacement_preview).toHaveLength(512);
+  } finally { variableFields = undefined; variablePreferences.clear(); }
+});
+test("confirmed fallback updates preserve unrelated settings and use only profile/data-field routes with both scopes", async () => {
+  variableFields = preferenceFields;
+  variablePreferences.set(7, [{ datafield_id: 3, replacement: "votre entreprise" }]);
+  const bearer = await token("mcp:read mcp:write");
+  try {
+    const before = businessCalls.length;
+    const updated = await resourceCall(bearer, "set_variable_replacements", { replacements: [{ field: "Civilité", replacement: "Mr/Mme" }], confirm: true });
+    expect(updated.result.isError).not.toBe(true);
+    expect(updated.data).toMatchObject({ executed: true, account_id: 7, configured_replacements: 2 });
+    expect(businessCalls.slice(before).map((call) => `${call.method} ${call.path}`)).toEqual(["GET /data-fields", "PUT /users/me"]);
+    expect(businessCalls.at(-1)).toMatchObject({ bearer: "Bearer exchanged-mcp:read+mcp:write", body: { datafields_replacement: [
+      { datafield_id: 3, replacement: "votre entreprise" }, { datafield_id: 2, replacement: "Mr/Mme" }] } });
+    const reread = await resourceCall(bearer, "get_variable_replacements", { search: "civility" });
+    expect(reread.data.fields[0].replacement).toBe("Mr/Mme");
+    const writes = businessCalls.filter((call) => call.method === "PUT").length;
+    expect((await resourceCall(bearer, "set_variable_replacements", { replacements: [{ field: "%civility%", replacement: "Mr/Mme" }], confirm: true })).data.unchanged).toBe(true);
+    expect(businessCalls.filter((call) => call.method === "PUT").length).toBe(writes);
+    const cleared = await resourceCall(bearer, "set_variable_replacements", { replacements: [{ field: "2", replacement: "" }], confirm: true });
+    expect(cleared.data.executed).toBe(true);
+    expect(variablePreferences.get(7)).toEqual([{ datafield_id: 3, replacement: "votre entreprise" }]);
+    await resourceCall(bearer, "set_variable_replacements", { replacements: [{ field: "3", replacement: "" }], confirm: true });
+    expect(variablePreferences.get(7)).toEqual([]);
+  } finally { variableFields = undefined; variablePreferences.clear(); }
+});
+test("generic profile writes reject extra body/query settings before exchange, including API-key mode", async () => {
+  const bearer = await token("mcp:write");
+  const before = [businessCalls.length, apiBearers.length, exchanges.length];
+  for (const args of [
+    { body: { datafields_replacement: [], email: "other@example.invalid" } }, { body: { language: "ENG" } },
+    { body: { datafields_replacement: [] }, query: { password: "test" } },
+    { path: "/users/me?email=other", body: { datafields_replacement: [] } },
+  ]) {
+    const result = await resourceCall(bearer, "magileads_request", { method: "PUT", path: "/users/me", confirm: true, ...args });
+    expect(result.result.isError).toBe(true);
+  }
+  expect([businessCalls.length, apiBearers.length, exchanges.length]).toEqual(before);
+  const instance = await ephemeralMcp("api_key", true);
+  try {
+    const result = await toolResult(await keyRpc(instance.origin, "key-alpha", "tools/call", { name: "magileads_request", arguments: { method: "PUT", path: "/users/me", body: { datafields_replacement: [], email: "other" }, confirm: true } }));
+    expect(result.isError).toBe(true);
+    expect(businessCalls.length).toBe(before[0]);
+  } finally { await closeTestServer(instance.server); }
+});
+test("generic fallback update accepts explicit replacement arrays with write-only scope and local preview", async () => {
+  try {
+    const bearer = await token("mcp:write");
+    const args = { method: "PUT", path: "/users/me", body: { datafields_replacement: [{ datafield_id: 2, replacement: "Mr/Mme" }] } };
+    const before = businessCalls.length;
+    expect((await resourceCall(bearer, "magileads_request", args)).data.dry_run).toBe(true);
+    expect(businessCalls.length).toBe(before);
+    expect((await resourceCall(bearer, "magileads_request", { ...args, confirm: true })).result.isError).not.toBe(true);
+    expect(businessCalls.at(-1)?.bearer).toBe("Bearer exchanged-mcp:write");
+    expect(variablePreferences.get(7)).toEqual(args.body.datafields_replacement);
+  } finally { variablePreferences.clear(); }
+});
+test("fallback errors never fall back to bulk contact writes, including backend permission refusals", async () => {
+  variableFields = preferenceFields;
+  const bearer = await token("mcp:read mcp:write");
+  try {
+    for (const replacements of [[{ field: "missing", replacement: "x" }], [{ field: "2", replacement: "x" }, { field: "civility", replacement: "y" }]]) {
+      const before = businessCalls.length;
+      expect((await resourceCall(bearer, "set_variable_replacements", { replacements, confirm: true })).result.isError).toBe(true);
+      expect(businessCalls.slice(before).every((call) => call.method === "GET")).toBe(true);
+    }
+    apiMode = "forbidden";
+    const before = businessCalls.length;
+    const refused = await resourceCall(bearer, "set_variable_replacements", { replacements: [{ field: "2", replacement: "x" }], confirm: true });
+    expect(refused.result.isError).toBe(true);
+    expect(businessCalls.slice(before).filter((call) => call.method === "PUT")).toHaveLength(1);
+    expect(businessCalls.slice(before).some((call) => /contact-lists/.test(call.path))).toBe(false);
+  } finally { variableFields = undefined; variablePreferences.clear(); apiMode = "normal"; }
+});
+test("fallback writes remain bound to the selected account and reject stale revisions", async () => {
+  variableFields = preferenceFields;
+  const bearer = await grantToken();
+  try {
+    const original = await activeContext(mcpOrigin, bearer);
+    const selected = await toolResult(await accountRpc(mcpOrigin, bearer, "switch_account", { user_id: 42, confirm: true, account_revision: original.revision }));
+    const context = JSON.parse(selected.content[0].text).account_context;
+    const args = { replacements: [{ field: "2", replacement: "Mr/Mme" }], confirm: true };
+    const before = businessCalls.length;
+    const stale = await toolResult(await accountRpc(mcpOrigin, bearer, "set_variable_replacements", { ...args, account_revision: original.revision }));
+    expect(stale.isError).toBe(true);
+    expect(businessCalls.length).toBe(before);
+    const accepted = await toolResult(await accountRpc(mcpOrigin, bearer, "set_variable_replacements", { ...args, account_revision: context.revision }));
+    expect(accepted.isError).not.toBe(true);
+    expect(variablePreferences.get(42)).toEqual([{ datafield_id: 2, replacement: "Mr/Mme" }]);
+    expect(variablePreferences.has(7)).toBe(false);
+    expect(JSON.parse(accepted.content[0].text).account_context.active_account.id).toBe(42);
+  } finally { variableFields = undefined; variablePreferences.clear(); }
+});
+
 test("tool declarations compute route-scope unions for composite tools", () => {
   const table = toolAccessTable();
   expect(scopesForTool(table.get("add_contact_to_list")!)).toEqual(["mcp:read", "mcp:write"]);
   expect(scopesForTool(table.get("run_google_maps_targeting")!)).toEqual(["mcp:read", "mcp:write"]);
   expect(scopesForTool(table.get("extract_maps_search")!)).toEqual(["mcp:write"]);
   expect(scopesForTool(table.get("search_contacts")!)).toEqual(["mcp:read"]);
+  expect(scopesForTool(table.get("get_variable_replacements")!)).toEqual(["mcp:read"]);
+  expect(scopesForTool(table.get("set_variable_replacements")!)).toEqual(["mcp:read", "mcp:write"]);
   for (const name of ["share_resource", "copy_contacts_across_lists"]) expect(scopesForTool(table.get(name)!)).toEqual(["mcp:read", "mcp:write"]);
   for (const name of ["copy_resources_to_user", "share_prm_contacts"]) expect(scopesForTool(table.get(name)!)).toEqual(["mcp:write"]);
   for (const name of ["list_copyable_resources", "query_all_contacts"]) expect(scopesForTool(table.get(name)!)).toEqual(["mcp:read"]);
@@ -1405,13 +1530,13 @@ test("public plugin tool annotations match private-account and open-world behavi
     } }[] };
   };
   const tools = payload.result.tools;
-  expect(tools).toHaveLength(36);
+  expect(tools).toHaveLength(38);
   const openWorld = new Set([
     "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting", "magileads_request",
     "get_active_account", "list_switchable_accounts", "switch_account", "return_to_original_account",
     "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists",
   ]);
-  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model", "switch_account", "return_to_original_account", "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists"]);
+  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model", "switch_account", "return_to_original_account", "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists", "set_variable_replacements"]);
   for (const tool of tools) {
     expect(tool.annotations.openWorldHint).toBe(openWorld.has(tool.name));
     expect(tool.annotations.readOnlyHint).toBe(!writes.has(tool.name));
@@ -1979,11 +2104,13 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     for (const name of ["create_email_model", "add_contact_to_list", "extract_maps_search", "run_google_maps_targeting"]) {
       expect(tools.find((tool) => tool.name === name)?.description).toContain(CREATION_GUIDANCE);
     }
-    expect(names).toHaveLength(29);
+    expect(names).toHaveLength(31);
     for (const tool of tools) expect(tool.description).toContain(USER_FACING_GUIDANCE);
     expect(names).toContain("run_google_maps_targeting");
     expect(names).toContain("add_contact_to_list");
     expect(names).toContain("create_email_model");
+    expect(names).toContain("get_variable_replacements");
+    expect(names).toContain("set_variable_replacements");
     for (const name of ["list_copyable_resources", "copy_resources_to_user", "share_resource", "share_prm_contacts", "query_all_contacts", "copy_contacts_across_lists"]) expect(names).toContain(name);
     const beforeModelPreview = businessCalls.length;
     const preview = await keyRpc(origin, undefined, "tools/call", { name: "create_email_model",
@@ -2008,7 +2135,7 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     expect(hiddenResult.error !== undefined || hiddenResult.result?.isError === true).toBe(true);
     expect(exchanges.length).toBe(beforeExchanges);
     const keyListed = await keyRpc(origin, "key-alpha", "tools/list");
-    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(29);
+    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(31);
   } finally {
     await close(server);
   }
@@ -2076,7 +2203,7 @@ test("custom reseller hosts work with API keys in api_key and both modes without
         expect((await initialized.json() as { result: { serverInfo: { name: string } } }).result.serverInfo.name).toBe("magileads-mcp");
         const listed = await keyRpc(origin, "key-alpha", "tools/list", undefined, { Host: host });
         expect(listed.status).toBe(200);
-        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(32);
+        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(34);
         // The hostname is an alias, not an account selector: two keys keep their identities on either host.
         for (const [key, id] of [["key-alpha", 71], ["key-beta", 72]] as const) {
           const result = await keyRpc(origin, key, "tools/call", { name: "get_account_overview", arguments: {} }, { Host: host });

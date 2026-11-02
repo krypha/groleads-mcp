@@ -8,10 +8,10 @@ const documented = [...document.matchAll(/^\| (GET|POST|PUT) \| `([^`]+)` \| `(m
 const shape = (method: string, path: string) => `${method} ${path.replace(/\{[^}]+\}/g, "{}")}`;
 const concrete = (path: string) => path.replace(/\{[^}]+\}/g, "7");
 
-test("catalogue exactly equals all 249 documented method/path/scope pairs", () => {
-  expect(documented).toHaveLength(249);
+test("catalogue exactly equals all 250 documented method/path/scope pairs", () => {
+  expect(documented).toHaveLength(250);
   expect(CALLABLE_ENDPOINTS).toHaveLength(documented.length);
-  expect(new Set(CALLABLE_ENDPOINTS.map((row) => shape(row.method, row.path))).size).toBe(249);
+  expect(new Set(CALLABLE_ENDPOINTS.map((row) => shape(row.method, row.path))).size).toBe(250);
   for (const expected of documented) {
     const actual = matchEndpoint(expected.method, concrete(expected.path));
     expect(actual?.scope).toBe(expected.scope);

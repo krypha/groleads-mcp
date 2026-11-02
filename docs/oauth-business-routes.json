@@ -247,5 +247,6 @@
   {"method":"POST","path":"/targeting/linkedin/refresh/{contact_list_id}","scope":"mcp:write","tag":"Targeting, enrichment and statistics","summary":"Targeting::refreshLinkedinTargetingContactList"},
   {"method":"POST","path":"/targeting/linkedin/{contact_list_id}/relaunch-errors","scope":"mcp:write","tag":"Targeting, enrichment and statistics","summary":"Targeting::relaunchLinkedinExtractions"},
   {"method":"GET","path":"/integrations/linkedin","scope":"mcp:read","tag":"Existing account and integration access","summary":"User-scoped integration listing"},
-  {"method":"GET","path":"/users/me","scope":"mcp:read","tag":"Existing account and integration access","summary":"Authenticated user profile"}
+  {"method":"GET","path":"/users/me","scope":"mcp:read","tag":"Existing account and integration access","summary":"Authenticated user profile"},
+  {"method":"PUT","path":"/users/me","scope":"mcp:write","tag":"Account variable fallbacks","summary":"Set account variable replacements / default fallback values only"}
 ]

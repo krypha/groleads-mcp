@@ -38,7 +38,8 @@ const list = contract.map((row) => {
   if (!["GET", "POST", "PUT"].includes(row.method) || !["mcp:read", "mcp:write"].includes(row.scope) ||
       !row.path.startsWith("/") || seen.has(key)) throw new Error("Invalid or duplicate contract operation: " + key);
   seen.add(key);
-  const info = descriptions.get(key);
+  // Preserve the narrow profile permission and variable/fallback discovery terms.
+  const info = row.method === "PUT" && row.path === "/users/me" ? row : descriptions.get(key);
   return { method: row.method, path: row.path, tag: info?.tag || row.tag,
     summary: (info?.summary || row.summary).slice(0, 140), scope: row.scope, write: row.scope === "mcp:write" };
 });

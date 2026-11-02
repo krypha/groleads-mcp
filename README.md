@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that exposes
 **Magileads** as tools for AI agents — Google Maps targeting, contact lists, campaign
-audit, PRM (pipeline), email templates, data queries, and 249 explicitly authorized
+audit, PRM (pipeline), email templates, data queries, and 250 explicitly authorized
 Magileads business API operations. Administrative/secret endpoints, DELETE and PATCH
 are not exposed.
 
@@ -20,6 +20,7 @@ transport uses Magileads environment credentials.
 
 - [Tools](#tools)
 - [Copying and sharing](#copying-sharing-and-account-wide-contact-filters)
+- [Variable fallback values](#account-variable-fallback-values)
 - [How targeting works](#how-targeting-works)
 - [Transports](#transports)
 - [Private OAuth account switching](#oauth-account-switching-private-integrations)
@@ -55,6 +56,8 @@ authorized target, without asserting that missing delegation is the sole cause.
 | `list_contact_fields` | `contact_list_id` | `{ fields[] }` — each `{ data_field_id, identifier, label, type }` |
 | `add_contact_to_list` | `contact_list_id`, `properties:[{field,value}]`, `confirm?` | imports one contact — **dry-run until `confirm:true`** |
 | `create_email_model` | `name`, `subject`, `text?`, `html?`, `folder_id?`, `tags_ids?`, `confirm?` | saves a template without sending — **local dry-run until `confirm:true`** |
+| `get_variable_replacements` | `search?`, `page?`, `per_page?` (1–50) | account fallback values, field labels/identifiers/placeholders; no list ID needed |
+| `set_variable_replacements` | `replacements:[{field,replacement}]` (1–50), `confirm?` | merges selected fallbacks into the active account preferences; **local dry-run until `confirm:true`** |
 | `list_copyable_resources` | `resource_type`, `search?`, `page?`, `per_page?` | compact IDs/names, complete-list filtering and paging |
 | `copy_resources_to_user` | `resource_type`, `resource_ids` (1–50), `target_user_id`, `with_models?`, `confirm?` | sequential copies; reports accepted, uncertain and unattempted IDs |
 | `share_resource` | `resource_type`, `resource_id`, `target_type`, `target_ids`, `action?`, `allow_write?`, `allow_delete?`, `confirm?` | grants/revokes explicit access while preserving other sharing rules |
@@ -83,8 +86,9 @@ authorized target, without asserting that missing delegation is the sole cause.
 ## Copying, sharing and account-wide contact filters
 
 Version 0.14.0 adds six dedicated tools, available in both `full` and `public` profiles.
-All use the existing **249-route OAuth contract**; no administrative routes or new
-permissions have been opened. Mutations return a local preview until `confirm:true`.
+All reuse the authorized business routes. Version 0.15.0 separately adds one
+field-restricted profile operation, bringing the contract to **250 operations**.
+Mutations return a local preview until `confirm:true`.
 Private HTTP OAuth additionally requires the current `account_revision`, as for other writes.
 
 Use `list_copyable_resources` to choose IDs, then `copy_resources_to_user` to copy
@@ -136,6 +140,51 @@ Global copying is asynchronous: use the returned `next_check` to poll the destin
 Copy job until `Completed`. The recipe reports pending work with exit code 2 and does
 not repeat the copy. Set `MAGILEADS_TEST_VERIFY_DESTINATION_ID` to an existing QA
 destination to verify it later in read-only mode.
+
+## Account variable fallback values
+
+Version 0.15.0 adds `get_variable_replacements` and `set_variable_replacements`
+to both private and public tool profiles. These configure the account's variable
+fallbacks used when a contact value is absent. They do not fill contact properties,
+alter field definitions, or send messages.
+
+Example: call `get_variable_replacements` with `{"search":"Civilité"}`, then:
+
+```json
+{
+  "replacements": [{"field":"Civilité","replacement":"Mr/Mme"}],
+  "confirm": true
+}
+```
+
+Use this with `set_variable_replacements`; add the current `account_revision` for
+private HTTP OAuth confirmed writes. Fields resolve by unambiguous label (case/
+accent insensitive), identifier (`civility`), exact placeholder (`%civility%`) or
+numeric ID as a string. An empty replacement removes only that field's fallback.
+Unknown/ambiguous fields and duplicate resolved IDs are refused.
+
+The API setting is **`user_profile.datafields_replacement`**, updated through
+`PUT /users/me`. It is a complete configuration: the tool reads and preserves
+unrelated saved replacements before merging selected changes. `[]` clears the
+configuration under the November API contract. If a remaining saved field is no
+longer readable, the tool refuses the write rather than silently deleting it;
+an explicitly named stale ID can be cleared. Identical updates send no PUT.
+The merged JSON must fit the API's **65535-byte UTF-8 limit**. Reads are paged;
+long replacement values have an explicit preview flag, while writes always use
+the complete saved configuration. Concurrent edits are not locked atomically.
+
+Both tools require `mcp:read`; the setter additionally requests `mcp:write` in its
+Token Exchange. The generic passthrough also exposes `PUT /users/me`, but accepts
+**only** `{datafields_replacement:[{datafield_id,replacement}]}` and no query
+parameters, on all authentication modes. Other profile settings remain unavailable.
+Generic writes replace the whole array, so prefer the dedicated setter to merge
+selected changes. No uncertain update is automatically retried.
+
+Live recipe: securely configure stdio credentials and
+`MAGILEADS_TEST_EXPECTED_USER_ID`, then run
+`bun run scripts/check-variable-replacements.ts`. Read-only by default;
+`--allow-update` opts into temporary demo-account updates followed by exact
+restoration. It tests the local stdio MCP and real API, not deployed HTTP OAuth.
 
 ## How targeting works
 
@@ -276,7 +325,7 @@ exclusions, LinkedIn sends, imports, or deletes.
 ## Generic API access (everything else)
 
 The dedicated tools above cover the common workflows. For anything else, three **generic
-passthrough** tools reach only the 249 method/path pairs in the backend's OAuth
+passthrough** tools reach only the 250 method/path pairs in the backend's OAuth
 business contract, including registered pagination variants. The generated index is
 committed in [`src/endpoints.generated.ts`](src/endpoints.generated.ts); authorization
 comes from [`docs/oauth-business-routes.json`](docs/oauth-business-routes.json), not
@@ -437,8 +486,8 @@ permission checks, error codes, and acceptance tests. It follows the backend's
 
 Account switching is **automatic** for HTTP OAuth (`oauth` or `both`) with
 `MCP_TOOL_PROFILE=full`. There is no activation variable and no new secret.
-OAuth clients get up to 36 tools, filtered by their scopes; API-key clients and
-stdio retain 32, and the public profile retains 29. No switch capability is added
+OAuth clients get up to 38 tools, filtered by their scopes; API-key clients and
+stdio retain 34, and the public profile retains 31. No switch capability is added
 to those other modes. Existing OAuth authorizations remain usable without a
 new consent page or a forced reconnection. `get_active_account` accepts
 `mcp:read` **or** `mcp:write`; listing accounts requires read, while selection and
@@ -494,7 +543,7 @@ refuse to start unless all five required OAuth settings are present.
 | --- | --- |
 | `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
-| `MCP_TOOL_PROFILE` | `full` (default: 36 tools for OAuth, 32 for API keys) or `public` (29 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
+| `MCP_TOOL_PROFILE` | `full` (default: 38 tools for OAuth, 34 for API keys) or `public` (31 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
 | `OAUTH_MCP_RESOURCE` | Required for OAuth modes; primary resource URL, e.g. `https://mcp.magileads.io/mcp`. Actual OAuth host authorization comes from private resource discovery, with no local fallback. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
@@ -809,9 +858,9 @@ developer mode, then submitted as a remote MCP-only plugin to the public
 directory. See the [ChatGPT deployment and submission guide](docs/chatgpt-publication.md)
 for the OAuth smoke test, public-domain verification (`OPENAI_APPS_CHALLENGE_TOKEN`),
 review materials, and test cases. Set `MCP_TOOL_PROFILE=public` for submission:
-it exposes the 29 dedicated business tools while hiding the three generic API
+it exposes the 31 dedicated business tools while hiding the three generic API
 passthrough and four account-control tools. The default `full` profile exposes
-up to 36 tools for private HTTP OAuth integrations, or 32 for API-key/stdio clients.
+up to 38 tools for private HTTP OAuth integrations, or 34 for API-key/stdio clients.
 Connecting privately does not publish the plugin.
 
 ## Connect to a Hermes Agent
@@ -831,7 +880,9 @@ explicit `MCP_ALLOW_API_KEY_QUERY=true` opt-in described above.
 src/
 ├── magileads.ts             Self-contained Magileads client (dual auth + JWT refresh + API calls)
 ├── tools.ts                 Central registration, scopes, account context and core tools
-├── resource-tools.ts        6 copy/sharing/global contact tools (32 business tools in total)
+├── resource-tools.ts        6 copy/sharing/global contact tools
+├── variable-tools.ts        Account variable fallback tools (34 business tools in total)
+├── variable-replacements.ts Pure validation, field resolution and preserving merges
 ├── resource-operations.ts   Pure resource definitions, ACL merging and preview fingerprints
 ├── endpoints.ts             Exact route resolution and explicit scopes
 ├── endpoints.generated.ts   Authorized OAuth business operations (generated)
@@ -841,7 +892,7 @@ src/
 ├── http-config.ts          HTTP authentication mode and key-in-URL opt-in
 ├── log.ts                  Credential-redacting stderr logger
 └── http.ts                  OAuth/API-key Streamable HTTP + /health
-docs/oauth-business-routes.json  Explicit backend authorization matrix (249 operations)
+docs/oauth-business-routes.json  Explicit backend authorization matrix (250 operations)
 scripts/generate-endpoints.mjs  Generates from the matrix; Swagger supplies descriptions only
 scripts/tool-table.ts         Prints the declared tool/route/scope table
 tests/oauth.test.ts           Isolated OAuth and fake-API smoke tests

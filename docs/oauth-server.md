@@ -354,3 +354,23 @@ Required MCP tests cover the two original POST read mismatches, every additional
 Review the changes as four business batches: message models; lists/contacts/fields; PRM/campaigns; targeting/enrichment/statistics. Each batch includes the corresponding matrix rows, scope assertions and business permission regression cases. Keep each MR below 2,000 changed lines. The matrix assertions and OAuth fixtures are shared validation prerequisites.
 
 After the API and MCP changes are available in a validation environment, connect using the OAuth client's published identity and verify consent, an authenticated read, model creation/update, the same search through dedicated and generic tools, and a confirmed real action with controlled test data. Check wrong-scope, foreign-resource and excluded-operation refusals. Keep production deployment separate from local verification. This extension requires no schema change, migration or SQL command.
+
+## November 2026 addendum: account variable fallbacks
+
+The current API Swagger explicitly authorizes this additional operation, bringing
+the contract to **250 operations**. This is a field-restricted business preference,
+not a general account/profile administration permission.
+Source checked on 2026-11-02: `https://api.magileads.net/swagger.json`,
+`paths./users/me.put.description` and `UserUpdate.datafields_replacement`.
+
+| Method | Path | Scope | Restrictions |
+| --- | --- | --- | --- |
+| PUT | `/users/me` | `mcp:write` | Only `datafields_replacement`; any other profile parameter is refused before updates. |
+
+`datafields_replacement` is the complete array of `{datafield_id,replacement}`.
+Omission/null preserves the configuration; `[]` clears it. Changed configurations
+require all referenced fields to remain readable. JSON configuration size is at
+most 65535 bytes. The MCP is stricter for generic writes: an explicit valid array
+is required, extra body fields and all query parameters are refused. Dedicated
+tools merge selected changes while preserving unrelated replacements, require
+the read/write scope union and do not modify any contact data.
