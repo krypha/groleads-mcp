@@ -16,7 +16,9 @@ décrivent la soumission « With MCP ».
    dédiés restent accessibles, les trois outils génériques
    (`list_api_endpoints`, `magileads_get`, `magileads_request`) sont masqués.
    Le profil par défaut `full` expose 35 outils métier, plus 4 outils de compte
-   en HTTP OAuth privé (39 au total). Sur une même URL, ce profil s'applique à tous les clients HTTP.
+   en HTTP OAuth privé (39 au total). Les connexions par clé API ont quatre outils
+   de signatures et accèdent à 39 outils dans `full` ou 36 dans `public`.
+   Sur une même URL, ce profil s'applique à tous les clients HTTP.
    Garder
    `MCP_ALLOW_API_KEY_QUERY=false` pour éviter les clés dans les URL et les logs.
 2. Vérifier `https://mcp.magileads.io/health` puis lancer le préflight public :

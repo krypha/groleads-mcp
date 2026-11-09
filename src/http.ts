@@ -209,6 +209,9 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, co
     result: withAccountContext({ isError: true, content: [{ type: "text" as const,
       text: error instanceof Error ? error.message : "Invalid operation." }] }, accountSession?.context),
   });
+  if (access?.nonOAuth && credential.kind === "oauth") {
+    return toolError(new Error("This tool requires an API-key connection or local stdio credentials. Its API routes are outside the OAuth business contract."));
+  }
   if (access && switchingEnabled && credential.kind === "oauth" && resource) {
     try { accountSession = await loadAccountSession(credential.bearer, resource.resource); }
     catch (error) {

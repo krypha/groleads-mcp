@@ -41,6 +41,7 @@ const exchanges: {
 const apiBearers: string[] = [];
 const apiKeys: string[] = [];
 const businessCalls: { method: string; path: string; bearer: string; body?: unknown; contentType?: string }[] = [];
+const emailSignatureCalls: { method: string; path: string; key: string; body?: unknown }[] = [];
 let resourceCopyFailureId: number | undefined;
 let resourceCopyFailureStatus = 403;
 let bulkImportUnavailable = false;
@@ -289,6 +290,22 @@ const api = await start(async (req, res) => {
     if (!hasExchangedScope(req, "mcp:read")) return respond(res, 401, {});
     return respond(res, 200, { user_profile: { id: 7, first_name: "Test", last_name: "User", subscriptions: {}, datafields_replacement: variablePreferences.get(7) ?? null } });
   }
+  if (req.url === "/email-signatures" || req.url === "/email-signatures/42") {
+    const key = String(req.headers["x-api-key"] ?? "");
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+    emailSignatureCalls.push({ method: req.method || "", path: req.url, key, body });
+    if (key !== "key-alpha") return respond(res, 401, { state_message: "unauthorized" });
+    const signature = { id: 42, name: "Sales", text: "Sam", html: "<strong>Sam</strong>", from_sharing: false, write_permission: true };
+    if (req.method === "GET") {
+      return respond(res, 200, req.url === "/email-signatures"
+        ? { email_signatures_list: [signature] }
+        : { email_signature_profile: signature });
+    }
+    if (req.method === "POST") return respond(res, 201, { state: true, email_signature_id: 42 });
+    return respond(res, 200, { state: true });
+  }
   const endpoint = matchEndpoint(req.method || "GET", new URL(req.url || "/", "http://localhost").pathname);
   if (endpoint) {
     const chunks: Buffer[] = [];
@@ -469,7 +486,7 @@ test("switching is automatic only for private HTTP OAuth; API keys and public pr
     expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(39);
     for (const response of [await keyRpc(instance.origin, "key-alpha", "tools/list")]) {
       const data = await response.json() as { result: { tools: { name: string }[] } };
-      expect(data.result.tools).toHaveLength(35);
+      expect(data.result.tools).toHaveLength(39);
       expect(data.result.tools.some((tool) => tool.name === "switch_account")).toBe(false);
     }
     const hidden = await keyRpc(instance.origin, "key-alpha", "tools/call", { name: "switch_account", arguments: { user_id: 42, confirm: true } });
@@ -1229,7 +1246,7 @@ test("dedicated and generic contact search both request the read scope", async (
 });
 
 test("metadata is available at both RFC and bare paths with CORS", async () => {
-  expect(toolAccessTable().size).toBe(39);
+  expect(toolAccessTable().size).toBe(43);
   for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
     const response = await fetch(`${mcpOrigin}${path}`);
     expect(response.status).toBe(200);
@@ -2160,6 +2177,51 @@ async function ephemeralMcp(mode: "api_key" | "both", withoutOAuth = false, allo
   }
 }
 
+test("signature tools use the caller API key and send only confirmed changes", async () => {
+  const instance = await ephemeralMcp("api_key", true);
+  try {
+    async function call(name: string, args: Record<string, unknown> = {}) {
+      const response = await keyRpc(instance.origin, "key-alpha", "tools/call", { name, arguments: args });
+      const result = await toolResult(response);
+      expect(result.isError).not.toBe(true);
+      return JSON.parse(result.content[0].text);
+    }
+    const before = emailSignatureCalls.length;
+    expect(await call("list_email_signatures", { search: "sales" })).toMatchObject({ signatures: [{ id: 42, name: "Sales" }], total: 1 });
+    expect(await call("get_email_signature", { email_signature_id: 42 })).toMatchObject({ result: { text: "Sam", html: "<strong>Sam</strong>" } });
+    const create = { name: "Support", text: "Sam & Alex" };
+    const update = { email_signature_id: 42, name: "Updated support" };
+    expect(await call("create_email_signature", create)).toMatchObject({ dry_run: true });
+    expect(await call("update_email_signature", update)).toMatchObject({ dry_run: true });
+    expect(emailSignatureCalls.slice(before).map((request) => request.method)).toEqual(["GET", "GET"]);
+    expect(await call("create_email_signature", { ...create, confirm: true })).toMatchObject({ executed: true, email_signature_id: 42 });
+    expect(await call("update_email_signature", { ...update, confirm: true })).toMatchObject({ updated_fields: ["name"] });
+    expect(emailSignatureCalls.slice(-2)).toEqual([
+      { method: "POST", path: "/email-signatures", key: "key-alpha", body: { ...create, html: "<p>Sam &amp; Alex</p>" } },
+      { method: "PUT", path: "/email-signatures/42", key: "key-alpha", body: { name: "Updated support" } },
+    ]);
+  } finally { await closeTestServer(instance.server); }
+});
+
+test("signature tools and generic signature routes are closed to OAuth callers", async () => {
+  const bearer = await token("mcp:read mcp:write");
+  const listed = await rpc("tools/list", bearer);
+  const payload = await listed.json() as { result: { tools: { name: string }[] } };
+  expect(payload.result.tools.some((tool) => tool.name.includes("email_signature"))).toBe(false);
+  const before = emailSignatureCalls.length;
+  const beforeExchanges = exchanges.length;
+  const beforeContext = accountControlCalls.length;
+  const direct = await rpc("tools/call", bearer, { name: "create_email_signature", arguments: { name: "Support", text: "Sam", confirm: true } });
+  const result = await toolResult(direct);
+  expect(result.isError).toBe(true);
+  expect(result.content[0].text).toContain("outside the OAuth business contract");
+  expect(accountControlCalls.length).toBe(beforeContext);
+  const generic = await rpc("tools/call", bearer, { name: "magileads_get", arguments: { path: "/email-signatures" } });
+  expect((await toolResult(generic)).isError).toBe(true);
+  expect(emailSignatureCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+});
+
 test("public profile keeps dedicated tools but hides the generic passthrough", async () => {
   expect(isToolExposed("future_unreviewed_tool", "public")).toBe(false);
   expect(isToolExposed("future_unreviewed_tool", "full")).toBe(true);
@@ -2205,7 +2267,7 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     expect(hiddenResult.error !== undefined || hiddenResult.result?.isError === true).toBe(true);
     expect(exchanges.length).toBe(beforeExchanges);
     const keyListed = await keyRpc(origin, "key-alpha", "tools/list");
-    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(32);
+    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(36);
   } finally {
     await close(server);
   }
@@ -2273,7 +2335,7 @@ test("custom reseller hosts work with API keys in api_key and both modes without
         expect((await initialized.json() as { result: { serverInfo: { name: string } } }).result.serverInfo.name).toBe("magileads-mcp");
         const listed = await keyRpc(origin, "key-alpha", "tools/list", undefined, { Host: host });
         expect(listed.status).toBe(200);
-        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(35);
+        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(39);
         // The hostname is an alias, not an account selector: two keys keep their identities on either host.
         for (const [key, id] of [["key-alpha", 71], ["key-beta", 72]] as const) {
           const result = await keyRpc(origin, key, "tools/call", { name: "get_account_overview", arguments: {} }, { Host: host });

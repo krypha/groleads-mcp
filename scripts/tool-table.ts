@@ -2,6 +2,10 @@ import { scopeForRoute, scopesForTool, toolAccessTable } from "../src/tools.js";
 
 process.stdout.write("| tool | route (API scope) | exchange scopes |\n| --- | --- | --- |\n");
 for (const [tool, access] of toolAccessTable()) {
+  if (access.nonOAuth) {
+    process.stdout.write(`| ${tool} | ${access.routes.join("<br>")} | API key or stdio credentials |\n`);
+    continue;
+  }
   if (access.accountControl) {
     process.stdout.write(`| ${tool} (private HTTP OAuth only) | Private control plane: docs/account-switching-api-contract.md | No business token exchange; caller requires ${access.scopeAlternatives?.join(" OR ") ?? access.scope} |\n`);
     continue;

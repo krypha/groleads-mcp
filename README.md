@@ -57,6 +57,10 @@ authorized target, without asserting that missing delegation is the sole cause.
 | `add_contact_to_list` | `contact_list_id`, `properties:[{field,value}]`, `confirm?` | imports one contact — **dry-run until `confirm:true`** |
 | `import_contacts_to_list` | `contact_list_id`, `contacts:[{email,first_name,…}]` (1–500), `confirm?` | imports a JSON batch in one upload — **dry-run until `confirm:true`** |
 | `create_email_model` | `name`, `subject`, `text?`, `html?`, `folder_id?`, `tags_ids?`, `confirm?` | saves a template without sending — **local dry-run until `confirm:true`** |
+| `list_email_signatures` | `search?`, `page?`, `per_page?` | accessible signature names and IDs (API key or stdio) |
+| `get_email_signature` | `email_signature_id` | signature text, HTML and editor design (API key or stdio) |
+| `create_email_signature` | `name`, `text?`, `html?`, `json_template?`, `is_template?`, `confirm?` | saves a signature after confirmation (API key or stdio) |
+| `update_email_signature` | `email_signature_id`, fields to change, `confirm?` | applies a partial update after confirmation (API key or stdio) |
 | `get_variable_replacements` | `search?`, `page?`, `per_page?` (1–50) | account fallback values, field labels/identifiers/placeholders; no list ID needed |
 | `set_variable_replacements` | `replacements:[{field,replacement}]` (1–50), `confirm?` | merges selected fallbacks into the active account preferences; **local dry-run until `confirm:true`** |
 | `list_copyable_resources` | `resource_type`, `search?`, `page?`, `per_page?` | compact IDs/names, complete-list filtering and paging |
@@ -141,6 +145,20 @@ Global copying is asynchronous: use the returned `next_check` to poll the destin
 Copy job until `Completed`. The recipe reports pending work with exit code 2 and does
 not repeat the copy. Set `MAGILEADS_TEST_VERIFY_DESTINATION_ID` to an existing QA
 destination to verify it later in read-only mode.
+
+## Email signatures
+
+The four signature tools use the caller's API key in HTTP mode or the configured
+credentials in stdio. List signatures to find an ID and read the signature before
+editing part of its content. Creation and updates have a local preview and require
+`confirm:true`. Updates send the selected fields. Text, HTML and visual editor
+design can be edited separately. For a change that applies to both mail formats,
+provide the updated text and HTML.
+
+To make the tools available to OAuth clients, the API needs to add
+`GET /email-signatures` and `GET /email-signatures/{id}` to `mcp:read`, plus
+`POST /email-signatures` and `PUT /email-signatures/{id}` to `mcp:write`.
+The MCP can then enable these four routes in its OAuth catalogue.
 
 ## Account variable fallback values
 
@@ -508,8 +526,9 @@ permission checks, error codes, and acceptance tests. It follows the backend's
 
 Account switching is **automatic** for HTTP OAuth (`oauth` or `both`) with
 `MCP_TOOL_PROFILE=full`. There is no activation variable and no new secret.
-OAuth clients get up to 39 tools, filtered by their scopes; API-key clients and
-stdio retain 35, and the public profile retains 32. No switch capability is added
+OAuth clients get up to 39 tools, filtered by their scopes. API-key clients and
+stdio have 39 tools, including four signature tools. The public profile exposes
+32 tools over OAuth and 36 with API keys. No switch capability is added
 to those other modes. Existing OAuth authorizations remain usable without a
 new consent page or a forced reconnection. `get_active_account` accepts
 `mcp:read` **or** `mcp:write`; listing accounts requires read, while selection and
@@ -565,7 +584,7 @@ refuse to start unless all five required OAuth settings are present.
 | --- | --- |
 | `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
-| `MCP_TOOL_PROFILE` | `full` (default: 39 tools for OAuth, 35 for API keys) or `public` (32 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
+| `MCP_TOOL_PROFILE` | `full` (default: up to 39 tools per auth mode) or `public` (32 OAuth tools, 36 with API keys). Actual OAuth tools are filtered by scopes. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
 | `OAUTH_MCP_RESOURCE` | Required for OAuth modes; primary resource URL, e.g. `https://mcp.magileads.io/mcp`. Actual OAuth host authorization comes from private resource discovery, with no local fallback. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
@@ -880,9 +899,10 @@ developer mode, then submitted as a remote MCP-only plugin to the public
 directory. See the [ChatGPT deployment and submission guide](docs/chatgpt-publication.md)
 for the OAuth smoke test, public-domain verification (`OPENAI_APPS_CHALLENGE_TOKEN`),
 review materials, and test cases. Set `MCP_TOOL_PROFILE=public` for submission:
-it exposes the 32 dedicated business tools while hiding the three generic API
+it exposes the 32 dedicated business tools over OAuth while hiding the three generic API
 passthrough and four account-control tools. The default `full` profile exposes
-up to 39 tools for private HTTP OAuth integrations, or 35 for API-key/stdio clients.
+up to 39 tools for private HTTP OAuth integrations. API-key and stdio clients
+get 39 tools, with signature tools available in place of OAuth account switching.
 Connecting privately does not publish the plugin.
 
 ## Connect to a Hermes Agent

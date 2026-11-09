@@ -539,6 +539,8 @@ export type ToolAccess = {
   scope: Scope;
   routes: readonly string[];
   dynamic?: boolean;
+  /** Dedicated routes available with an API key or stdio credentials. */
+  nonOAuth?: true;
   /** Private OAuth control plane, never a business API passthrough. */
   accountControl?: boolean;
   /** One alternative is sufficient; private context reads accept read OR write. */
@@ -563,6 +565,7 @@ const PUBLIC_TOOLS = new Set([
   "query_all_contacts", "copy_contacts_across_lists",
   "get_variable_replacements", "set_variable_replacements",
   "import_contacts_to_list",
+  "list_email_signatures", "get_email_signature", "create_email_signature", "update_email_signature",
 ]);
 
 export function isToolExposed(name: string, profile: ToolProfile): boolean {
@@ -585,6 +588,7 @@ export function scopeForRoute(access: ToolAccess, route: string): Scope {
 
 /** The complete, deterministic scope union needed for an API token exchange. */
 export function scopesForTool(access: ToolAccess): Scope[] {
+  if (access.nonOAuth) return [];
   const used = new Set(access.routes.map((route) => scopeForRoute(access, route)));
   return SCOPES.filter((scope) => used.has(scope));
 }
@@ -603,6 +607,7 @@ export function accessForTool(name: string): ToolAccess | undefined {
 export function preflightToolCall(name: string, args: unknown, allowedScopes?: readonly Scope[]): { scopes: Scope[]; exchange: boolean } {
   const access = accessForTool(name);
   if (!access) return { scopes: [], exchange: false };
+  if (access.nonOAuth) return { scopes: [], exchange: false };
   if (access.scopeAlternatives) {
     const scope = access.scopeAlternatives.find((item) => allowedScopes?.includes(item)) ?? access.scope;
     return { scopes: [scope], exchange: false };
@@ -638,7 +643,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
       if (access.routeScopes && Object.keys(access.routeScopes).some((route) => !access.routes.includes(route))) {
         throw new Error(`Scope override references an undeclared route: ${name}`);
       }
-      if (!scopesForTool(access).includes(access.scope)) throw new Error(`Tool scope does not match its API routes: ${name}`);
+      if (!access.nonOAuth && !scopesForTool(access).includes(access.scope)) throw new Error(`Tool scope does not match its API routes: ${name}`);
       if (seen.has(name)) throw new Error(`Duplicate tool registration: ${name}`);
       seen.add(name);
       const previous = catalog.get(name);
@@ -646,6 +651,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         throw new Error(`Conflicting tool access declaration: ${name}`);
       }
       catalog.set(name, access);
+      if (access.nonOAuth && allowedScopes !== undefined) return {};
       if (access.accountControl && (!accountSwitchingEnabled || profile !== "full")) return {};
       if (allowedScopes && !(access.scopeAlternatives
         ? access.scopeAlternatives.some((scope) => allowedScopes.includes(scope))
@@ -2182,6 +2188,101 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           note: "Nothing was sent. Re-call with confirm:true to save this template. No email will be sent." });
         const data = await rawRequest("POST", "/models/email", body);
         return ok({ executed: true, method: "POST", path: "/models/email", ...capResult(data) });
+      } catch (error) { return fail(error); }
+    },
+  );
+
+  const signatureFields = {
+    name: z.string().trim().min(1).max(200),
+    text: z.string().max(100_000).optional().describe("Plain-text signature."),
+    html: z.string().max(MAX_EMAIL_HTML_LENGTH).optional().describe("HTML signature, including its layout and links."),
+    json_template: z.string().max(250_000).optional().describe("Serialized design from the visual editor, when applicable."),
+    is_template: z.boolean().optional(),
+  };
+  const signatureId = z.number().int().positive().safe();
+
+  register({ scope: "mcp:read", nonOAuth: true, routes: ["GET /email-signatures"] })(
+    "list_email_signatures",
+    {
+      title: "List email signatures",
+      description: "List accessible email signatures, including shared signatures. Search by name and use the signature ID with get_email_signature to read its content.",
+      inputSchema: {
+        search: z.string().trim().max(200).optional(),
+        page: z.number().int().min(1).max(1_000_000).default(1),
+        per_page: z.number().int().min(1).max(100).default(25),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ search, page, per_page }): Promise<TextResult> => {
+      try {
+        const data = await rawRequest("GET", "/email-signatures") as { email_signatures_list?: Raw[] } | null;
+        if (!Array.isArray(data?.email_signatures_list)) throw new Error("The API did not return a signature list.");
+        const term = search?.toLowerCase();
+        const matching = data.email_signatures_list.filter((row) => !term || String(row.name).toLowerCase().includes(term));
+        const start = (page - 1) * per_page;
+        const signatures = matching.slice(start, start + per_page).map((row) => ({
+          id: row.id, name: row.name, from_sharing: row.from_sharing, write_permission: row.write_permission,
+        }));
+        return ok({ signatures, total: matching.length, page, per_page, next_page: start + per_page < matching.length ? page + 1 : null });
+      } catch (error) { return fail(error); }
+    },
+  );
+
+  register({ scope: "mcp:read", nonOAuth: true, routes: ["GET /email-signatures/{id}"] })(
+    "get_email_signature",
+    {
+      title: "Read an email signature",
+      description: "Read a signature by ID, including its text, HTML and visual editor design when available. Very large responses include a truncation notice.",
+      inputSchema: { email_signature_id: signatureId },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async ({ email_signature_id }): Promise<TextResult> => {
+      try {
+        const data = await rawRequest("GET", `/email-signatures/${email_signature_id}`) as { email_signature_profile?: Raw } | null;
+        if (data?.email_signature_profile?.id !== email_signature_id) throw new Error("The API did not return the requested signature.");
+        return ok({ email_signature_id, ...capResult(data.email_signature_profile) });
+      } catch (error) { return fail(error); }
+    },
+  );
+
+  register({ scope: "mcp:write", nonOAuth: true, routes: ["POST /email-signatures"] })(
+    "create_email_signature",
+    {
+      title: "Create an email signature",
+      description: "Save a signature with a name and text or HTML. Plain text can generate escaped HTML. Returns a preview until confirm:true.",
+      inputSchema: { ...signatureFields, confirm: z.boolean().optional() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ confirm, ...fields }): Promise<TextResult> => {
+      try {
+        if (!fields.text?.trim() && !fields.html?.trim()) throw new Error("Supply nonempty signature text or HTML.");
+        const body = normalizeEmailCreation(fields);
+        if (confirm !== true) return ok({ dry_run: true, would_call: { method: "POST", path: "/email-signatures", body } });
+        const data = await rawRequest("POST", "/email-signatures", body, false) as { state?: boolean; email_signature_id?: number } | null;
+        if (data?.state !== true || !signatureId.safeParse(data.email_signature_id).success) {
+          throw new Error("The API did not confirm creation with a signature ID. Verify the signature list before retrying.");
+        }
+        return ok({ executed: true, email_signature_id: data.email_signature_id });
+      } catch (error) { return fail(error); }
+    },
+  );
+
+  register({ scope: "mcp:write", nonOAuth: true, routes: ["PUT /email-signatures/{id}"] })(
+    "update_email_signature",
+    {
+      title: "Update an email signature",
+      description: "Change selected signature fields by ID. Read the current signature first when editing part of its content. HTML, plain text and visual editor design are separate fields. Supply each variant that needs an edit. Returns a preview until confirm:true.",
+      inputSchema: { ...signatureFields, name: signatureFields.name.optional(), email_signature_id: signatureId, confirm: z.boolean().optional() },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ email_signature_id, confirm, ...body }): Promise<TextResult> => {
+      try {
+        if (Object.keys(body).length === 0) throw new Error("Supply at least one signature field to update.");
+        const path = `/email-signatures/${email_signature_id}`;
+        if (confirm !== true) return ok({ dry_run: true, would_call: { method: "PUT", path, body } });
+        const data = await rawRequest("PUT", path, body, false) as { state?: boolean } | null;
+        if (data?.state !== true) throw new Error("The API did not confirm the signature update.");
+        return ok({ executed: true, email_signature_id, updated_fields: Object.keys(body) });
       } catch (error) { return fail(error); }
     },
   );
