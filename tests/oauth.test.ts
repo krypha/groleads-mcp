@@ -43,6 +43,7 @@ const apiKeys: string[] = [];
 const businessCalls: { method: string; path: string; bearer: string; body?: unknown; contentType?: string }[] = [];
 let resourceCopyFailureId: number | undefined;
 let resourceCopyFailureStatus = 403;
+let bulkImportUnavailable = false;
 let globalTotal = 8;
 let globalMatched = 3;
 let globalCursorMode: "normal" | "missing" | "wrong_path" = "normal";
@@ -296,15 +297,28 @@ const api = await start(async (req, res) => {
     const contentType = req.headers["content-type"] || "";
     if (contentType.startsWith("multipart/form-data")) {
       const form = await new Request("http://fixture.invalid", { method: "POST", headers: { "Content-Type": contentType }, body: Buffer.concat(chunks) }).formData();
-      const wireSharing = form.get("sharing");
-      expect([...form.keys()]).toEqual(["sharing"]); // No audio, names or other metadata may be overwritten.
-      body = { sharing: wireSharing === "" ? [] : JSON.parse(`[${wireSharing}]`) };
+      if (req.url === "/contact-lists/42/contacts" && req.method === "POST") {
+        const file = form.get("contacts");
+        if (!(file instanceof File)) return respond(res, 400, { state_message: "contacts_file_required" });
+        body = {
+          fields: [...form.keys()], filename: file.name, mime: file.type,
+          contacts: JSON.parse(await file.text()), ignore_errors: form.get("ignore_errors"),
+        };
+      } else {
+        const wireSharing = form.get("sharing");
+        expect([...form.keys()]).toEqual(["sharing"]); // No audio, names or other metadata may be overwritten.
+        body = { sharing: wireSharing === "" ? [] : JSON.parse(`[${wireSharing}]`) };
+      }
     } else body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
     businessCalls.push({ method: req.method || "", path: req.url || "", bearer: req.headers.authorization || "", body, contentType });
     if (apiMode === "unauthorized") return respond(res, 401, { state_message: "token_expired" });
     if (apiMode === "forbidden") return respond(res, 403, { state_message: "unauthorized_model" });
     if (!hasExchangedScope(req, endpoint.scope)) return respond(res, 401, { state_message: "insufficient_scope" });
     const url = new URL(req.url || "/", "http://localhost");
+    if (req.method === "POST" && url.pathname === "/contact-lists/42/contacts" && contentType.startsWith("multipart/form-data")) {
+      if (bulkImportUnavailable) return respond(res, 503, { state_message: "service_unavailable" });
+      return respond(res, 200, { state: true });
+    }
     if (req.method === "PUT" && url.pathname === "/users/me") {
       if (!Array.isArray(body?.datafields_replacement) || Object.keys(body).some((key) => key !== "datafields_replacement")) return respond(res, 403, { state_message: "unauthorized_profile" });
       variablePreferences.set(delegated?.context.active_account.id ?? 7, body.datafields_replacement);
@@ -448,14 +462,14 @@ test("switching is automatic only for private HTTP OAuth; API keys and public pr
     const before = accountControlCalls.length;
     const listed = await keyRpc(instance.origin, undefined, "tools/list", undefined, { Authorization: `Bearer ${bearer}` });
     const tools = (await listed.json() as { result: { tools: { name: string; inputSchema: { properties: Record<string, unknown> } }[] } }).result.tools;
-    expect(tools).toHaveLength(38);
+    expect(tools).toHaveLength(39);
     expect(tools.find((tool) => tool.name === "create_email_model")?.inputSchema.properties.account_revision).toBeDefined();
     expect(accountControlCalls.length).toBe(before);
     const standard = await rpc("tools/list", bearer);
-    expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(38);
+    expect((await standard.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(39);
     for (const response of [await keyRpc(instance.origin, "key-alpha", "tools/list")]) {
       const data = await response.json() as { result: { tools: { name: string }[] } };
-      expect(data.result.tools).toHaveLength(34);
+      expect(data.result.tools).toHaveLength(35);
       expect(data.result.tools.some((tool) => tool.name === "switch_account")).toBe(false);
     }
     const hidden = await keyRpc(instance.origin, "key-alpha", "tools/call", { name: "switch_account", arguments: { user_id: 42, confirm: true } });
@@ -1215,7 +1229,7 @@ test("dedicated and generic contact search both request the read scope", async (
 });
 
 test("metadata is available at both RFC and bare paths with CORS", async () => {
-  expect(toolAccessTable().size).toBe(38); // Eight preference/resource tools plus four private account-control tools.
+  expect(toolAccessTable().size).toBe(39);
   for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
     const response = await fetch(`${mcpOrigin}${path}`);
     expect(response.status).toBe(200);
@@ -1530,13 +1544,13 @@ test("public plugin tool annotations match private-account and open-world behavi
     } }[] };
   };
   const tools = payload.result.tools;
-  expect(tools).toHaveLength(38);
+  expect(tools).toHaveLength(39);
   const openWorld = new Set([
     "generate_maps_search_urls", "extract_maps_search", "run_google_maps_targeting", "magileads_request",
     "get_active_account", "list_switchable_accounts", "switch_account", "return_to_original_account",
     "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists",
   ]);
-  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "magileads_request", "create_email_model", "switch_account", "return_to_original_account", "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists", "set_variable_replacements"]);
+  const writes = new Set(["extract_maps_search", "run_google_maps_targeting", "add_contact_to_list", "import_contacts_to_list", "magileads_request", "create_email_model", "switch_account", "return_to_original_account", "copy_resources_to_user", "share_resource", "share_prm_contacts", "copy_contacts_across_lists", "set_variable_replacements"]);
   for (const tool of tools) {
     expect(tool.annotations.openWorldHint).toBe(openWorld.has(tool.name));
     expect(tool.annotations.readOnlyHint).toBe(!writes.has(tool.name));
@@ -1930,6 +1944,61 @@ test("contact import exchanges read and write scopes and completes its read-then
   expect(businessCalls.slice(-3).every(({ bearer }) => bearer === "Bearer exchanged-mcp:read+mcp:write")).toBe(true);
 });
 
+test("bulk import previews locally and submits one multipart JSON file with the scope union", async () => {
+  const caller = await token("mcp:read mcp:write");
+  const args = { contact_list_id: 42, contacts: [{ email: "one@example.invalid" }, { "1": "two@example.invalid" }] };
+  const before = businessCalls.length;
+  const beforeExchanges = exchanges.length;
+  const preview = await resourceCall(caller, "import_contacts_to_list", args);
+  expect(preview.data).toMatchObject({ dry_run: true, contacts_to_import: 2 });
+  expect(businessCalls.length).toBe(before);
+  expect(exchanges.length).toBe(beforeExchanges);
+
+  const result = await resourceCall(caller, "import_contacts_to_list", { ...args, confirm: true });
+  expect(result.result.isError).not.toBe(true);
+  expect(result.data).toMatchObject({ executed: true, contacts_submitted: 2, result: { state: true } });
+  expect(exchanges.at(-1)?.scope).toBe("mcp:read mcp:write");
+  const calls = businessCalls.slice(before);
+  expect(calls.map(({ method, path }) => `${method} ${path}`).sort()).toEqual([
+    "GET /contact-lists/42", "GET /data-fields", "POST /contact-lists/42/contacts",
+  ]);
+  expect(calls.at(-1)?.contentType).toContain("multipart/form-data; boundary=");
+  expect(calls.at(-1)?.body).toEqual({
+    fields: ["contacts", "ignore_errors"], filename: "contacts.json", mime: expect.stringMatching(/^application\/json(?:;|$)/), ignore_errors: "false",
+    contacts: [
+      { properties: [{ data_field_id: 1, value: "one@example.invalid" }] },
+      { properties: [{ data_field_id: 1, value: "two@example.invalid" }] },
+    ],
+  });
+});
+
+test("bulk import rejects invalid batches before uploading and does not replay a 503", async () => {
+  const caller = await token("mcp:read mcp:write");
+  const before = businessCalls.length;
+  for (const contacts of [
+    [{ email: "valid@example.invalid" }, { "999": "unknown" }],
+    [{ email: "one@example.invalid", "1": "duplicate@example.invalid" }],
+    Array.from({ length: 501 }, () => ({ email: "one@example.invalid" })),
+    [{ email: "x".repeat(1024 * 1024) }],
+  ]) {
+    const response = await resourceCall(caller, "import_contacts_to_list", { contact_list_id: 42, contacts, confirm: true });
+    expect(response.result.isError).toBe(true);
+  }
+  expect(businessCalls.slice(before).filter((call) => call.method === "POST")).toHaveLength(0);
+  try {
+    bulkImportUnavailable = true;
+    const response = await resourceCall(caller, "import_contacts_to_list", {
+      contact_list_id: 42, contacts: [{ email: "one@example.invalid" }], confirm: true,
+    });
+    expect(response.result.isError).toBe(true);
+    expect(response.result.content[0].text).toContain("Check the destination list before retrying");
+    expect(businessCalls.slice(before).filter((call) => call.method === "POST").map((call) => call.path))
+      .toEqual(["/contact-lists/42/contacts"]);
+  } finally {
+    bulkImportUnavailable = false;
+  }
+});
+
 test("Google Maps composite exchanges both scopes; standalone extract needs only write", async () => {
   const caller = await token("mcp:read mcp:write");
   const composite = await rpc("tools/call", caller, {
@@ -2104,7 +2173,8 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     for (const name of ["create_email_model", "add_contact_to_list", "extract_maps_search", "run_google_maps_targeting"]) {
       expect(tools.find((tool) => tool.name === name)?.description).toContain(CREATION_GUIDANCE);
     }
-    expect(names).toHaveLength(31);
+    expect(names).toHaveLength(32);
+    expect(names).toContain("import_contacts_to_list");
     for (const tool of tools) expect(tool.description).toContain(USER_FACING_GUIDANCE);
     expect(names).toContain("run_google_maps_targeting");
     expect(names).toContain("add_contact_to_list");
@@ -2135,7 +2205,7 @@ test("public profile keeps dedicated tools but hides the generic passthrough", a
     expect(hiddenResult.error !== undefined || hiddenResult.result?.isError === true).toBe(true);
     expect(exchanges.length).toBe(beforeExchanges);
     const keyListed = await keyRpc(origin, "key-alpha", "tools/list");
-    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(31);
+    expect((await keyListed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(32);
   } finally {
     await close(server);
   }
@@ -2203,7 +2273,7 @@ test("custom reseller hosts work with API keys in api_key and both modes without
         expect((await initialized.json() as { result: { serverInfo: { name: string } } }).result.serverInfo.name).toBe("magileads-mcp");
         const listed = await keyRpc(origin, "key-alpha", "tools/list", undefined, { Host: host });
         expect(listed.status).toBe(200);
-        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(34);
+        expect((await listed.json() as { result: { tools: unknown[] } }).result.tools).toHaveLength(35);
         // The hostname is an alias, not an account selector: two keys keep their identities on either host.
         for (const [key, id] of [["key-alpha", 71], ["key-beta", 72]] as const) {
           const result = await keyRpc(origin, key, "tools/call", { name: "get_account_overview", arguments: {} }, { Host: host });

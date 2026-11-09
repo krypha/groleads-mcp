@@ -55,6 +55,7 @@ authorized target, without asserting that missing delegation is the sole cause.
 | `get_contact_list_status` | `contact_list_id` | `{ id, name, contacts, emails, companies, jobs[] }` |
 | `list_contact_fields` | `contact_list_id` | `{ fields[] }` — each `{ data_field_id, identifier, label, type }` |
 | `add_contact_to_list` | `contact_list_id`, `properties:[{field,value}]`, `confirm?` | imports one contact — **dry-run until `confirm:true`** |
+| `import_contacts_to_list` | `contact_list_id`, `contacts:[{email,first_name,…}]` (1–500), `confirm?` | imports a JSON batch in one upload — **dry-run until `confirm:true`** |
 | `create_email_model` | `name`, `subject`, `text?`, `html?`, `folder_id?`, `tags_ids?`, `confirm?` | saves a template without sending — **local dry-run until `confirm:true`** |
 | `get_variable_replacements` | `search?`, `page?`, `per_page?` (1–50) | account fallback values, field labels/identifiers/placeholders; no list ID needed |
 | `set_variable_replacements` | `replacements:[{field,replacement}]` (1–50), `confirm?` | merges selected fallbacks into the active account preferences; **local dry-run until `confirm:true`** |
@@ -214,6 +215,27 @@ body `{ properties:[{ data_field_id, value }] }` after confirmation, then calls
 field definitions and list access are checked only after confirmation, before any
 import. The API can report `contacts_updated` when an existing contact
 is matched.
+
+For bulk imports, use `import_contacts_to_list` with JSON objects keyed by field
+identifier or numeric ID. Values are nonempty strings. Omit missing properties.
+
+```json
+{
+  "contact_list_id": 42,
+  "contacts": [
+    {"email": "sam@example.com", "first_name": "Sam"},
+    {"email": "alex@example.com", "first_name": "Alex"}
+  ]
+}
+```
+
+Confirm the preview with `confirm:true` and, for private HTTP OAuth, the current
+`account_revision`. The tool validates the destination and resolves all field IDs
+before uploading one in-memory JSON file to `POST /contact-lists/{id}/contacts`.
+Each batch is limited to 500 contacts and 1 MiB, including the generated file.
+Submit larger imports in successive batches. The API may update matching contacts.
+After an upload error such as a 503, verify the destination before retrying because
+some rows may already have been imported.
 
 `preview_contact_selection` is read-only. It counts a filtered segment and returns
 `matched_count`, `total_count`, `selected`, and `not_selected`.
@@ -486,8 +508,8 @@ permission checks, error codes, and acceptance tests. It follows the backend's
 
 Account switching is **automatic** for HTTP OAuth (`oauth` or `both`) with
 `MCP_TOOL_PROFILE=full`. There is no activation variable and no new secret.
-OAuth clients get up to 38 tools, filtered by their scopes; API-key clients and
-stdio retain 34, and the public profile retains 31. No switch capability is added
+OAuth clients get up to 39 tools, filtered by their scopes; API-key clients and
+stdio retain 35, and the public profile retains 32. No switch capability is added
 to those other modes. Existing OAuth authorizations remain usable without a
 new consent page or a forced reconnection. `get_active_account` accepts
 `mcp:read` **or** `mcp:write`; listing accounts requires read, while selection and
@@ -543,7 +565,7 @@ refuse to start unless all five required OAuth settings are present.
 | --- | --- |
 | `MCP_HTTP_AUTH` | `oauth` (default), `api_key`, or `both`. |
 | `MCP_ALLOW_API_KEY_QUERY` | `false` (default); opt in to URL keys only for clients unable to send a header. |
-| `MCP_TOOL_PROFILE` | `full` (default: 38 tools for OAuth, 34 for API keys) or `public` (31 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
+| `MCP_TOOL_PROFILE` | `full` (default: 39 tools for OAuth, 35 for API keys) or `public` (32 dedicated tools, no switch or generic passthrough). Actual tools are filtered by OAuth scopes. |
 | `OAUTH_ISSUER` | Required for OAuth modes; authorization-server issuer, equal to JWT `iss`. |
 | `OAUTH_MCP_RESOURCE` | Required for OAuth modes; primary resource URL, e.g. `https://mcp.magileads.io/mcp`. Actual OAuth host authorization comes from private resource discovery, with no local fallback. |
 | `OAUTH_API_RESOURCE` | Required for OAuth modes; API resource/audience requested during token exchange; must differ from the MCP resource. |
@@ -858,9 +880,9 @@ developer mode, then submitted as a remote MCP-only plugin to the public
 directory. See the [ChatGPT deployment and submission guide](docs/chatgpt-publication.md)
 for the OAuth smoke test, public-domain verification (`OPENAI_APPS_CHALLENGE_TOKEN`),
 review materials, and test cases. Set `MCP_TOOL_PROFILE=public` for submission:
-it exposes the 31 dedicated business tools while hiding the three generic API
+it exposes the 32 dedicated business tools while hiding the three generic API
 passthrough and four account-control tools. The default `full` profile exposes
-up to 38 tools for private HTTP OAuth integrations, or 34 for API-key/stdio clients.
+up to 39 tools for private HTTP OAuth integrations, or 35 for API-key/stdio clients.
 Connecting privately does not publish the plugin.
 
 ## Connect to a Hermes Agent
@@ -881,7 +903,7 @@ src/
 ├── magileads.ts             Self-contained Magileads client (dual auth + JWT refresh + API calls)
 ├── tools.ts                 Central registration, scopes, account context and core tools
 ├── resource-tools.ts        6 copy/sharing/global contact tools
-├── variable-tools.ts        Account variable fallback tools (34 business tools in total)
+├── variable-tools.ts        Account variable fallback tools
 ├── variable-replacements.ts Pure validation, field resolution and preserving merges
 ├── resource-operations.ts   Pure resource definitions, ACL merging and preview fingerprints
 ├── endpoints.ts             Exact route resolution and explicit scopes

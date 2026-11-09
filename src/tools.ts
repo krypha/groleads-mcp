@@ -7,6 +7,7 @@ import {
   getContactList,
   listDataFields,
   addContactToList,
+  importContactsToList,
   countContacts,
   listProgrammations,
   getProgrammationById,
@@ -46,6 +47,7 @@ const MAX_LINKS = 40;
 const MAX_URLS_PER_EXTRACT = 10; // the extract endpoint accepts at most 10 URLs
 const MAX_RESULTS = 200;
 const MAX_CRITERIA = 30; // guard against abusive/degenerate filters (API also caps)
+const MAX_IMPORT_BYTES = 1024 * 1024;
 
 type TextResult = {
   content: { type: "text"; text: string }[];
@@ -560,6 +562,7 @@ const PUBLIC_TOOLS = new Set([
   "list_copyable_resources", "copy_resources_to_user", "share_resource", "share_prm_contacts",
   "query_all_contacts", "copy_contacts_across_lists",
   "get_variable_replacements", "set_variable_replacements",
+  "import_contacts_to_list",
 ]);
 
 export function isToolExposed(name: string, profile: ToolProfile): boolean {
@@ -1039,7 +1042,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "`last_name`, `company`, or pass its numeric data_field_id; the tool resolves identifiers " +
         "to the exact API shape `{properties:[{data_field_id,value}]}`. This write is a dry " +
         "run until `confirm:true`. The API may report an update instead of an addition when the " +
-        "contact already exists.",
+        "contact already exists. Use import_contacts_to_list for multiple contacts.",
       inputSchema: {
         contact_list_id: z.number().int().positive().describe("Destination contact list id."),
         properties: z
@@ -1087,6 +1090,74 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
           list_name: list.name,
           ...result,
         });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  register({ scope: "mcp:write", routes: ["GET /contact-lists/{id}", "GET /data-fields", "POST /contact-lists/{id}/contacts"] })(
+    "import_contacts_to_list",
+    {
+      title: "Import contacts in bulk from JSON",
+      description:
+        "Import up to 500 contacts into an existing list in one upload. Each JSON object maps readable field identifiers " +
+        "or numeric data-field IDs to nonempty string values, e.g. {email:'contact@example.com',first_name:'Sam'}. " +
+        "Omit missing properties. The tool builds the JSON file for the API in memory. The batch and the generated file " +
+        "must each fit within 1 MiB. The API may update matching contacts. Dry run until confirm:true. For larger imports, " +
+        "submit explicitly confirmed batches in sequence. After an upload error, check the destination before retrying, " +
+        "because some rows may already be imported.",
+      inputSchema: {
+        contact_list_id: z.number().int().positive().safe().describe("Destination contact list ID."),
+        contacts: z.array(z.record(z.string().min(1).max(256), z.string().min(1)).refine((row) => {
+          const count = Object.keys(row).length;
+          return count >= 1 && count <= 100;
+        }, "Each contact must have 1–100 properties.")).min(1).max(500)
+          .describe("Contacts as JSON objects keyed by field identifier or numeric field ID."),
+        confirm: z.boolean().optional().describe("Set true to send the batch."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async ({ contact_list_id, contacts, confirm }): Promise<TextResult> => {
+      try {
+        if (Buffer.byteLength(JSON.stringify(contacts), "utf8") > MAX_IMPORT_BYTES) {
+          throw new Error("The contact batch exceeds 1 MiB. Submit smaller batches.");
+        }
+        if (confirm !== true) {
+          return ok({ dry_run: true, contact_list_id, contacts_to_import: contacts.length,
+            would_call: { method: "POST", path: `/contact-lists/${contact_list_id}/contacts`, format: "multipart JSON file" },
+            note: "Confirm the destination and number of contacts. The API may update matching contacts." });
+        }
+        const [list, { identifierToId, idToIdentifier }] = await Promise.all([
+          getContactList(contact_list_id), dataFieldMaps(),
+        ]);
+        if (list?.id !== contact_list_id) throw new Error("The API did not confirm the destination list.");
+        const resolved = contacts.map((contact, index) => {
+          const seen = new Set<number>();
+          const properties = Object.entries(contact).map(([field, value]) => {
+            const data_field_id = resolveDataFieldId(field, identifierToId);
+            if (!idToIdentifier.has(data_field_id)) throw new Error(`Contact ${index + 1}: unknown data field ${data_field_id}.`);
+            if (seen.has(data_field_id)) throw new Error(`Contact ${index + 1}: duplicate data field ${data_field_id}.`);
+            seen.add(data_field_id);
+            return { data_field_id, value };
+          });
+          return { properties };
+        });
+        const contactsJson = JSON.stringify(resolved);
+        if (Buffer.byteLength(contactsJson, "utf8") > MAX_IMPORT_BYTES) {
+          throw new Error("The generated JSON file exceeds 1 MiB. Submit smaller batches.");
+        }
+
+        try {
+          const result = await importContactsToList(contact_list_id, contactsJson);
+          if (result?.state !== true) throw new Error("The API did not confirm the bulk import.");
+          return ok({ executed: true, contact_list_id, list_name: list.name, contacts_submitted: contacts.length,
+            ...capResult(result) });
+        } catch (err) {
+          const error = fail(err);
+          error.content[0].text += " Check the destination list before retrying. Some contacts may already have been imported.";
+          return error;
+        }
       } catch (err) {
         return fail(err);
       }
@@ -2204,6 +2275,7 @@ export function registerTools(target: McpServer, allowedScopes?: readonly Scope[
         "execution: mcp:read operations (including POST searches/statistics) execute without confirmation. " +
         "mcp:write operations (including personalized GET generation) are DRY RUN until confirm:true. " +
         "For POST /models/email, text-only non-AI/non-editor creations get escaped HTML; explicit HTML is preserved. " +
+        "Use import_contacts_to_list for bulk contact import, which builds the required multipart upload. " +
         "PUT /users/me accepts only datafields_replacement and no query parameters; prefer set_variable_replacements to preserve unrelated fallbacks. " +
         "DELETE, PATCH and undocumented/admin endpoints are unavailable. Discover paths with list_api_endpoints.",
       inputSchema: {

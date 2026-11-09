@@ -414,6 +414,18 @@ export function addContactToList(
   });
 }
 
+/** The bulk endpoint expects a JSON file in a multipart form. */
+export function importContactsToList(listId: number, contactsJson: string): Promise<ImportContactResponse> {
+  const form = new FormData();
+  form.append("contacts", new Blob([contactsJson], { type: "application/json" }), "contacts.json");
+  form.append("ignore_errors", "false");
+  return api<ImportContactResponse>(`/contact-lists/${listId}/contacts`, {
+    method: "POST",
+    body: form,
+    redirect: "error",
+  }, false);
+}
+
 /**
  * Count the contacts of a list that match `filter`, via the paginated contacts
  * endpoint. `per_page:1` keeps the payload tiny; `number_of_results` is the FULL
